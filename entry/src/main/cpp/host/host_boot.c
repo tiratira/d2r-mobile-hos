@@ -1,11 +1,14 @@
 /*
  * host_boot.c — 宿主启动序(上游 dm/host/main.c 的 HOS 骨架)。
  *
- * dmHostBoot():加载内嵌 guest 容器 → 校验 → 按门表注册门(绝对地址 =
- * 镜像基址 + ret_off)→ 准备每线程环境 → 在新 pthread 上以 dm_thread_enter
- * 调客体入口。真实三模块接入后,这里扩展为上游的 SDK 启动序(init_array、
- * nnMain、跨模块重定位);当前占位容器的入口本身是一个 tpidr_r 门桩,
- * 自检即可验证「线程环境 → 门分派 → 寄存器回写 → 返回」全链路。
+ * dmHostProbeModules():经 loader_hos(宿主扮演 Horizon rtld)装载三个内嵌
+ * 模块 —— 原地重定位(数据窗口 mprotect RW)、符号表解析、门表登记 —— 并出
+ * 自检报告(每模块符号数/三类重定位计数 + SDK 启动序关键符号探测)。
+ * x86_64 构建编 data-only 镜像:同一装载/重定位路径照跑,仅不执行。
+ *
+ * dmHostBoot():占位容器冒烟(线程环境 → 门分派 → 寄存器回写 → 返回)。
+ * 真实 nnMain 启动序(_init_libc0 → nnosInitialize → … → nnMain)待
+ * fs/oe/hid 服务层 HLE 就绪后接入(符号已可在自检报告里看到)。
  */
 #include "host/dm.h"
 #include "host/front_hos.h"
@@ -15,10 +18,13 @@
 #include <pthread.h>
 #include <sys/mman.h>
 
-/* 真实模块容器(hos_embed.py 产物;缺省弱符号为空,存在时由 CMake 编入) */
+/* 真实模块容器(hos_embed.py v3 产物;缺省弱符号为空,CMake 探测编入) */
 extern const uint8_t __dm_guest_main_start[] __attribute__((weak));
+extern const uint8_t __dm_guest_main_meta[] __attribute__((weak));
 extern const uint8_t __dm_guest_sdk_start[] __attribute__((weak));
+extern const uint8_t __dm_guest_sdk_meta[] __attribute__((weak));
 extern const uint8_t __dm_guest_subsdk0_start[] __attribute__((weak));
+extern const uint8_t __dm_guest_subsdk0_meta[] __attribute__((weak));
 
 #ifdef __aarch64__
 typedef struct {
@@ -44,14 +50,13 @@ void dm_thread_returned(void)
 }
 
 /*
- * 探测内嵌模块:加载 + 校验 + 注册门表 + 进模块注册表,不执行任何入口。
- * 幂等:模块保持加载(门表/转调引用其绝对地址),重复调用只回报缓存结果。
- * 真实 nnMain 要等 svc/线程 HLE 填齐(hilog 的 UNIMPL 清单)才能启动。
+ * 装载三个内嵌模块并统一重定位(上游 load_modules 的顺序:先全部登记解析,
+ * 再统一重定位 —— 跨模块符号要先都在位)。幂等:重复调用只回报缓存结果。
  */
 int dmHostProbeModules(char *report, int report_size)
 {
     static int s_done;
-    static char s_cache[320];
+    static char s_cache[448];
     if (s_done) {
         snprintf(report, report_size, "%s", s_cache);
         return 0;
@@ -59,46 +64,34 @@ int dmHostProbeModules(char *report, int report_size)
     s_done = 1;
     struct {
         const char *name;
-        const uint8_t *blob;
+        const uint8_t *image;
+        const uint8_t *meta;
     } mods[3] = {
-        {"main", __dm_guest_main_start},
-        {"sdk", __dm_guest_sdk_start},
-        {"subsdk0", __dm_guest_subsdk0_start},
+        {"main", __dm_guest_main_start, __dm_guest_main_meta},
+        {"sdk", __dm_guest_sdk_start, __dm_guest_sdk_meta},
+        {"subsdk0", __dm_guest_subsdk0_start, __dm_guest_subsdk0_meta},
     };
-    int off = 0;
-    int total_gates = 0;
     int loaded = 0;
+    int off = 0;
     for (int i = 0; i < 3; i++) {
-        if (mods[i].blob == NULL) {
+        if (mods[i].image == NULL || mods[i].meta == NULL) {
             continue;   /* 未嵌入(弱符号空) */
         }
-        DmGuestModule m;
-        if (dmGuestLoadEmbedded(mods[i].blob, UINT64_MAX, mods[i].name, &m) != 0 ||
-            dmGuestVerify(&m) != 0) {
+        if (dm_load_module(mods[i].image, mods[i].meta, mods[i].name) != 0) {
             off += snprintf(report + off, report_size - off, "%s:FAIL ", mods[i].name);
             continue;
         }
-        for (uint32_t g = 0; g < m.hdr.gate_count; g++) {
-            DmGuestGate gt;
-            if (dmGuestGateAt(&m, g, &gt) == 0) {
-                gate_register_abs((uint64_t)(m.image + gt.ret_off), (int)gt.kind,
-                                  gt.arg, (uint64_t)(m.image + gt.orig_off));
-            }
-        }
-        /* 保持加载:门表登记的是镜像内绝对地址,释放即悬空(剪口转调也要用) */
-        dm_module_register(mods[i].name, m.image, m.hdr.image_size);
-        total_gates += (int)m.hdr.gate_count;
         loaded++;
-        off += snprintf(report + off, report_size - off,
-                        "%s:%lluB/%ug ", mods[i].name,
-                        (unsigned long long)m.hdr.image_size, m.hdr.gate_count);
     }
     if (loaded == 0) {
         snprintf(s_cache, sizeof(s_cache), "no embedded game modules (placeholder only)");
-    } else {
-        snprintf(s_cache + off, sizeof(s_cache) - off,
-                 "| %d modules, %d gates registered (not booted)", loaded, total_gates);
+        snprintf(report, report_size, "%s", s_cache);
+        return 0;
     }
+    dm_relocate_all();
+    char lr[192];
+    dm_loader_report(lr, sizeof(lr));
+    snprintf(s_cache, sizeof(s_cache), "%d modules | %s", loaded, lr);
     snprintf(report, report_size, "%s", s_cache);
     return 0;
 }
@@ -106,7 +99,7 @@ int dmHostProbeModules(char *report, int report_size)
 int dmHostBoot(const char *which, char *report, int report_size)
 {
     /* 占位容器自检:验证「线程环境 → 门分派 → 寄存器回写 → 返回」全链路;
-     * 真实模块的 nnMain 启动待 svc HLE 验证后接入。幂等防重复登记。 */
+     * 幂等防重复登记。 */
     static int s_done;
     if (s_done) {
         snprintf(report, report_size, "boot: already run (see first report)");
@@ -135,7 +128,7 @@ int dmHostBoot(const char *which, char *report, int report_size)
 #ifdef __aarch64__
     boot_ctx c;
     c.mod = m;
-    c.entry = (uint64_t)(m.image + m.hdr.entry_offset);
+    c.entry = (uint64_t)(m.image + m.hdr.entry_off);
     c.sp = (uint64_t)mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (c.sp == (uint64_t)MAP_FAILED) {

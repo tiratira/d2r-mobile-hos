@@ -54,12 +54,35 @@ uint32_t dm_thr_cur_handle(void);
 int dm_svc_selftest(char *report, int report_size);
 int dm_guest_heap_readable(uint64_t a, size_t n);
 
-/* 模块注册表(hle_core.c;host_boot 登记加载好的 guest 模块) */
-typedef struct { char name[16]; const uint8_t *base; uint64_t size; } dm_module_t;
+/* 模块注册表(hle_core.c 登记;loader_hos.c 装载后补全动态段字段) */
+typedef struct {
+    char name[16];
+    uint8_t *base;          /* 镜像首址(.so 节内,原地重定位) */
+    uint64_t size;          /* image_size(未补齐) */
+    /* 装载器字段(loader_hos.c) */
+    const void *dyn;        /* Elf64_Dyn(镜像内) */
+    const void *symtab;     /* Elf64_Sym */
+    const char *strtab;
+    uint32_t nsym;
+    uint32_t *symh;         /* 名字→符号下标 开地址哈希 */
+    uint32_t symh_mask;
+    uint64_t init, init_array, init_arraysz;
+    uint64_t patch_off, text_end, ro_off, data_off;
+    int reloc_rel, reloc_abs, reloc_jmp;   /* 重定位计数(自检报告) */
+} dm_module_t;
 void dm_module_register(const char *name, const uint8_t *base, uint64_t size);
-const dm_module_t *dm_module_find(const char *name);
+dm_module_t *dm_module_find(const char *name);
 const dm_module_t *dm_module_of(uint64_t addr);
 const dm_module_t *dm_module_iter(const dm_module_t *prev);   /* NULL = 从头遍历 */
+int dm_max_modules(void);
+dm_module_t *dm_module_at(int idx);
+
+/* 装载器(host/loader_hos.c,扮演 Horizon rtld) */
+int dm_load_module(const void *image, const void *meta, const char *name);
+void dm_relocate_all(void);
+uint8_t *dm_guest_sym(const char *name);
+int dm_loader_report(char *buf, int size);
+const void *dm_swforce_lookup(const char *name);
 
 /* 启动序(host_boot.c) */
 int dmHostBoot(const char *which, char *report, int report_size);

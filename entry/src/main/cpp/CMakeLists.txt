@@ -17,6 +17,7 @@ add_library(dmhost SHARED
     host/hle_svc.c
     host/hle_thread.c
     host/hle_hostcall.c
+    host/loader_hos.c
     host/front_hos.c
     host/host_boot.c
     gfx/dm_gfx_backend.c
@@ -26,7 +27,8 @@ add_library(dmhost SHARED
 )
 
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-    # ARM64:门跳汇编 + 内嵌 guest 模块(hos_embed.py 产物,绝不入库)
+    # ARM64:门跳汇编 + 内嵌 guest 模块(hos_embed.py 产物,绝不入库);
+    # 镜像在 "ax" 段原地执行(数据窗口由 loader mprotect RW 后原地重定位)
     target_sources(dmhost PRIVATE
         host/entry_hos.S
         loader/dm_guest_placeholder.S
@@ -35,14 +37,25 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     foreach(m main sdk subsdk0)
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}.S")
             list(APPEND GUEST_S "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}.S")
-            message(STATUS "guest module embedded: ${m}")
+            message(STATUS "guest module embedded: ${m} (in-place exec)")
         endif()
     endforeach()
     target_sources(dmhost PRIVATE ${GUEST_S})
 else()
-    # x86_64(PC 模拟器):ARM64 汇编/guest 镜像不可用,C 桩替代;
-    # 宿主框架(HAL/输入/渲染/Vulkan/NVN)照常,供界面与图形通路验证。
-    target_sources(dmhost PRIVATE host/entry_x86_stub.c)
+    # x86_64(PC 模拟器):ARM64 汇编不可编;guest 镜像以 data-only 容器嵌入,
+    # 装载/重定位/符号解析路径与真机同码可测,仅不执行
+    target_sources(dmhost PRIVATE
+        host/entry_x86_stub.c
+        loader/dm_guest_placeholder_x86.S
+    )
+    set(GUEST_S "")
+    foreach(m main sdk subsdk0)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}_x86.S")
+            list(APPEND GUEST_S "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}_x86.S")
+            message(STATUS "guest module embedded (data-only): ${m}")
+        endif()
+    endforeach()
+    target_sources(dmhost PRIVATE ${GUEST_S})
     message(STATUS "x86_64 build: guest execution disabled (ARM64-only)")
 endif()
 

@@ -268,16 +268,27 @@ void dm_module_register(const char *name, const uint8_t *base, uint64_t size)
         die("模块注册表满");
     }
     dm_module_t *m = &g_mods[g_nmods++];
+    memset(m, 0, sizeof *m);
     snprintf(m->name, sizeof m->name, "%s", name);
-    m->base = base;
+    m->base = (uint8_t *)(uintptr_t)base;   /* 镜像在 .so 节内,装载器会原地写数据窗口 */
     m->size = size;
 }
 
-const dm_module_t *dm_module_find(const char *name)
+dm_module_t *dm_module_find(const char *name)
 {
     for (int i = 0; i < g_nmods; i++) {
         if (strcmp(g_mods[i].name, name) == 0) {
             return &g_mods[i];
+        }
+    }
+    return NULL;
+}
+
+const void *dm_swforce_lookup(const char *name)
+{
+    for (const hle_force_ent *e = __start_swforce; e < __stop_swforce; e++) {
+        if (strcmp(e->name, name) == 0) {
+            return e->fn;
         }
     }
     return NULL;
@@ -301,4 +312,14 @@ const dm_module_t *dm_module_iter(const dm_module_t *prev)
     }
     int idx = (int)(prev - g_mods);
     return idx + 1 < g_nmods ? &g_mods[idx + 1] : NULL;
+}
+
+int dm_max_modules(void)
+{
+    return g_nmods;
+}
+
+dm_module_t *dm_module_at(int idx)
+{
+    return idx >= 0 && idx < g_nmods ? &g_mods[idx] : NULL;
 }
