@@ -14,7 +14,15 @@ add_library(dmhost SHARED
     input/dm_input.c
     loader/dm_guest_loader.c
     loader/dm_guest_placeholder.S
+    host/entry_hos.S
+    host/dm.h
+    host/hle_core.c
+    host/hle_svc.c
+    host/front_hos.c
+    host/host_boot.c
     gfx/dm_gfx_backend.c
+    gfx/dm_vk.cpp
+    gfx/nvn/dm_nvn.c
     render/dm_renderer.cpp
 )
 

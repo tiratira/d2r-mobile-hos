@@ -18,8 +18,20 @@ export class DmNative {
     return dmhost.guestSelfTest();
   }
 
+  static hostSelfTest(): string {
+    return dmhost.hostSelfTest();
+  }
+
   static gfxProbe(): string {
     return dmhost.gfxProbe();
+  }
+
+  static useVulkan(): number {
+    return dmhost.useVulkan();
+  }
+
+  static useGles(): number {
+    return dmhost.useGles();
   }
 
   /** phase: 0=down 1=move 2=up 3=cancel;x/y 传像素坐标(vp2px 换算后) */

@@ -14,23 +14,39 @@ II:重制版》在 iPhone/Mac 上的原生移植)的架构适配到 **HarmonyOS(
 | 层 | 状态 |
 |----|------|
 | HarmonyOS 工程骨架(hvigor + CMake,API 26,phone/tablet,横屏沉浸) | ✅ 可构建 |
-| Native 宿主库 `libdmhost.so`(平台 HAL / 输入 / guest 加载器骨架 / 图形后端接口) | ✅ 编译通过 |
-| XComponent + EGL/GLES3 原生渲染循环(表面/线程/触摸通路演示) | ✅ 已实现 |
-| ArkUI 触控叠加层:虚拟摇杆、技能键(点按/按住/拖拽瞄准)、腰带、Boss 血条、小地图占位 | ✅ 已实现(演示态) |
-| guest 镜像内嵌加载 + 门表自检(等价上游 gen_embed.py 策略) | ✅ 骨架 + 自检样例 |
-| 指令重写器 `hos` 规则集(svc gate / TLR) | ⏳ 待实施 |
-| NVN → Vulkan 图形回放后端 | ⏳ 待实施(NDK 已带 libvulkan) |
-| 宿主 HLE(syscall/线程/内存/服务)平移 | ⏳ 待实施 |
+| **M1 重写器**:`tools/patch_nso_hos.py` — `hos` 规则域(svc/tpidr/cntpct → 门桩直连 `dm_gate`,x18 保留;CUTS/OBS/PARAMS 表从上游源码切片同步) | ✅ 已交付(待真实 NSO 验证) |
+| **M1 嵌入**:`tools/hos_embed.py` — 容器 v2 打包(`.incbin` 进签名段 + gatebl 替换 + 门表)+ 合成 NSO 单测 | ✅ 已交付 |
+| **M2 宿主核心**:`host/entry_hos.S`(dm_gate 全量保存恢复)+ `hle_core.c`(八类门分派/线程环境/记名桩/HLE 段)+ `hle_svc.c`(分派框架+客体 VA 窗口)+ `host_boot.c`(加载→门注册→dm_thread_enter 启动序) | ✅ 编译通过,自检穿过 dm_gate 执行占位 guest |
+| **M3 图形**:`gfx/dm_vk.cpp` — Vulkan 实例→`VK_OHOS_surface`→交换链→呈现循环;`gfx/nvn/` — NVN 引导函数表 + 记名桩 | ✅ 骨架编译通过(真机 `useVulkan()` 验证通路) |
+| ArkUI:主菜单 / 游戏页(XComponent + 摇杆/技能/腰带/Boss条叠加层)/ 设置 / 移植状态(自检按钮 + VK/GLES 切换) | ✅ 已实现 |
+| XComponent EGL/GLES3 演示渲染循环(与 Vulkan 后端可切换) | ✅ 已实现 |
+| 真实游戏模块接入(重写→嵌入→SDK 启动序→NVN 录制回放→OHAudio) | ⏳ 下一阶段(需你的游戏文件) |
 
-完整映射表与实施路线见 **[docs/PORTING.md](docs/PORTING.md)**。
+完整映射与实施路线见 **[docs/PORTING.md](docs/PORTING.md)**。
 
 ## 目录速览
 
 ```
-entry/src/main/cpp/   native 宿主:hal / input / loader / gfx / render / napi
+tools/                M1:patch_nso_hos.py(hos 规则域)/ hos_embed.py(容器 v2 打包)/ test_patch_nso_hos.py
+entry/src/main/cpp/
+  host/               M2:entry_hos.S(门跳汇编)/ hle_core(门分派+线程环境)/ hle_svc / host_boot / front_hos
+  gfx/                M3:dm_vk.cpp(Vulkan WSI 管线)/ nvn/(NVN 引导骨架)
+  hal/ input/ loader/ render/ napi/   平台 HAL / 输入环 / 容器 v2 加载器 / EGL 演示 / NAPI 桥
 entry/src/main/ets/   ArkUI:pages(Index|Game|Settings|PortingStatus) + components(触控层)
 docs/PORTING.md       上游 → 鸿蒙 逐子系统映射与路线图
 ../d2r-mobile-src/    上游源码(克隆自 github.com/d2r-mobile/d2r-mobile)
+```
+
+## 重写自己游戏文件的管线(需 Python3 + lz4)
+
+```bash
+# 1. 从你的 Switch 游戏文件提取三个 NSO(上游 docs/GAME_FILES.md)
+# 2. HOS 规则域重写(DM_UPSTREAM 指向上游 patch_nso.py,默认 ../d2r-mobile-src)
+python tools/patch_nso_hos.py <main.nso> out/main main
+# 3. 打包成可编进 .so 的汇编
+python tools/hos_embed.py --outdir out/main --name main --kind 0 --out entry/src/main/cpp/loader/guest_main.S
+# 4. 把 guest_main.S 加入 CMake 源列表后构建
+# 合成 NSO 快速验证:python tools/test_patch_nso_hos.py
 ```
 
 ## 构建与运行

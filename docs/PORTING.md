@@ -71,59 +71,110 @@ Switch 版 D2R 是三个 NSO 模块(`main` / `sdk` / `subsdk0`)的 ARM64 原生
 
 ## 4. 关键技术决策
 
-### 4.1 重写规则集:`DM_RULESET=hos`
+### 4.1 重写规则集 `hos`(tools/patch_nso_hos.py,已交付)
 
-上游按规则集产出重写产物(`keypage` / `rules` / `touch`)。移植需在
-`patch_nso.py` 注册 `hos` 规则集,逐条对照:
+上游按规则集产出重写产物(`native` / `rules` / `touch`)。HOS 规则集以独立
+脚本 `tools/patch_nso_hos.py` 实现,CUTS/OBS/PARAMS 数据表直接从上游
+`patch_nso.py` 源码切片提取,保持同步。
 
-| 指令 | Apple 规则集(现状) | 建议的 HOS 规则集 |
-|------|--------------------|-------------------|
-| `x18` 读写 | 改线程槽 | 大概率保留(Linux 不征用 x18;保守起见可沿用槽方案,先保留再实测) |
-| `tpidr_el0` 读写 | 改线程槽 | 保留原指令(Linux TLS 语义兼容,需对齐 Horizon TCB 布局差异) |
-| `tpidrro_el0` 读 | 改线程槽 | 改 gate(内核写入的是 Linux 语义值,Horizon 语义需宿主提供) |
-| `svc #n` | 改 gate | **必须改 gate**(svc 会陷入 OHOS 内核) |
-| `cntpct_el0` 读 | 改 gate | 可保留直读(Linux 允许),频率语义差异由宿主在 gate/SDK 层校准 |
-| CUTS / OBS 表 | 按构建号注册 | 原样复用(与 OS 无关) |
+**核心差异 —— 槽基址**。上游补丁代码以 `mrs tpidrro_el0` 取 pthread TSD
+数组基址(Apple 内核把 TSD 指针放进 tpidrro);Linux/OHOS 内核往 tpidrro_el0
+写的是线程 TID(小整数),Apple 产物不能直接跑;x18 虽在 OHOS 上不被内核
+征用,但它是客体自写自读的寄存器,宿主不能拿它当槽基址。HOS 方案:
 
-验证:`dm/verify/regress.sh` 的 Unicorn 等价性试跑在开发机上即可对
-`hos` 规则集执行,不需要设备。
+- **门桩直连宿主**:镜像经 hos_embed.py 编进 libdmhost.so 的同一可执行段,
+  每个门桩直接 `bl dm_gate`(汇编期符号解析),按 LR 返回点查门表 —— 与
+  上游同一 ABI,但完全不需要每线程基址寄存器。
+- **tpidr_el0 / tpidrro_el0 也走门**(新门类 tpidr_r / tpidr_w / tpidrro_r):
+  宿主 C 侧用 pthread TSD 实现槽,绕开 musl 的 tpidr_el0(libc 依赖它,不
+  能让客体覆盖)。
+- **x18 不改写**:OHOS 内核与 musl 均不征用 x18,客体自写自读与 Horizon
+  语义一致;`dm_gate` 保存并恢复 x18(Apple 版跳过恢复,因为内核会改它)。
 
-### 4.2 代码段嵌入(签名约束)
+| 指令 | Apple 规则集 | HOS 规则集(patch_nso_hos.py) |
+|------|-------------|------------------------------|
+| `x18` 读写 | 改线程槽 K18(含独占窗口/跳转表展开) | **保留**(不改写) |
+| `mrs/msr tpidr_el0` | 内联读/写槽 KTLS | 门 tpidr_r / tpidr_w |
+| `mrs tpidrro_el0` | 内联读槽 KTLR | 门 tpidrro_r |
+| `svc #n` | 门(svc) | 门(svc),桩形一致 |
+| `mrs cntpct/cntvct_el0` | 门 | 门,宿主按 19.2MHz 应答 |
+| CUTS / OBS / PARAMS | 表驱动 | 同一张表(源码切片提取);PARAMS 变为 param 门 |
 
-OHOS 与 iOS 一样禁止运行时写可执行页。沿用上游方案:
+附带收益:HOS 规则集不需要 capstone(x18 的反汇编改写整个不需要),也不需
+要 eh_frame 函数边界扫描(仅 OBS 入口断言用,暂略)。
+
+产物格式与上游同名同列(`<名>.patched.bin/.gates.tsv/.sites.tsv/…`),另加
+`<名>.gatebl.tsv`:镜像文件内必须由 hos_embed.py 换成 `bl dm_gate` 的字偏移
+(重写器在这些位置留 `0x94000000` 占位)。
+
+**验证**:`tools/test_patch_nso_hos.py` 构造合成 NSO(埋 svc/tpidr/cntpct/x18
+指令),断言:埋点全换成跳转、x18 指令逐字保留、门数与 gatebl 数一致、
+hos_embed 生成的 .S 含正确数量的 `bl dm_gate`。运行需 python3 + lz4;真实
+模块的等价性回归仍用上游 `dm/verify/regress.sh`(开发机,平台无关)。
+
+### 4.2 代码段嵌入(tools/hos_embed.py,已交付)
+
+OHOS 与 iOS 一样禁止运行时写可执行页。沿用上游 gen_embed.py 策略并适配 ELF:
 
 ```
-宿主侧脚本(新增 dm/tools/hos_embed.py):
-  <name>.patched.bin + <name>.gates.tsv
-    → guest_<name>.S:
-        .section .dm_guest_<name>, "ax"
-        .incbin "<name>.patched.bin"
-        <门表数据>
-    → 并生成 DmGuestImageHeader(见 cpp/loader/dm_guest_loader.h)
-CMake:把生成的 .S 加入 libdmhost.so 源列表
-运行时:dmGuestLoadEmbedded() 直接登记,无需复制
+patch_nso_hos.py:
+  <名>.patched.bin(含键页与补丁区)+ .gates.tsv + .gatebl.tsv
+hos_embed.py:
+  → guest_<名>.S:
+      .section .dm_guest_<名>, "ax"        # 整块 4K 对齐,随 .so 签名
+      DmGuestImageHeader v2(32B)
+      .incbin 切片,gatebl 偏移处交替发 `bl dm_gate`
+      容器门表(N × 32B:{ret_off, kind, arg, orig_off, rsv})
+CMake:把生成的 .S 加入 libdmhost.so
+运行时:dmGuestLoadEmbedded() 只登记基址与门,不复制代码
 ```
 
-本仓库的 `dm_guest_placeholder.S` 就是该格式的自检样例。
+数据段写权限:容器整块在 "ax" 段,装载器在运行时对 `[DATA_OFF, 补丁区)` 页
+mprotect 加写(Linux 系内核允许对自有映射改权限;若具体版本拒绝 RWX,则对
+数据页去 X —— 数据页永不执行)。占位样例 `dm_guest_placeholder.S` 是该容器
+格式的手写实例,镜像体是一个真实门桩,自检会实际穿过 `dm_gate` 执行。
 
-### 4.3 图形:NVN → Vulkan
+### 4.3 宿主核心(cpp/host,已交付)
 
-上游 `nvn_mtl.m` 约 41 个 ObjC 文件回放 NVN 命令到 Metal。HOS 后端逐
-职责对应改写为 Vulkan:
+- `entry_hos.S`:上游 entry.S 的 ELF 移植 —— 记名桩表(4096)、`dm_gate`
+  (全量保存/恢复 x0-x30+q0-q31+NZCV;**x18 亦恢复**,HOS 上它承载客体
+  TCB)、`dm_thread_enter`(切客体栈调入口)。
+- `hle_core.c`:门表(开地址哈希,按返回点一次命中)分派八类门(svc /
+  cntpct / cntvct / obs / tpidr_r / tpidr_w / tpidrro_r / param);每线程
+  环境(TLS 块 8K + Horizon TLR 0x200 + SDK 临界区线程对象 TLR[0x1f8] +
+  参数位种子);未实现导入记名桩;HLE/HLE_FORCE 登记段(ELF `__start_swhle`
+  边界迭代)。
+- `hle_svc.c`:svc 分派框架 + 客体 4GiB 地址空间窗口(MAP_NORESERVE);每个
+  未实现调号记一次 hilog,按清单排期。宿主私有调号(上游 hle.h 的
+  SVC_HOST_*)占位。
+- `host_boot.c`:启动序 —— 加载内嵌容器 → 校验 → 门表注册(绝对地址 =
+  镜像基址 + ret_off)→ 每线程环境 → pthread 上 `dm_thread_enter` 调入口。
+  真实三模块接入后扩展为上游 main.c 的 SDK 启动序(init_array、nnMain、
+  跨模块重定位)。
+- `front_hos.c`:前端接口子集(分辨率参数位),表面尺寸接入后由游戏页覆盖。
 
-- NVN 命令缓冲/纹理/管线状态 → Vulkan command buffer / image / pipeline
-- 上游离线把着色器翻到 MSL;HOS 直接用 Ryujinx 链产出的 **SPIR-V**,
-  `vkCreateShaderModule` 消费,少一步翻译
-- 纹理格式:A16 及更早芯片的补充纹理包(BC 压缩)在鸿蒙按机型 GPU
-  (Maleoon/Adreno)验证 `VK_FORMAT_BC*` 支持,不支持时走上游
-  `bcdec` 软解(`dm/third_party/bcdec` 可直接编入 native)
-- 演示期表面:EGL/GLES3(本仓库 `cpp/render`)先行打通窗口/线程/输入
-  通路,Vulkan 回放器就位后替换
+### 4.4 图形:NVN → Vulkan(cpp/gfx,骨架已交付)
 
-### 4.4 触控界面
+上游 `nvn_mtl.m` 把 NVN 命令回放为 Metal。HOS 对应物:
+
+- `gfx/nvn/dm_nvn.c`:NVN 引导接口骨架 —— 宿主侧 `nvnBootstrapLoader`
+  返回函数表,表项为记名桩(首次调用记一行 hilog);录制层(hle_nvn.c
+  平移)就位后逐个换成真实录制函数。
+- `gfx/dm_vk.cpp`:Vulkan WSI 管线 —— 实例 → `VK_OHOS_surface`
+  (`vkCreateSurfaceOHOS`,NDK 自 API 10 提供)→ 图形+呈现队列 → 交换链 →
+  呈现循环。真机上 `useVulkan()` 成功即证明 Vulkan 出图通路可用;回放器
+  就位后只换每帧命令(当前为清屏色动画)。
+- 着色器链:上游 Maxwell→SPIR-V(Ryujinx)→MSL 两步;HOS 止步 SPIR-V,
+  `vkCreateShaderModule` 直接消费,少一步翻译。
+- 纹理:BC 压缩格式按机型 GPU 验证 `VK_FORMAT_BC*`,不支持时编入上游
+  `dm/third_party/bcdec` 软解。
+- EGL/GLES3 演示后端(`render/dm_renderer.cpp`)保留:同一表面可在两后端
+  间切换,`devecocli run` 后在「移植状态」页可验证。
+
+### 4.5 触控界面(已交付,见 entry/src/main/ets)
 
 上游的触控规则("保留原界面语言,用手势替代额外按钮")原样适用于鸿蒙。
-本仓库以 ArkUI 实现:摇杆(精确对角线)、技能键(点按/按住/拖拽瞄准)、
+ArkUI 叠加层:摇杆(精确对角线)、技能键(点按/按住/拖拽瞄准 + 双技能组)、
 腰带、Boss 血条、小地图占位;合成输入经 NAPI 注入 `cpp/input`,与
 XComponent 原生触摸事件汇入同一事件环。guest 接入后,这些事件改由
 `dm_cursor.c` / `hle_private_aim.c` 平移版消费。

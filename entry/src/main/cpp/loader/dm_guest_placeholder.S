@@ -1,27 +1,35 @@
 /*
- * dm_guest_placeholder.S — 编译进 .so 的占位 guest 镜像。
+ * dm_guest_placeholder.S — 编译进 .so 的占位 guest 容器(v2)。
  *
- * 上游 iOS 用 ios/tools/gen_embed.py 把 patch_nso.py 的重写产物
- * <name>.patched.bin 变成汇编编进 App;HOS 移植沿用同一策略:宿主侧
- * 脚本生成同样的 .incbin 段(见 docs/PORTING.md),此文件是带完整
- * 容器头的占位样例,供加载器自检,不含任何游戏内容。
+ * 正式产物由 tools/patch_nso_hos.py + tools/hos_embed.py 从你的游戏 NSO 生成
+ * (容器 v2,与 dm_guest_loader.h 对齐)。本文件是手工等价样例:镜像体只有
+ * 一个 HOS 门桩(stp; bl dm_gate; ldp; ret),门表登记一个 tpidr_r 门
+ * (ret_off=8, arg=x0)。宿主自检会实际穿过 dm_gate 执行它,验证
+ * 线程环境/门分派/寄存器回写全链路。不含任何游戏内容。
  */
     .section .dm_guest_placeholder, "ax"
-    .align 3
-    .global __dm_guest_placeholder_start
+    .p2align 12
+    .globl __dm_guest_placeholder_start
     .type __dm_guest_placeholder_start, @object
 __dm_guest_placeholder_start:
-    /* DmGuestImageHeader (32 字节) */
+    /* DmGuestImageHeader v2 (32B) */
     .word 0x48523244      /* magic 'D2RH' */
-    .word 1               /* version */
+    .word 2               /* version */
     .word 0               /* module_kind = main */
     .word 1               /* gate_count */
-    .xword 4              /* image_size */
-    .xword 0              /* entry_offset */
-    /* 镜像:单条 ARM64 ret 指令 */
-    .word 0xd65f03c0
-    /* 门表: { u32 gate_id; u64 image_offset } 自然对齐共 16 字节 */
-    .word 0               /* gate_id = 0 */
-    .word 0               /* 对齐填充 */
-    .xword 0              /* image_offset */
+    .xword 16             /* image_size */
+    .xword 0              /* entry_offset = 0(入口即门桩) */
+    /* 镜像:HOS 门桩 + ret(等价 patch_nso_hos.py 的 site_gate 产物) */
+    stp x29, x30, [sp, #-16]!
+    bl dm_gate            /* ← hos_embed.py 的 gatebl 替换点,手写版直接写指令 */
+    ldp x29, x30, [sp], #16
+    ret
+    /* 门表 @ 32+16 = 48(已 8 字节对齐) */
+    .globl __dm_guest_placeholder_gates
+__dm_guest_placeholder_gates:
+    .xword 8              /* ret_off:bl 后一条(ldp) */
+    .word 4               /* kind = DM_GATE_TPIDR_R */
+    .word 0               /* arg = x0 */
+    .xword 0              /* orig_off */
+    .xword 0              /* reserved */
     .size __dm_guest_placeholder_start, .-__dm_guest_placeholder_start

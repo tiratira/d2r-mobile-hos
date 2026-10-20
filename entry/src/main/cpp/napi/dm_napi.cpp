@@ -15,13 +15,17 @@
 #include "input/dm_input.h"
 #include "loader/dm_guest_loader.h"
 #include "gfx/dm_gfx_backend.h"
+#include "gfx/dm_vk.h"
+#include "gfx/nvn/dm_nvn.h"
 #include "render/dm_renderer.h"
+#include "host/dm.h"
 
 #define DM_LOG_TAG "D2RMobileHOS"
 #define DMLOG_I(...) OH_LOG_INFO(LOG_APP, __VA_ARGS__)
 #define DMLOG_E(...) OH_LOG_ERROR(LOG_APP, __VA_ARGS__)
 
 static DmRenderer g_renderer;
+static OHNativeWindow *g_window = nullptr;   /* SurfaceCreated 保存,后端切换用 */
 
 static void OnSurfaceCreatedCB(OH_NativeXComponent *component, void *window)
 {
@@ -31,9 +35,10 @@ static void OnSurfaceCreatedCB(OH_NativeXComponent *component, void *window)
         return;
     }
     DMLOG_I("surface created");
+    g_window = reinterpret_cast<OHNativeWindow *>(window);
     dmInputInit();
     dmPlatInit();
-    g_renderer.Start(reinterpret_cast<OHNativeWindow *>(window));
+    g_renderer.Start(g_window);
 }
 
 static void OnSurfaceChangedCB(OH_NativeXComponent *component, void *window)
@@ -47,7 +52,9 @@ static void OnSurfaceDestroyedCB(OH_NativeXComponent *component, void *window)
     (void)window;
     (void)component;
     DMLOG_I("surface destroyed");
+    dmVkStop();
     g_renderer.Stop();
+    g_window = nullptr;
 }
 
 static void DispatchTouchEventCB(OH_NativeXComponent *component, void *window)
@@ -132,11 +139,50 @@ static napi_value GuestSelfTest(napi_env env, napi_callback_info info)
     return result;
 }
 
+static napi_value HostSelfTest(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    char report[256];
+    int rc = dmHostBoot("main", report, sizeof(report));
+    napi_value result;
+    napi_create_string_utf8(env, rc == 0 ? report : report, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
 static napi_value GfxProbe(napi_env env, napi_callback_info info)
 {
     (void)info;
+    char report[512];
+    snprintf(report, sizeof(report), "%s | %s | %s",
+             dmVkProbe(), dmGfxBackendName(DM_GFX_BACKEND_EGL_GLES), dmNvnSelfTest());
     napi_value result;
-    napi_create_string_utf8(env, dmGfxVulkanProbe(), NAPI_AUTO_LENGTH, &result);
+    napi_create_string_utf8(env, report, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value UseVulkan(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    napi_value result;
+    int rc = -1;
+    if (g_window != nullptr) {
+        g_renderer.Stop();
+        rc = dmVkStart(g_window);
+    }
+    napi_create_int32(env, rc, &result);
+    return result;
+}
+
+static napi_value UseGles(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    napi_value result;
+    int rc = -1;
+    if (g_window != nullptr) {
+        dmVkStop();
+        rc = g_renderer.Start(g_window);
+    }
+    napi_create_int32(env, rc, &result);
     return result;
 }
 
@@ -198,7 +244,10 @@ static napi_value Init(napi_env env, napi_value exports)
         {"getHostInfo", nullptr, GetHostInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setFilesDir", nullptr, SetFilesDir, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"guestSelfTest", nullptr, GuestSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"hostSelfTest", nullptr, HostSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"gfxProbe", nullptr, GfxProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"useVulkan", nullptr, UseVulkan, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"useGles", nullptr, UseGles, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"touchInject", nullptr, TouchInject, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setStick", nullptr, SetStick, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"castSkill", nullptr, CastSkill, nullptr, nullptr, nullptr, napi_default, nullptr},
