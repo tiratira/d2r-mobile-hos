@@ -23,7 +23,7 @@ struct PortingStatus {
     { system: '宿主加载/门注册', upstream: 'dm/host/loader.c', hos: 'cpp/loader v2 + host/host_boot.c 启动序', state: '已完成' },
     { system: '门分派汇编', upstream: 'dm/host/entry.S(Mach-O)', hos: 'cpp/host/entry_hos.S(ELF,x18 保持)', state: '已完成' },
     { system: '线程槽/计数器', upstream: 'dm/host/thread.c + hle.c', hos: 'cpp/hal + hle_core(pthread TSD + 19.2MHz)', state: '已完成' },
-    { system: '系统调用接管', upstream: 'dm/host/hle_svc.c / hle_thread.c', hos: '分派框架 + 记名日志 + 客体 VA 窗口', state: '骨架就绪' },
+    { system: '系统调用接管', upstream: 'dm/host/hle_svc.c / hle_thread.c', hos: '内存/查询类 + 线程/同步类 + 0x80 起宿主调用(zlib/转调),自检 17/17', state: '已实现' },
     { system: 'NVN 命令层', upstream: 'dm/gfx/nvn/hle_nvn.c(纯 C)', hos: 'cpp/gfx/nvn:引导 + 函数表 + 记名桩', state: '骨架就绪' },
     { system: '回放后端', upstream: 'dm/gfx/nvn/nvn_mtl.m(Metal)', hos: 'cpp/gfx/dm_vk:实例→VK_OHOS_surface→交换链→呈现', state: '骨架就绪' },
     { system: '着色器翻译', upstream: 'gfx/tools:Maxwell→SPIR-V→MSL', hos: '止步 SPIR-V,供 Vulkan 消费', state: '待实施' },

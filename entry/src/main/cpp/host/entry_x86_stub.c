@@ -23,10 +23,10 @@ uint64_t dm_gate(uint64_t ret_addr, uint64_t *regs)
 
 void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp)
 {
-    (void)entry;
-    (void)arg;
     (void)sp;
-    OH_LOG_WARN(LOG_APP, "dm_thread_enter: ARM64 guest execution unavailable on x86_64");
+    /* x86_64 上没有 ARM64 guest 代码可执行;唯一调用方是 svc HLE 自检的
+     * 测试线程(entry 为宿主函数地址),按宿主约定直接调用。 */
+    ((void (*)(uint64_t))entry)(arg);
 }
 
 /* 占位 guest 容器(与 dm_guest_placeholder.S 同字节,仅作加载器自检数据,

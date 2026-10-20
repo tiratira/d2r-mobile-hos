@@ -45,8 +45,21 @@ uint64_t unimpl_c(unsigned idx, uint64_t *regs);
 void dm_thread_returned(void);
 void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp);
 
-/* svc 分派(hle_svc.c) */
+/* svc 分派(hle_svc.c;线程/同步类在 hle_thread.c,宿主调用在 hle_hostcall.c) */
 uint64_t svc_dispatch(uint32_t num, uint64_t *regs, uint64_t orig_addr);
+int svc_thread(int num, uint64_t *regs);
+uint64_t svc_host_call(uint32_t num, uint64_t *regs, uint64_t orig);
+uint32_t dm_svc_thread_main_init(void);   /* 主线程登记,进客体前调一次 */
+uint32_t dm_thr_cur_handle(void);
+int dm_svc_selftest(char *report, int report_size);
+int dm_guest_heap_readable(uint64_t a, size_t n);
+
+/* 模块注册表(hle_core.c;host_boot 登记加载好的 guest 模块) */
+typedef struct { char name[16]; const uint8_t *base; uint64_t size; } dm_module_t;
+void dm_module_register(const char *name, const uint8_t *base, uint64_t size);
+const dm_module_t *dm_module_find(const char *name);
+const dm_module_t *dm_module_of(uint64_t addr);
+const dm_module_t *dm_module_iter(const dm_module_t *prev);   /* NULL = 从头遍历 */
 
 /* 启动序(host_boot.c) */
 int dmHostBoot(const char *which, char *report, int report_size);

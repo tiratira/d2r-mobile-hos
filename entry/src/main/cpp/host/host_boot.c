@@ -44,11 +44,19 @@ void dm_thread_returned(void)
 }
 
 /*
- * 探测内嵌模块:加载 + 校验 + 注册门表,不执行任何入口。
+ * 探测内嵌模块:加载 + 校验 + 注册门表 + 进模块注册表,不执行任何入口。
+ * 幂等:模块保持加载(门表/转调引用其绝对地址),重复调用只回报缓存结果。
  * 真实 nnMain 要等 svc/线程 HLE 填齐(hilog 的 UNIMPL 清单)才能启动。
  */
 int dmHostProbeModules(char *report, int report_size)
 {
+    static int s_done;
+    static char s_cache[320];
+    if (s_done) {
+        snprintf(report, report_size, "%s", s_cache);
+        return 0;
+    }
+    s_done = 1;
     struct {
         const char *name;
         const uint8_t *blob;
@@ -77,25 +85,34 @@ int dmHostProbeModules(char *report, int report_size)
                                   gt.arg, (uint64_t)(m.image + gt.orig_off));
             }
         }
+        /* 保持加载:门表登记的是镜像内绝对地址,释放即悬空(剪口转调也要用) */
+        dm_module_register(mods[i].name, m.image, m.hdr.image_size);
         total_gates += (int)m.hdr.gate_count;
         loaded++;
         off += snprintf(report + off, report_size - off,
                         "%s:%lluB/%ug ", mods[i].name,
                         (unsigned long long)m.hdr.image_size, m.hdr.gate_count);
-        dmGuestUnload(&m);
     }
     if (loaded == 0) {
-        snprintf(report, report_size, "no embedded game modules (placeholder only)");
-        return 0;
+        snprintf(s_cache, sizeof(s_cache), "no embedded game modules (placeholder only)");
+    } else {
+        snprintf(s_cache + off, sizeof(s_cache) - off,
+                 "| %d modules, %d gates registered (not booted)", loaded, total_gates);
     }
-    snprintf(report + off, report_size - off, "| %d modules, %d gates registered (not booted)",
-             loaded, total_gates);
+    snprintf(report, report_size, "%s", s_cache);
     return 0;
 }
 
 int dmHostBoot(const char *which, char *report, int report_size)
 {
-    /* 当前只有占位容器;真实模块在此按 main/sdk/subsdk0 依次加载。 */
+    /* 占位容器自检:验证「线程环境 → 门分派 → 寄存器回写 → 返回」全链路;
+     * 真实模块的 nnMain 启动待 svc HLE 验证后接入。幂等防重复登记。 */
+    static int s_done;
+    if (s_done) {
+        snprintf(report, report_size, "boot: already run (see first report)");
+        return 0;
+    }
+    s_done = 1;
     (void)which;
     DmGuestModule m;
     if (dmGuestLoadEmbedded(__dm_guest_placeholder_start, UINT64_MAX, "main", &m) != 0 ||
@@ -113,9 +130,8 @@ int dmHostBoot(const char *which, char *report, int report_size)
         gate_register_abs((uint64_t)(m.image + g.ret_off), (int)g.kind, g.arg,
                           (uint64_t)(m.image + g.orig_off));
     }
-    /* 客体地址空间窗口(真实接入时切堆/栈) */
-    dm_guest_va_reserve();
-    /* 客体主线程:宿主栈仅用于 dm_thread_enter 垫层,随即切客体栈 */
+    /* 主线程登记(线程类 svc 要用),客体地址空间由首个 svc 触发预留 */
+    dm_svc_thread_main_init();
 #ifdef __aarch64__
     boot_ctx c;
     c.mod = m;

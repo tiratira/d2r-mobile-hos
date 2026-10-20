@@ -255,3 +255,50 @@ uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs)
         }
     }
 }
+
+/* ---------- 模块注册表(host_boot 登记加载好的 guest 模块;门表 orig 查询、
+ * 剪口转调、Break 定位、image_bytes 记账共用) ---------- */
+#define DM_MAX_MOD 8
+static dm_module_t g_mods[DM_MAX_MOD];
+static int g_nmods;
+
+void dm_module_register(const char *name, const uint8_t *base, uint64_t size)
+{
+    if (g_nmods >= DM_MAX_MOD) {
+        die("模块注册表满");
+    }
+    dm_module_t *m = &g_mods[g_nmods++];
+    snprintf(m->name, sizeof m->name, "%s", name);
+    m->base = base;
+    m->size = size;
+}
+
+const dm_module_t *dm_module_find(const char *name)
+{
+    for (int i = 0; i < g_nmods; i++) {
+        if (strcmp(g_mods[i].name, name) == 0) {
+            return &g_mods[i];
+        }
+    }
+    return NULL;
+}
+
+const dm_module_t *dm_module_of(uint64_t addr)
+{
+    for (int i = 0; i < g_nmods; i++) {
+        if (addr >= (uint64_t)(uintptr_t)g_mods[i].base &&
+            addr < (uint64_t)(uintptr_t)g_mods[i].base + g_mods[i].size) {
+            return &g_mods[i];
+        }
+    }
+    return NULL;
+}
+
+const dm_module_t *dm_module_iter(const dm_module_t *prev)
+{
+    if (!prev) {
+        return g_nmods ? &g_mods[0] : NULL;
+    }
+    int idx = (int)(prev - g_mods);
+    return idx + 1 < g_nmods ? &g_mods[idx + 1] : NULL;
+}

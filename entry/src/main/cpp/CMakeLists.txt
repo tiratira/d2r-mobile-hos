@@ -15,6 +15,8 @@ add_library(dmhost SHARED
     loader/dm_guest_loader.c
     host/hle_core.c
     host/hle_svc.c
+    host/hle_thread.c
+    host/hle_hostcall.c
     host/front_hos.c
     host/host_boot.c
     gfx/dm_gfx_backend.c
@@ -51,4 +53,5 @@ target_link_libraries(dmhost PUBLIC
     libGLESv3.so
     libhilog_ndk.z.so
     libvulkan.so
+    libz.so
 )
