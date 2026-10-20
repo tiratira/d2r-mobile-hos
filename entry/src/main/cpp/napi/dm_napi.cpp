@@ -99,6 +99,15 @@ static void RegisterCallbacks(napi_env env, napi_value exports)
     DMLOG_I("xcomponent callbacks registered");
 }
 
+static const char *HostAbiName(void)
+{
+#ifdef __aarch64__
+    return "arm64";
+#else
+    return "x86_64";
+#endif
+}
+
 static napi_value GetHostInfo(napi_env env, napi_callback_info info)
 {
     (void)info;
@@ -107,10 +116,32 @@ static napi_value GetHostInfo(napi_env env, napi_callback_info info)
     dmGuestSelfTest(guest, sizeof(guest));
     uint64_t c = dmPlatCounterRead();
     snprintf(report, sizeof(report),
-             "dmhost-hos arm64 | slots:tcb/tlr/gate | counter:%llu@19.2MHz | gfx:%s | %s",
-             (unsigned long long)c, dmGfxBackendName(DM_GFX_BACKEND_EGL_GLES), guest);
+             "dmhost-hos %s | slots:tcb/tlr/gate | counter:%llu@19.2MHz | gfx:%s | %s",
+             HostAbiName(), (unsigned long long)c,
+             dmGfxBackendName(DM_GFX_BACKEND_EGL_GLES), guest);
     napi_value result;
     napi_create_string_utf8(env, report, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+/* 实际 ABI:x86_64 模拟器只能跑 data-only 框架层,ARM64 真机才执行游戏 */
+static napi_value HostAbi(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    napi_value result;
+    napi_create_string_utf8(env, HostAbiName(), NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value GuestExecSupported(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    napi_value result;
+#ifdef __aarch64__
+    napi_create_int32(env, 1, &result);
+#else
+    napi_create_int32(env, 0, &result);
+#endif
     return result;
 }
 
@@ -310,6 +341,8 @@ static napi_value Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor desc[] = {
         {"getHostInfo", nullptr, GetHostInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"hostAbi", nullptr, HostAbi, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"guestExecSupported", nullptr, GuestExecSupported, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setFilesDir", nullptr, SetFilesDir, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"guestSelfTest", nullptr, GuestSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hostSelfTest", nullptr, HostSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},

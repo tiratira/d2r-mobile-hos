@@ -2,6 +2,10 @@
  * libdmhost.so 类型声明 — D2R Mobile HOS 原生宿主桥。
  */
 export const getHostInfo: () => string;
+/** 实际 ABI:"arm64"(真机)| "x86_64"(PC 模拟器,data-only) */
+export const hostAbi: () => string;
+/** 1 = 能执行游戏客体(ARM64);0 = 仅框架层(x86_64 模拟器) */
+export const guestExecSupported: () => number;
 export const setFilesDir: (dir: string) => void;
 export const guestSelfTest: () => string;
 /** 宿主全链路自检:加载内嵌 guest → 注册门 → 穿过 dm_gate 执行入口 */

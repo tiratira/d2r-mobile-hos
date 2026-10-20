@@ -10,6 +10,14 @@ export class DmNative {
     return dmhost.getHostInfo();
   }
 
+  static hostAbi(): string {
+    return dmhost.hostAbi();
+  }
+
+  static guestExecSupported(): number {
+    return dmhost.guestExecSupported();
+  }
+
   static setFilesDir(dir: string): void {
     dmhost.setFilesDir(dir);
   }

@@ -17,6 +17,32 @@ import { BossBar } from '../components/BossBar';
 struct Game {
   @State bossHp: number = 76.4;
   @State bossName: string = '都瑞尔 Duriel';
+  @State abi: string = '';
+  @State bootInfo: string = '';
+  @State bootStage: string = '未启动';
+  private stageTimer: number = -1;
+
+  aboutToAppear(): void {
+    this.abi = DmNative.hostAbi();
+  }
+
+  aboutToDisappear(): void {
+    if (this.stageTimer >= 0) {
+      clearInterval(this.stageTimer);
+      this.stageTimer = -1;
+    }
+  }
+
+  /** 进入游戏:真机(ARM64)自动走 SDK 启动序;模拟器只做预检并显示原因 */
+  private startGuest(): void {
+    this.bootInfo = DmNative.hostStart();
+    this.bootStage = DmNative.bootStage();
+    if (this.stageTimer < 0) {
+      this.stageTimer = setInterval(() => {
+        this.bootStage = DmNative.bootStage();
+      }, 1500);
+    }
+  }
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
@@ -29,7 +55,28 @@ struct Game {
           if (filesDir !== '') {
             DmNative.setFilesDir(filesDir);
           }
+          this.startGuest();
         })
+
+      // 运行形态说明:模拟器(x86_64)不执行 ARM64 游戏,避免把演示渐变误认成游戏画面
+      if (this.abi !== 'arm64') {
+        Column({ space: 4 }) {
+          Text('模拟器模式(x86_64)')
+            .fontSize(12)
+            .fontColor('#e8b46a')
+            .fontWeight(FontWeight.Bold)
+          Text('本机只跑移植框架层 + 演示渲染,不执行 ARM64 游戏客体。\n游戏画面需要 ARM64 鸿蒙真机(连接后 devecocli run 即可)。')
+            .fontSize(10)
+            .fontColor('#b7a67e')
+            .textAlign(TextAlign.Center)
+        }
+        .position({ x: '20%', y: '42%' })
+        .width('60%')
+        .padding(10)
+        .backgroundColor('rgba(20,12,6,0.72)')
+        .borderRadius(10)
+        .border({ width: 1, color: 'rgba(200,170,110,0.25)' })
+      }
 
       // 顶部中央:Boss 血条
       Column() {
@@ -50,6 +97,23 @@ struct Game {
         .onClick(() => {
           router.back();
         })
+
+      // 启动状态(真机显示 BOOT 阶段;模拟器显示预检摘要)
+      Column({ space: 2 }) {
+        Text(this.abi === 'arm64' ? `启动阶段:${this.bootStage}` : '框架层已加载 · 游戏未执行')
+          .fontSize(10)
+          .fontColor(this.abi === 'arm64' ? '#9fbf8a' : '#bf9a6a')
+        if (this.bootInfo !== '') {
+          Text(this.bootInfo)
+            .fontSize(8)
+            .fontColor('#8a7c62')
+            .maxLines(3)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        }
+      }
+      .position({ x: 12, y: 52 })
+      .width('64%')
+      .alignItems(HorizontalAlign.Start)
 
       // 右上:小地图占位
       Column() {
