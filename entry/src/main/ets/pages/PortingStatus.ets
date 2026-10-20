@@ -20,7 +20,7 @@ struct PortingStatus {
   private rows: StatusRow[] = [
     { system: '指令重写器', upstream: 'dm/tools/patch_nso.py(Python,离线)', hos: 'tools/patch_nso_hos.py:hos 规则域(门桩直连 dm_gate)', state: '骨架就绪' },
     { system: '镜像嵌入', upstream: 'ios/tools/gen_embed.py(.incbin 进签名段)', hos: 'tools/hos_embed.py:容器 v2 + gatebl 替换', state: '已完成' },
-    { system: '宿主加载/门注册', upstream: 'dm/host/loader.c', hos: 'cpp/loader v2 + host/host_boot.c 启动序', state: '已完成' },
+    { system: '宿主加载/门注册', upstream: 'dm/host/loader.c', hos: 'cpp/loader v3 + host/loader_hos.c(原地装载/重定位/符号哈希)', state: '已实现' },
     { system: '门分派汇编', upstream: 'dm/host/entry.S(Mach-O)', hos: 'cpp/host/entry_hos.S(ELF,x18 保持)', state: '已完成' },
     { system: '线程槽/计数器', upstream: 'dm/host/thread.c + hle.c', hos: 'cpp/hal + hle_core(pthread TSD + 19.2MHz)', state: '已完成' },
     { system: '系统调用接管', upstream: 'dm/host/hle_svc.c / hle_thread.c', hos: '内存/查询类 + 线程/同步类 + 0x80 起宿主调用(zlib/转调),自检 17/17', state: '已实现' },

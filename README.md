@@ -18,6 +18,7 @@ II:重制版》在 iPhone/Mac 上的原生移植)的架构适配到 **HarmonyOS(
 | **M1 嵌入**:`tools/hos_embed.py` — 容器 v2 打包(`.incbin` 进签名段 + gatebl 替换 + 门表)+ 合成 NSO 单测 | ✅ 已交付 |
 | **M2 宿主核心**:`host/entry_hos.S`(dm_gate 全量保存恢复)+ `hle_core.c`(八类门分派/线程环境/记名桩/HLE 段/模块注册表)+ `host_boot.c`(加载→门注册→dm_thread_enter 启动序) | ✅ 编译通过,自检穿过 dm_gate 执行占位 guest |
 | **M2 svc HLE**:`hle_svc.c`(客体地址空间 + 内存/查询类)+ `hle_thread.c`(线程/锁/条件/地址仲裁/事件/WaitSync 全量)+ `hle_hostcall.c`(0x80 TACT zlib 解码 + 0x81-0x8b 转调原函数) | ✅ 模拟器自检 **17/17** |
+| **M2 loader(rtld)**:`loader_hos.c` + 容器 v3 — 三模块**原地装载**(镜像在签名节内,仅数据窗口 mprotect RW 后原地重定位),符号哈希/跨模块解析/swforce 接管;模拟器实测 main 700 符号/6 万余重定位,SDK 启动序 7 符号全解析 | ✅ x86 data-only 同码验证 |
 | **M3 图形**:`gfx/dm_vk.cpp` — Vulkan 实例→`VK_OHOS_surface`→交换链→呈现循环;`gfx/nvn/` — NVN 引导函数表 + 记名桩 | ✅ 骨架编译通过(模拟器实测 Vulkan 实例 OK) |
 | **资源管线**:基础版直读 `extract_romfs_hos.py --base-only`(IVFC L4 逐块认证)+ v2228224 完整提取 `extract_romfs_hactool.sh`(基座区 100% 块一致交叉验证) | ✅ 25 文件 7.68 GiB + 46 文件 8.36 GiB |
 | ArkUI:主菜单 / 游戏页(XComponent + 摇杆/技能/腰带/Boss条叠加层)/ 设置 / 移植状态(自检按钮 + VK/GLES 切换) | ✅ 已实现 |
