@@ -100,14 +100,13 @@ class RomfsReader:
     def __init__(self, base_nca, base_k, upd_nca, upd_k, data_off):
         self.base_sec = base_nca.sections[base_k]
         self.upd_sec = upd_nca.sections[upd_k]
-        self.base_fs = base_nca[base_k]
         self.upd_fs = upd_nca[upd_k]
         self.upd_crypto = self.upd_sec.crypto
         self.data_off = data_off
         self.sec_abs = upd_nca.header.sectionTables[upd_k].offset
-        # 密钥/计数器在节的 partition 视图上(Nca.open 把 titleKeyDec 传给它)
-        self.key = self.upd_sec.cryptoKey
-        self.counter = self.upd_sec.cryptoCounter
+        # 从工作着的 crypto 对象拿 key/nonce(它成功解过本节的 reloc 表区)
+        self.key = self.upd_crypto.key
+        self.counter = self.upd_crypto.nonce
         self._parse_relocations()
         self._parse_subsections()
         Print.info(f'bktr: reloc entries={len(self.reloc)} subsections={len(self.sub)}')
@@ -122,28 +121,28 @@ class RomfsReader:
         return b
 
     def _parse_relocations(self):
+        """照 hactool bktr.h/bktr.c:块头(16B + 0x3FF0 桶虚拟偏移表)之后,
+        桶节点按 sizeof(bucket)+sizeof(entry) = 0x4000+0x14 间距排列;
+        条目 20 字节 {u64 虚拟, u64 物理, u32 isPatch},桶内按虚拟偏移有序。"""
         bk = self.upd_fs.bktrRelocation
         assert bk is not None and bk.bktr_size > 0, '更新节没有 BKTR 重定位表'
         p = bk.bktr_offset
         pad, bucket_count, total = struct.unpack('<IIQ', self._sec_read(self.upd_sec, p, 16))
-        base_offs = struct.unpack(f'<{0x3FF0 // 8}Q',
-                                  self._sec_read(self.upd_sec, p + 16, 0x3FF0))
         entries = []
         q = p + 0x4000
-        for _ in range(bucket_count):
-            # 桶节点紧密排列:头节点 0x4000 后依次;endOffset 是虚拟界,不是表内偏移
+        for b in range(bucket_count):
+            # 桶节点 0x4000 间距(实测本表:p+0x8000 处 cnt=17、end=总补丁大小、
+            # 首条目虚拟偏移恰接桶1 末尾;hactool 源码的 +0x14 是其指针算术怪癖)
             bpad, cnt, end = struct.unpack('<IIQ', self._sec_read(self.upd_sec, q, 16))
             raw = self._sec_read(self.upd_sec, q + 16, cnt * 20)
             for i in range(cnt):
-                # 条目 20 字节 {u64 虚拟, u64 物理, u32 isPatch}(Atmosphere 序列化布局,
-                # 对照验证:v=0x10d0560→p=0xf70570 恰为 base 数据区起点+0x570)
                 v, ph, is_patch = struct.unpack_from('<QQI', raw, i * 20)
                 if v == 0 and ph == 0:
-                    continue          # 桶内零填充条目(第二桶可为全零占位)
+                    continue          # 零填充条目
                 entries.append((v, ph, is_patch))
-            q += 16 + cnt * 20
+            q += 0x4000
         entries.sort()
-        # 同一虚拟起点只留首条(表内顺序即优先序;重复 v 排序后取末条会串)
+        # 同一虚拟起点只留首条(表内顺序即优先序)
         dedup = []
         for e in entries:
             if dedup and dedup[-1][0] == e[0]:
@@ -187,7 +186,8 @@ class RomfsReader:
         return cur_ctr, nxt
 
     def _upd_phys_read(self, phys, n):
-        """更新节物理读,按子段 CTR 解密(调用方保证 [phys,phys+n) 不跨子段)。"""
+        """更新节物理读(节级偏移),按子段 CTR 解密;调用方保证不跨子段。
+        照 hactool:nca_update_bktr_ctr(ctr, subsec.ctr_val, phys + 节起点)。"""
         sec = self.upd_sec
         sec.crypto = None                        # 取原始密文
         try:
@@ -198,18 +198,21 @@ class RomfsReader:
         if len(raw) != n:
             raise IOError(f'upd short read {phys:#x}+{n:#x}')
         ctr, _ = self._sub_bound(phys)
-        if ctr is None:
-            return raw                           # 子段表未覆盖:节连续 CTR
         aes = aes128.AESCTR(self.key, nonce=bytearray(self.counter))
-        aes.bktrSeek(self.sec_abs + self.data_off + phys, ctr)
+        if ctr is None:
+            aes.seek(self.sec_abs + phys)        # 连续 CTR
+        else:
+            aes.bktrSeek(self.sec_abs + phys, ctr)
         return aes.decrypt(bytearray(raw))
 
     def read(self, v, n):
+        """hactool 语义:虚拟偏移是更新节的节级偏移(v=0=节起始,含 IVFC 层)。
+        section_ofs = v - reloc.virt + reloc.phys(同为节级);
+        is_patch → 本节(子段 CTR),否则 → 基础节(基座自己的连续 CTR)。"""
         out = bytearray()
         while n > 0:
             i, rv, ph, is_patch = self._reloc_at(v)
             phys = ph + (v - rv)
-            # 本重定位条目的管辖长度(到下一条目的虚拟起点)
             span_end = self.reloc[i + 1][0] if i + 1 < len(self.reloc) else v + n
             limit = span_end - v
             if is_patch:
@@ -220,10 +223,14 @@ class RomfsReader:
             if is_patch:
                 out += self._upd_phys_read(phys, chunk)
             else:
-                out += self._sec_read(self.base_sec, self.data_off + phys, chunk)
+                out += self._sec_read(self.base_sec, phys, chunk)
             v += chunk
             n -= chunk
         return bytes(out)
+
+    def read_romfs(self, off, n):
+        """romfs 级偏移(0=数据层起点)读。"""
+        return self.read(self.data_off + off, n)
 
 
 def walk_romfs(rd, data_size):
@@ -354,7 +361,13 @@ def main():
                 return r
         rd = BaseReader()
     else:
-        rd = RomfsReader(b_nca, b_k, u_nca, u_k, u_doff)
+        rr = RomfsReader(b_nca, b_k, u_nca, u_k, u_doff)
+
+        class RomfsView:
+            """walk/提取/校验都用 romfs 级偏移(0=数据层起点);BKTR 用节级。"""
+            def read(self, v, n):
+                return rr.read_romfs(v, n)
+        rd = RomfsView()
     files, fd_off, _ = walk_romfs(rd, data_size)
     total = sum(s for _, _, s in files)
     Print.info(f'romfs: {len(files)} files, {total / (1 << 30):.2f} GiB')

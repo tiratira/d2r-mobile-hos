@@ -19,7 +19,7 @@ II:重制版》在 iPhone/Mac 上的原生移植)的架构适配到 **HarmonyOS(
 | **M2 宿主核心**:`host/entry_hos.S`(dm_gate 全量保存恢复)+ `hle_core.c`(八类门分派/线程环境/记名桩/HLE 段/模块注册表)+ `host_boot.c`(加载→门注册→dm_thread_enter 启动序) | ✅ 编译通过,自检穿过 dm_gate 执行占位 guest |
 | **M2 svc HLE**:`hle_svc.c`(客体地址空间 + 内存/查询类)+ `hle_thread.c`(线程/锁/条件/地址仲裁/事件/WaitSync 全量)+ `hle_hostcall.c`(0x80 TACT zlib 解码 + 0x81-0x8b 转调原函数) | ✅ 模拟器自检 **17/17** |
 | **M3 图形**:`gfx/dm_vk.cpp` — Vulkan 实例→`VK_OHOS_surface`→交换链→呈现循环;`gfx/nvn/` — NVN 引导函数表 + 记名桩 | ✅ 骨架编译通过(模拟器实测 Vulkan 实例 OK) |
-| **资源管线**:`tools/extract_romfs_hos.py` — 基础版 RomFS 直读提取(7.68 GiB / 25 文件 CASC 档案);更新包 BKTR 补丁解密待破(见 P2) | ✅ base / ⏳ patch |
+| **资源管线**:基础版直读 `extract_romfs_hos.py --base-only`(IVFC L4 逐块认证)+ v2228224 完整提取 `extract_romfs_hactool.sh`(基座区 100% 块一致交叉验证) | ✅ 25 文件 7.68 GiB + 46 文件 8.36 GiB |
 | ArkUI:主菜单 / 游戏页(XComponent + 摇杆/技能/腰带/Boss条叠加层)/ 设置 / 移植状态(自检按钮 + VK/GLES 切换) | ✅ 已实现 |
 | XComponent EGL/GLES3 演示渲染循环(与 Vulkan 后端可切换) | ✅ 已实现 |
 | 真实 nnMain 启动链(loader 重定位 / SDK init 序列 / fs·oe·hid HLE / NVN 回放 / OHAudio) | ⏳ P2 |
@@ -67,11 +67,15 @@ devecocli build
 # 5) 真机自检:「移植状态」页 → 宿主全链路自检
 #    (加载三个真实容器 + 注册全部门表;svc HLE 自检 17/17)
 
-# 6) RomFS 数据提取(基础版 NSZ 先解回 NSP,再从基础包直读;
-#    产物 = 25 个文件 / 7.68 GiB:CASC 档案 00..17-00000001.data + 清单)
-D:/Tools/nsz_v4.6.1_win64_portable/nsz.exe -D -o <基础NSP目录> "<基础.nsz>"
+# 6) RomFS 数据提取(两条路径,均已本机验证):
+#    a) 基础版直读(自研,tools/extract_romfs_hos.py --base-only;对 NCA 内 IVFC
+#       L4 哈希层逐块认证):25 文件 7.68 GiB
+#    b) v2228224 完整 BKTR 解析(hactool,tools/extract_romfs_hactool.sh;
+#       基座区与认证基础版 100% 块一致):46 文件 8.36 GiB,含游戏要的 18 个 .data
 D:/Tools/nsz_v4.6.1_win64_portable/python.exe tools/extract_romfs_hos.py \
-    <基础.nsp> <更新.nsp> <prod.keys> <RomFS输出目录> --base-only
+    <基础.nsp> <更新.nsp> <prod.keys> <目录> --base-only
+HACTOOL=D:/Tools/hactool/hactool.exe tools/extract_romfs_hactool.sh \
+    <基础.nsp> <更新.nsp> <prod.keys> <目录>
 ```
 
 ## P2:真机 nnMain 启动链缺口(排期)
@@ -95,13 +99,15 @@ svc 内核层(内存/线程/同步,71 个调号)已全部落地并在模拟器�
 4. **NVN 录制/回放 + OHAudio** — 图形与音频通路(上游 Metal 回放 → 本仓
    Vulkan 回放)。
 
-**BKTR 补丁解密(开源问题)**:更新 NSP 的 RomFS 是基础包之上的 BKTR 叠加。
-已逆向确认重定位条目为 20 字节 `{u64 虚拟, u64 物理, u32 isPatch}`(800/818
-条合法、严格单调)与子段表布局,但补丁区 AES-CTR 计数器公式尚未破(试遍
-offset 基准 × 21 个子段 CTR × nonce 变体,均未命中;nut/nsz 自身从不解密
-BKTR 内容,无现成参考)。`--base-only` 先出基础版数据(v0,自洽完整);
-要 v2228224 补丁数据,最快路径是 [hactoolnet](https://github.com/Thealexbarney/LibHac)
-(上游 `extract_game.sh` 的原装工具,`hactoolnet --romfsdir` 直接解析 BKTR)。
+**BKTR 补丁解密(已解决,hactool 路径)**:更新 NSP 的 RomFS 是基础包之上的
+BKTR 叠加。格式已完整逆向(重定位条目 20 字节 `{u64 虚拟, u64 物理,
+u32 isPatch}`、节级偏移空间、0x4000 间距桶、子段 CTR 替换计数器 [4:8]),
+自研读法的中后段补丁区已解出正确内容,尾区计数器还差最后一处差异未收口
+(代码留在 `extract_romfs_hos.py` 里待续)。生产路径走 hactool 1.4.0 的
+`--baseromfs`,绕开它单 titlekey 槽位的限制(基座先导出成已解密镜像、垫
+0xF70000 零对齐节级偏移再喂回),配方固化在 `tools/extract_romfs_hactool.sh`。
+两条独立工具链交叉验证:基座覆盖区与自研提取器的 IVFC 认证产出 100% 块一致;
+产物 46 文件 8.36 GiB(21 个与基础版整文件一致、4 个打补丁、21 个新增)。
 
 ## 构建与运行
 
