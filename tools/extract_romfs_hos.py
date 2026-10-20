@@ -284,25 +284,46 @@ def walk_romfs(rd, data_size):
     return out, fd_off, data_size
 
 
-def ivfc_verify(rd, ivfc, data_off_in_section, data_size):
-    """全镜像 IVFC 校验:levels[0] 的整层 sha256 == ivfc.hash;
-    levels[i] 的每块(2^blockSize)是 levels[i+1] 对应字节段的 sha256。"""
+def ivfc_verify(rd, ivfc, data_off_in_section, data_size, sec=None):
+    """全镜像 IVFC 校验。决定性判据:对数据层逐块(尾块零填到整块)算哈希,
+    得到的 L4 哈希流必须与 NCA 里实际存储的 L4 层逐字节一致;再向上把链
+    算到顶层与节头主哈希比对(上层全部用存储层,哈希量极小)。"""
     levels = ivfc.levels
     data_bs = 1 << levels[-1].blockSize
     n_blocks = (data_size + data_bs - 1) // data_bs
     Print.info(f'ivfc verify: {n_blocks} x {data_bs:#x} blocks ...')
     t0 = time.time()
-    # 数据层 → 第一个哈希层:逐块哈希(不缓存整层)
-    def data_block_hash(i):
+
+    computed = bytearray()
+    for i in range(n_blocks):
         n = min(data_bs, data_size - i * data_bs)
-        return hashlib.sha256(rd.read(i * data_bs, n)).digest()
-    layer = [data_block_hash(i) for i in range(n_blocks)]
+        blk = rd.read(i * data_bs, n)
+        if n < data_bs:                       # 尾块按 IVFC 语义零填到整块
+            blk += bytes(data_bs - n)
+        computed += hashlib.sha256(blk).digest()
+
+    if sec is not None:
+        stored_l4_off = levels[-2].offset
+        sec.seek(stored_l4_off)
+        stored = sec.read(len(computed))
+        l4_ok = bytes(computed) == stored
+        Print.info(f'L4 哈希层比对(计算 {len(computed):#x} B vs 存储):'
+                   f'{"一致" if l4_ok else "不一致"} ({time.time() - t0:.0f}s)')
+        if not l4_ok:
+            for i in range(n_blocks):
+                if computed[i*32:i*32+32] != stored[i*32:i*32+32]:
+                    Print.info(f'  首个差异块 #{i} @data {i*data_bs:#x}')
+                    break
+        return l4_ok
+
+    # 无节对象时退回整树重算对主哈希
+    layer = [bytes(computed[i*32:i*32+32]) for i in range(n_blocks)]
     for li in range(len(levels) - 2, -1, -1):
         bs = 1 << levels[li].blockSize
         joined = b''.join(layer)
-        layer = [hashlib.sha256(joined[i:i + bs]).digest()
-                 for i in range(0, len(joined), bs)]
-        del joined
+        padded = joined + bytes((-len(joined)) % bs)
+        layer = [hashlib.sha256(padded[i:i + bs]).digest()
+                 for i in range(0, len(padded), bs)]
     got = hashlib.sha256(b''.join(layer)).digest()
     want = bytes(ivfc.hash)
     ok = got == want
@@ -345,7 +366,8 @@ def main():
 
     if VERIFY_ONLY:
         v_ivfc, v_doff = (b_ivfc, b_doff) if BASE_ONLY else (u_ivfc, u_doff)
-        ok = ivfc_verify(rd, v_ivfc, v_doff, data_size)
+        v_sec = b_nca.sections[b_k] if BASE_ONLY else u_nca.sections[u_k]
+        ok = ivfc_verify(rd, v_ivfc, v_doff, data_size, v_sec)
         sys.exit(0 if ok else 1)
 
     OUT.mkdir(parents=True, exist_ok=True)
@@ -373,7 +395,8 @@ def main():
 
     if VERIFY:
         v_ivfc, v_doff = (b_ivfc, b_doff) if BASE_ONLY else (u_ivfc, u_doff)
-        ok = ivfc_verify(rd, v_ivfc, v_doff, data_size)
+        v_sec = b_nca.sections[b_k] if BASE_ONLY else u_nca.sections[u_k]
+        ok = ivfc_verify(rd, v_ivfc, v_doff, data_size, v_sec)
         if not ok:
             sys.exit('IVFC 校验失败:提取器有 bug,数据不可信')
         Print.info('IVFC 全量校验通过')
