@@ -1,0 +1,227 @@
+/*
+ * dm_napi.cpp — NAPI 桥接 + XComponent 生命周期/触摸回调。
+ *
+ * 对应上游 dm/ios/Sources/front_ios.m(前端接口 host/front.h 的
+ * iOS 实现):窗口/表面、输入注入、宿主信息。HOS 侧由 ArkUI 的
+ * XComponent(libraryname="dmhost")挂接本模块。
+ */
+#include "napi/native_api.h"
+#include <ace/xcomponent/native_interface_xcomponent.h>
+#include <hilog/log.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "hal/dm_platform.h"
+#include "input/dm_input.h"
+#include "loader/dm_guest_loader.h"
+#include "gfx/dm_gfx_backend.h"
+#include "render/dm_renderer.h"
+
+#define DM_LOG_TAG "D2RMobileHOS"
+#define DMLOG_I(...) OH_LOG_INFO(LOG_APP, __VA_ARGS__)
+#define DMLOG_E(...) OH_LOG_ERROR(LOG_APP, __VA_ARGS__)
+
+static DmRenderer g_renderer;
+
+static void OnSurfaceCreatedCB(OH_NativeXComponent *component, void *window)
+{
+    (void)component;
+    if (window == nullptr) {
+        DMLOG_E("surface created without window");
+        return;
+    }
+    DMLOG_I("surface created");
+    dmInputInit();
+    dmPlatInit();
+    g_renderer.Start(reinterpret_cast<OHNativeWindow *>(window));
+}
+
+static void OnSurfaceChangedCB(OH_NativeXComponent *component, void *window)
+{
+    (void)component;
+    (void)window;
+}
+
+static void OnSurfaceDestroyedCB(OH_NativeXComponent *component, void *window)
+{
+    (void)window;
+    (void)component;
+    DMLOG_I("surface destroyed");
+    g_renderer.Stop();
+}
+
+static void DispatchTouchEventCB(OH_NativeXComponent *component, void *window)
+{
+    OH_NativeXComponent_TouchEvent ev;
+    if (OH_NativeXComponent_GetTouchEvent(component, window, &ev) != 0) {
+        return;
+    }
+    for (int i = 0; i < ev.numPoints; i++) {
+        const OH_NativeXComponent_TouchPoint &p = ev.touchPoints[i];
+        DmTouchPhase phase;
+        switch (p.type) {
+            case OH_NATIVEXCOMPONENT_DOWN: phase = DM_TOUCH_DOWN; break;
+            case OH_NATIVEXCOMPONENT_MOVE:  phase = DM_TOUCH_MOVE; break;
+            case OH_NATIVEXCOMPONENT_UP:    phase = DM_TOUCH_UP; break;
+            default:                        phase = DM_TOUCH_CANCEL; break;
+        }
+        dmInputPushTouch(p.id, p.x, p.y, phase);
+    }
+}
+
+static void RegisterCallbacks(napi_env env, napi_value exports)
+{
+    napi_value obj = nullptr;
+    if (napi_get_named_property(env, exports, OH_NATIVE_XCOMPONENT_OBJ, &obj) != napi_ok
+        || obj == nullptr) {
+        DMLOG_E("no native xcomponent object in exports");
+        return;
+    }
+    OH_NativeXComponent *component = nullptr;
+    if (napi_unwrap(env, obj, reinterpret_cast<void **>(&component)) != napi_ok
+        || component == nullptr) {
+        DMLOG_E("unwrap native xcomponent failed");
+        return;
+    }
+    static OH_NativeXComponent_Callback cb;
+    cb.OnSurfaceCreated = OnSurfaceCreatedCB;
+    cb.OnSurfaceChanged = OnSurfaceChangedCB;
+    cb.OnSurfaceDestroyed = OnSurfaceDestroyedCB;
+    cb.DispatchTouchEvent = DispatchTouchEventCB;
+    OH_NativeXComponent_RegisterCallback(component, &cb);
+    DMLOG_I("xcomponent callbacks registered");
+}
+
+static napi_value GetHostInfo(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    char report[512];
+    char guest[160];
+    dmGuestSelfTest(guest, sizeof(guest));
+    uint64_t c = dmPlatCounterRead();
+    snprintf(report, sizeof(report),
+             "dmhost-hos arm64 | slots:tcb/tlr/gate | counter:%llu@19.2MHz | gfx:%s | %s",
+             (unsigned long long)c, dmGfxBackendName(DM_GFX_BACKEND_EGL_GLES), guest);
+    napi_value result;
+    napi_create_string_utf8(env, report, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value SetFilesDir(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 1) {
+        return nullptr;
+    }
+    char dir[1024];
+    size_t len = 0;
+    napi_get_value_string_utf8(env, argv[0], dir, sizeof(dir), &len);
+    dmPlatSetFilesDir(dir);
+    return nullptr;
+}
+
+static napi_value GuestSelfTest(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    char report[160];
+    dmGuestSelfTest(report, sizeof(report));
+    napi_value result;
+    napi_create_string_utf8(env, report, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value GfxProbe(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    napi_value result;
+    napi_create_string_utf8(env, dmGfxVulkanProbe(), NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value TouchInject(napi_env env, napi_callback_info info)
+{
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return nullptr;
+    }
+    int32_t id = 0, phase = 0;
+    double x = 0, y = 0;
+    napi_get_value_int32(env, argv[0], &id);
+    napi_get_value_double(env, argv[1], &x);
+    napi_get_value_double(env, argv[2], &y);
+    napi_get_value_int32(env, argv[3], &phase);
+    dmInputPushTouch(id, (float)x, (float)y, (DmTouchPhase)phase);
+    return nullptr;
+}
+
+static napi_value SetStick(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return nullptr;
+    }
+    double dx = 0, dy = 0;
+    napi_get_value_double(env, argv[0], &dx);
+    napi_get_value_double(env, argv[1], &dy);
+    dmInputSetStick((float)dx, (float)dy);
+    return nullptr;
+}
+
+static napi_value CastSkill(napi_env env, napi_callback_info info)
+{
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return nullptr;
+    }
+    int32_t slot = 0, hold = 0;
+    double dx = 0, dy = 0;
+    napi_get_value_int32(env, argv[0], &slot);
+    napi_get_value_double(env, argv[1], &dx);
+    napi_get_value_double(env, argv[2], &dy);
+    napi_get_value_int32(env, argv[3], &hold);
+    dmInputCastSkill(slot, (float)dx, (float)dy, hold);
+    return nullptr;
+}
+
+EXTERN_C_START
+static napi_value Init(napi_env env, napi_value exports)
+{
+    napi_property_descriptor desc[] = {
+        {"getHostInfo", nullptr, GetHostInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setFilesDir", nullptr, SetFilesDir, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"guestSelfTest", nullptr, GuestSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"gfxProbe", nullptr, GfxProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"touchInject", nullptr, TouchInject, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setStick", nullptr, SetStick, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"castSkill", nullptr, CastSkill, nullptr, nullptr, nullptr, napi_default, nullptr},
+    };
+    napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
+    RegisterCallbacks(env, exports);
+    dmPlatInit();
+    dmInputInit();
+    return exports;
+}
+EXTERN_C_END
+
+static napi_module dmhostModule = {
+    .nm_version = 1,
+    .nm_flags = 0,
+    .nm_filename = nullptr,
+    .nm_register_func = Init,
+    .nm_modname = "dmhost",
+    .nm_priv = nullptr,
+    .reserved = {0},
+};
+
+extern "C" __attribute__((constructor)) void RegisterDmhostModule(void)
+{
+    napi_module_register(&dmhostModule);
+}

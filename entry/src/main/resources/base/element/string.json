@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "D2R Mobile HarmonyOS 移植框架入口模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Diablo II Resurrected Mobile - HarmonyOS 移植框架(不含游戏内容)"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "D2R Mobile HOS"
+    }
+  ]
+}
