@@ -24,6 +24,7 @@ OUT = Path(sys.argv[4])
 VERIFY = '--verify' in sys.argv[5:]
 LIST = '--list' in sys.argv[5:]
 BASE_ONLY = '--base-only' in sys.argv[5:]
+VERIFY_ONLY = '--verify-only' in sys.argv[5:]
 NSZ_PKG = os.environ.get('NSZ_PY_PATH',
                          r'D:\Tools\nz_v4.6.1_win64_portable\Lib\site-packages')
 
@@ -342,12 +343,18 @@ def main():
             Print.info(f'  {path}  {size:#x}')
         sys.exit(0)
 
+    if VERIFY_ONLY:
+        v_ivfc, v_doff = (b_ivfc, b_doff) if BASE_ONLY else (u_ivfc, u_doff)
+        ok = ivfc_verify(rd, v_ivfc, v_doff, data_size)
+        sys.exit(0 if ok else 1)
+
     OUT.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     done = 0
     with open(OUT / '_romfs_manifest.tsv', 'w', encoding='utf-8') as man:
         for path, off, size in files:
-            fp = (OUT / path).replace('\\', '/')
+            rel = path.lstrip('/')           # 根目录文件带前导 '/',pathlib 会丢基址
+            fp = OUT / rel
             fp.parent.mkdir(parents=True, exist_ok=True)
             h = hashlib.sha256()
             left = size
@@ -358,7 +365,7 @@ def main():
                     w.write(b)
                     h.update(b)
                     left -= n
-            man.write(f'{path}\t{size}\t{h.hexdigest()}\n')
+            man.write(f'{rel}\t{size}\t{h.hexdigest()}\n')
             done += 1
             if done % 500 == 0:
                 Print.info(f'  {done}/{len(files)} ({time.time() - t0:.0f}s)')
