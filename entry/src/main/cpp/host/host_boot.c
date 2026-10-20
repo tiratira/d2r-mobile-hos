@@ -20,6 +20,7 @@ extern const uint8_t __dm_guest_main_start[] __attribute__((weak));
 extern const uint8_t __dm_guest_sdk_start[] __attribute__((weak));
 extern const uint8_t __dm_guest_subsdk0_start[] __attribute__((weak));
 
+#ifdef __aarch64__
 typedef struct {
     DmGuestModule mod;
     uint64_t entry;
@@ -35,6 +36,7 @@ static void *guest_main(void *arg)
     dm_thread_enter(c->entry, 0, c->sp);
     return NULL;   /* dm_thread_enter 不返回;入口返回会走 dm_thread_returned */
 }
+#endif
 
 void dm_thread_returned(void)
 {
@@ -114,6 +116,7 @@ int dmHostBoot(const char *which, char *report, int report_size)
     /* 客体地址空间窗口(真实接入时切堆/栈) */
     dm_guest_va_reserve();
     /* 客体主线程:宿主栈仅用于 dm_thread_enter 垫层,随即切客体栈 */
+#ifdef __aarch64__
     boot_ctx c;
     c.mod = m;
     c.entry = (uint64_t)(m.image + m.hdr.entry_offset);
@@ -137,4 +140,10 @@ int dmHostBoot(const char *which, char *report, int report_size)
              m.hdr.gate_count, (unsigned long long)m.hdr.image_size);
     dmGuestUnload(&m);
     return 0;
+#else
+    (void)m;
+    snprintf(report, report_size,
+             "boot: guest 执行仅限 ARM64 真机(x86_64 模拟器跑框架层)");
+    return 0;
+#endif
 }

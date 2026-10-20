@@ -13,8 +13,6 @@ add_library(dmhost SHARED
     hal/dm_platform.c
     input/dm_input.c
     loader/dm_guest_loader.c
-    loader/dm_guest_placeholder.S
-    host/entry_hos.S
     host/hle_core.c
     host/hle_svc.c
     host/front_hos.c
@@ -25,17 +23,26 @@ add_library(dmhost SHARED
     render/dm_renderer.cpp
 )
 
-# 真实游戏模块(由 tools/patch_nso_hos.py + tools/hos_embed.py 从你自己的游戏文件
-# 生成;含重写后的游戏代码,绝不入库,.gitignore 已排除)。不存在时跳过,
-# 宿主仍可用占位容器自检。
-set(GUEST_S "")
-foreach(m main sdk subsdk0)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}.S")
-        list(APPEND GUEST_S "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}.S")
-        message(STATUS "guest module embedded: ${m}")
-    endif()
-endforeach()
-target_sources(dmhost PRIVATE ${GUEST_S})
+if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+    # ARM64:门跳汇编 + 内嵌 guest 模块(hos_embed.py 产物,绝不入库)
+    target_sources(dmhost PRIVATE
+        host/entry_hos.S
+        loader/dm_guest_placeholder.S
+    )
+    set(GUEST_S "")
+    foreach(m main sdk subsdk0)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}.S")
+            list(APPEND GUEST_S "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}.S")
+            message(STATUS "guest module embedded: ${m}")
+        endif()
+    endforeach()
+    target_sources(dmhost PRIVATE ${GUEST_S})
+else()
+    # x86_64(PC 模拟器):ARM64 汇编/guest 镜像不可用,C 桩替代;
+    # 宿主框架(HAL/输入/渲染/Vulkan/NVN)照常,供界面与图形通路验证。
+    target_sources(dmhost PRIVATE host/entry_x86_stub.c)
+    message(STATUS "x86_64 build: guest execution disabled (ARM64-only)")
+endif()
 
 target_link_libraries(dmhost PUBLIC
     libace_napi.z.so

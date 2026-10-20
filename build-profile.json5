@@ -1,42 +1,56 @@
 {
-  "app": {
-    "signingConfigs": [],
-    "products": [
+  app: {
+    signingConfigs: [
       {
-        "name": "default",
-        "signingConfig": "default",
-        "targetSdkVersion": "26.0.0",
-        "compatibleSdkVersion": "26.0.0",
-        "runtimeOS": "HarmonyOS",
-        "buildOption": {
-          "strictMode": {
-            "caseSensitiveCheck": true,
-            "useNormalizedOHMUrl": true
-          }
-        }
-      }
+        name: 'default',
+        type: 'HarmonyOS',
+        material: {
+          certpath: 'C:\\Users\\luyangbin\\.ohos\\config\\default_d2r-mobile-hos_fxoPPdJxM7Lcjs7tHYoBjXJ6R7p6cV1ezde8CRjc864=.cer',
+          keyAlias: 'debugKey',
+          keyPassword: '0000001b88174a808ab7bb17a165e01e99f3802f159b1158f5e16626168199bdb60c0c8e3dde36af2dc106',
+          profile: 'C:\\Users\\luyangbin\\.ohos\\config\\default_d2r-mobile-hos_fxoPPdJxM7Lcjs7tHYoBjXJ6R7p6cV1ezde8CRjc864=.p7b',
+          signAlg: 'SHA256withECDSA',
+          storeFile: 'C:\\Users\\luyangbin\\.ohos\\config\\default_d2r-mobile-hos_fxoPPdJxM7Lcjs7tHYoBjXJ6R7p6cV1ezde8CRjc864=.p12',
+          storePassword: '0000001b88174a808ab7bb17a165e01e99f3802f159b1158f5e16626168199bdb60c0c8e3dde36af2dc106',
+        },
+      },
     ],
-    "buildModeSet": [
+    products: [
       {
-        "name": "debug",
+        name: 'default',
+        signingConfig: 'default',
+        targetSdkVersion: '26.0.0',
+        compatibleSdkVersion: '26.0.0',
+        runtimeOS: 'HarmonyOS',
+        buildOption: {
+          strictMode: {
+            caseSensitiveCheck: true,
+            useNormalizedOHMUrl: true,
+          },
+        },
+      },
+    ],
+    buildModeSet: [
+      {
+        name: 'debug',
       },
       {
-        "name": "release"
-      }
-    ]
+        name: 'release',
+      },
+    ],
   },
-  "modules": [
+  modules: [
     {
-      "name": "entry",
-      "srcPath": "./entry",
-      "targets": [
+      name: 'entry',
+      srcPath: './entry',
+      targets: [
         {
-          "name": "default",
-          "applyToProducts": [
-            "default"
-          ]
-        }
-      ]
-    }
-  ]
+          name: 'default',
+          applyToProducts: [
+            'default',
+          ],
+        },
+      ],
+    },
+  ],
 }
