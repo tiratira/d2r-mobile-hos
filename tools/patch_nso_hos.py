@@ -24,9 +24,18 @@ import os, struct, sys
 import lz4.block
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
-UPSTREAM = os.environ.get('DM_UPSTREAM',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 '..', 'd2r-mobile-src', 'dm', 'tools', 'patch_nso.py'))
+
+def _find_upstream():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, '..', 'd2r-mobile-src'),
+                 os.path.join(here, '..', '..', 'd2r-mobile-src')):
+        p = os.path.join(cand, 'dm', 'tools', 'patch_nso.py')
+        if os.path.isfile(p):
+            return p
+    return None
+
+UPSTREAM = os.environ.get('DM_UPSTREAM') or _find_upstream()
+assert UPSTREAM, '找不到上游 patch_nso.py:设 DM_UPSTREAM 或把上游克隆到 ../d2r-mobile-src'
 RULESET = os.environ.get('DM_RULESET', 'hos')
 assert RULESET == 'hos', '本脚本只实现 hos 规则域'
 

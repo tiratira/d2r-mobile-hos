@@ -30,12 +30,12 @@ def build_synth_nso(path):
         0x24: 0xAA0603F6,               # mov x22, x6 —— 含 x18 的指令用真实编码:
         0x28: 0xF9400242 & 0xFFFFFFFF,  # ldr x2, [x18]
     }
-    # 直接写几条确定编码,避免 sysreg 位打包出错:
-    sites[0x14] = 0xD53BD020            # mrs x0, tpidr_el0   (tpidr_r, reg=0)
+    # 直接写确定编码(与 patch_nso_hos.py 扫描掩码一致):
+    sites[0x14] = 0xD53BD040            # mrs x0, tpidr_el0   (tpidr_r, reg=0)
     sites[0x18] = 0xD53BD065            # mrs x5, tpidrro_el0 (tpidrro_r, reg=5)
     sites[0x1C] = 0xD53BE033            # mrs x19, cntpct_el0 (cntpct, reg=19)
-    sites[0x24] = 0xB26003D2            # mov x18, x1(占位用,真实为 orr)— 改用 orr x18,xzr,x1 编码:
-    sites[0x24] = 0xAA0103F2            # orr x18, xzr, x1
+    sites[0x20] = 0xD51BD040            # msr tpidr_el0, x0   (tpidr_w, reg=0)
+    sites[0x24] = 0xAA0103F2            # orr x18, xzr, x1     (HOS 保留不改写)
     for off, w in sites.items():
         struct.pack_into('<I', text, off, w)
     struct.pack_into('<I', text, 0x30, 0xD65F03C0)   # ret
@@ -45,9 +45,9 @@ def build_synth_nso(path):
     blob = bytearray()
     def seg(fo_off, mo, sz, raw):
         return raw
-    # NSO 头:16 字节保留 + 0xc flags=0(不压缩) + 3×段头(file_off, mem_off, size)
-    nso = bytearray(0x10 + 4 + 0x30 + 0x20)
-    struct.pack_into('<I', nso, 0x0, 0x30534F4E & 0xFFFFFFFF)   # 'NSO0'
+    # NSO 头:0x0 magic / 0xc flags=0(不压缩) / 0x10..0x40 三段头 / 0x3c bss / 0x60 三段压缩大小
+    nso = bytearray(0x80)
+    nso[0:4] = b'NSO0'
     struct.pack_into('<I', nso, 0xc, 0)                          # flags:全不压缩
     text_fo = len(nso)
     ro_fo = text_fo + len(text)
@@ -68,14 +68,21 @@ class TestRewriterHos(unittest.TestCase):
             import lz4.block  # noqa: F401
         except ImportError:
             self.skipTest('lz4 未安装')
-        if not os.path.isfile(os.path.join(HERE, '..', 'd2r-mobile-src', 'dm', 'tools', 'patch_nso.py')):
+        here = os.path.dirname(os.path.abspath(__file__))
+        up = None
+        for cand in (os.path.join(here, '..', 'd2r-mobile-src'),
+                     os.path.join(here, '..', '..', 'd2r-mobile-src')):
+            p = os.path.join(cand, 'dm', 'tools', 'patch_nso.py')
+            if os.path.isfile(p):
+                up = p
+                break
+        if not up:
             self.skipTest('上游源码不在 ../d2r-mobile-src')
         self.tmp = tempfile.mkdtemp(prefix='hosrw_')
         self.nso = os.path.join(self.tmp, 'synth.nso')
         self.sites = build_synth_nso(self.nso)
         out = os.path.join(self.tmp, 'out')
-        env = dict(os.environ, DM_RULESET='hos',
-                   DM_UPSTREAM=os.path.join(HERE, '..', 'd2r-mobile-src', 'dm', 'tools', 'patch_nso.py'))
+        env = dict(os.environ, DM_RULESET='hos', DM_UPSTREAM=up)
         r = subprocess.run([sys.executable, os.path.join(HERE, 'patch_nso_hos.py'),
                             self.nso, out, 'synth'], env=env, capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)

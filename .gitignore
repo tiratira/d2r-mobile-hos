@@ -13,3 +13,9 @@
 /.cache
 /.cache/
 /.idea/
+
+# 本机生成物(含重写后的游戏代码与密钥相关,绝不入库)
+entry/src/main/cpp/loader/guest_*.S
+dm-work/
+.venv/
+__pycache__/

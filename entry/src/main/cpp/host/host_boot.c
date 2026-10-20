@@ -15,6 +15,11 @@
 #include <pthread.h>
 #include <sys/mman.h>
 
+/* 真实模块容器(hos_embed.py 产物;缺省弱符号为空,存在时由 CMake 编入) */
+extern const uint8_t __dm_guest_main_start[] __attribute__((weak));
+extern const uint8_t __dm_guest_sdk_start[] __attribute__((weak));
+extern const uint8_t __dm_guest_subsdk0_start[] __attribute__((weak));
+
 typedef struct {
     DmGuestModule mod;
     uint64_t entry;
@@ -34,6 +39,56 @@ static void *guest_main(void *arg)
 void dm_thread_returned(void)
 {
     DMLOG_W("guest entry returned(Horizon 线程应经 ExitThread 退出)");
+}
+
+/*
+ * 探测内嵌模块:加载 + 校验 + 注册门表,不执行任何入口。
+ * 真实 nnMain 要等 svc/线程 HLE 填齐(hilog 的 UNIMPL 清单)才能启动。
+ */
+int dmHostProbeModules(char *report, int report_size)
+{
+    struct {
+        const char *name;
+        const uint8_t *blob;
+    } mods[3] = {
+        {"main", __dm_guest_main_start},
+        {"sdk", __dm_guest_sdk_start},
+        {"subsdk0", __dm_guest_subsdk0_start},
+    };
+    int off = 0;
+    int total_gates = 0;
+    int loaded = 0;
+    for (int i = 0; i < 3; i++) {
+        if (mods[i].blob == NULL) {
+            continue;   /* 未嵌入(弱符号空) */
+        }
+        DmGuestModule m;
+        if (dmGuestLoadEmbedded(mods[i].blob, UINT64_MAX, mods[i].name, &m) != 0 ||
+            dmGuestVerify(&m) != 0) {
+            off += snprintf(report + off, report_size - off, "%s:FAIL ", mods[i].name);
+            continue;
+        }
+        for (uint32_t g = 0; g < m.hdr.gate_count; g++) {
+            DmGuestGate gt;
+            if (dmGuestGateAt(&m, g, &gt) == 0) {
+                gate_register_abs((uint64_t)(m.image + gt.ret_off), (int)gt.kind,
+                                  gt.arg, (uint64_t)(m.image + gt.orig_off));
+            }
+        }
+        total_gates += (int)m.hdr.gate_count;
+        loaded++;
+        off += snprintf(report + off, report_size - off,
+                        "%s:%lluB/%ug ", mods[i].name,
+                        (unsigned long long)m.hdr.image_size, m.hdr.gate_count);
+        dmGuestUnload(&m);
+    }
+    if (loaded == 0) {
+        snprintf(report, report_size, "no embedded game modules (placeholder only)");
+        return 0;
+    }
+    snprintf(report + off, report_size - off, "| %d modules, %d gates registered (not booted)",
+             loaded, total_gates);
+    return 0;
 }
 
 int dmHostBoot(const char *which, char *report, int report_size)

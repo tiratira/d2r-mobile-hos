@@ -50,6 +50,7 @@ uint64_t svc_dispatch(uint32_t num, uint64_t *regs, uint64_t orig_addr);
 
 /* 启动序(host_boot.c) */
 int dmHostBoot(const char *which, char *report, int report_size);
+int dmHostProbeModules(char *report, int report_size);
 
 /* 前端接口(front_hos) */
 uint64_t front_game_res(int mode);   /* {u32 宽, u32 高} 打包;mode 0=掌机 1=主机 */

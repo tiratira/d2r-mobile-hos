@@ -142,10 +142,14 @@ static napi_value GuestSelfTest(napi_env env, napi_callback_info info)
 static napi_value HostSelfTest(napi_env env, napi_callback_info info)
 {
     (void)info;
-    char report[256];
-    int rc = dmHostBoot("main", report, sizeof(report));
+    char report[512];
+    char modules[320];
+    dmHostProbeModules(modules, sizeof(modules));
+    char boot[160];
+    int rc = dmHostBoot("main", boot, sizeof(boot));
+    snprintf(report, sizeof(report), "%s | %s", modules, boot);
     napi_value result;
-    napi_create_string_utf8(env, rc == 0 ? report : report, NAPI_AUTO_LENGTH, &result);
+    napi_create_string_utf8(env, report, NAPI_AUTO_LENGTH, &result);
     return result;
 }
 

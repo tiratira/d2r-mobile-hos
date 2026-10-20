@@ -15,7 +15,6 @@ add_library(dmhost SHARED
     loader/dm_guest_loader.c
     loader/dm_guest_placeholder.S
     host/entry_hos.S
-    host/dm.h
     host/hle_core.c
     host/hle_svc.c
     host/front_hos.c
@@ -25,6 +24,18 @@ add_library(dmhost SHARED
     gfx/nvn/dm_nvn.c
     render/dm_renderer.cpp
 )
+
+# 真实游戏模块(由 tools/patch_nso_hos.py + tools/hos_embed.py 从你自己的游戏文件
+# 生成;含重写后的游戏代码,绝不入库,.gitignore 已排除)。不存在时跳过,
+# 宿主仍可用占位容器自检。
+set(GUEST_S "")
+foreach(m main sdk subsdk0)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}.S")
+        list(APPEND GUEST_S "${CMAKE_CURRENT_SOURCE_DIR}/loader/guest_${m}.S")
+        message(STATUS "guest module embedded: ${m}")
+    endif()
+endforeach()
+target_sources(dmhost PRIVATE ${GUEST_S})
 
 target_link_libraries(dmhost PUBLIC
     libace_napi.z.so

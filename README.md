@@ -37,16 +37,33 @@ docs/PORTING.md       上游 → 鸿蒙 逐子系统映射与路线图
 ../d2r-mobile-src/    上游源码(克隆自 github.com/d2r-mobile/d2r-mobile)
 ```
 
-## 重写自己游戏文件的管线(需 Python3 + lz4)
+## 重写自己游戏文件的管线(本机已验证到第 5 步)
 
 ```bash
-# 1. 从你的 Switch 游戏文件提取三个 NSO(上游 docs/GAME_FILES.md)
-# 2. HOS 规则域重写(DM_UPSTREAM 指向上游 patch_nso.py,默认 ../d2r-mobile-src)
-python tools/patch_nso_hos.py <main.nso> out/main main
-# 3. 打包成可编进 .so 的汇编
-python tools/hos_embed.py --outdir out/main --name main --kind 0 --out entry/src/main/cpp/loader/guest_main.S
-# 4. 把 guest_main.S 加入 CMake 源列表后构建
-# 合成 NSO 快速验证:python tools/test_patch_nso_hos.py
+# 0) Python 环境(uv)+ ExeFS 提取(nsz 便携包的解密栈,无需 hactool;
+#    密钥只在本机读取;已核对官方 3.3.94012 的 sha256)
+uv venv .venv && uv pip install --python .venv lz4
+D:/Tools/nsz_v4.6.1_win64_portable/python.exe tools/extract_exefs_hos.py \
+    <更新.nsp> <prod.keys> dm-work/data/switch/3.3.94012/Update/ExeFS
+
+# 1) 合成 NSO 快速自检
+.venv/Scripts/python.exe tools/test_patch_nso_hos.py
+
+# 2) HOS 规则域重写三模块(main: 179 门/22 剪口;sdk: 173 门;subsdk0: 原样)
+for m in main sdk subsdk0; do \
+  .venv/Scripts/python.exe tools/patch_nso_hos.py \
+    dm-work/data/switch/3.3.94012/Update/ExeFS/$m dm-work/build/hos/$m $m; done
+
+# 3) 打包成嵌入汇编(guest_*.S 已被 .gitignore 排除:含重写后的游戏代码)
+for m in main sdk subsdk0; do \
+  .venv/Scripts/python.exe tools/hos_embed.py --outdir dm-work/build/hos/$m \
+    --name $m --kind $([ $m = main ] && echo 0 || ([ $m = sdk ] && echo 1 || echo 2)) \
+    --out entry/src/main/cpp/loader/guest_$m.S; done
+
+# 4) 构建(CMake 自动探测 guest_*.S 并嵌入)
+devecocli build
+# 5) 真机自检:「移植状态」页 → 宿主全链路自检
+#    (加载三个真实容器 + 注册全部门表;nnMain 启动待 svc HLE 填齐)
 ```
 
 ## 构建与运行
