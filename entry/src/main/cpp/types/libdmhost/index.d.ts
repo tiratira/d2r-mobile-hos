@@ -6,6 +6,16 @@ export const setFilesDir: (dir: string) => void;
 export const guestSelfTest: () => string;
 /** 宿主全链路自检:加载内嵌 guest → 注册门 → 穿过 dm_gate 执行入口 */
 export const hostSelfTest: () => string;
+/** 真实 SDK 启动序:x86 只做预检,ARM64 真机起客体主线程跑 _init_libc0→…→nnMain */
+export const hostStart: () => string;
+/** 启动阶段字符串(最后到达的 _init_libc*/nninit*/nnMain 阶段) */
+export const bootStage: () => string;
+/** fs/oe/hid/time 服务层 HLE 自检 */
+export const serviceSelfTest: () => string;
+/** OHAudio 渲染器自检(48kHz/2ch/S16LE) */
+export const audioSelfTest: () => string;
+/** 播 800ms 440Hz 正弦,验证音频通路 */
+export const playTone: () => string;
 /** 图形探针:Vulkan 实例/设备 + EGL 后端名 + NVN 表自检 */
 export const gfxProbe: () => string;
 /** 游戏页表面切到 Vulkan 呈现循环(返回 0 成功;需已进入游戏页) */

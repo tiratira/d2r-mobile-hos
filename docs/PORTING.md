@@ -50,21 +50,21 @@ Switch 版 D2R 是三个 NSO 模块(`main` / `sdk` / `subsdk0`)的 ARM64 原生
 
 | # | 上游 | 作用 | HarmonyOS 对应 | 状态 |
 |---|------|------|----------------|------|
-| 1 | `dm/tools/patch_nso.py` | 离线指令重写器 | 复用;新增 `DM_RULESET=hos` 规则集(见 §4.1) | 待实施 |
+| 1 | `dm/tools/patch_nso.py` | 离线指令重写器 | 复用;新增 `DM_RULESET=hos` 规则集(见 §4.1) | 已完成 |
 | 2 | `dm/tools/*.py`(product.sh 等) | 构建产物脚本 | 复用(Python,平台无关,可在 Windows 跑) | 可复用 |
-| 3 | `dm/host/loader.c` | 镜像映射/门表/重定位 | `cpp/loader/dm_guest_loader.*`(容器头 + 门表骨架) | 骨架就绪 |
+| 3 | `dm/host/loader.c` | 镜像映射/门表/重定位 | `cpp/loader/dm_guest_loader.*` + `host/loader_hos.c`(原地重定位/符号哈希/DT_INIT) | 已完成 |
 | 4 | `dm/host/thread.c` 线程槽 | x18/TLS/TLR 替身 | `cpp/hal/dm_platform.*`:pthread_key 三槽 | 已完成 |
 | 5 | 19.2MHz 计数器应答 | `cntpct_el0` HLE | `dmPlatCounterRead()`:`CLOCK_MONOTONIC` 换算 | 已完成 |
-| 6 | `dm/host/hle*.c` | svc/线程/内存/服务 HLE | 纯 C 平移 + OHOS 适配(mmap/mprotect/pthread 均可用) | 待实施 |
-| 7 | `dm/host/main.c` 启动序 | SDK 运行时 + init_array + nnMain | 并入 `libdmhost.so` 启动路径 | 待实施 |
+| 6 | `dm/host/hle*.c` | svc/线程/内存/服务 HLE | svc/线程/同步 17/17;服务层 `hle_fs/oe/hid/time/misc/account/sdkinit` 最小集(见 §4.6) | 已完成(最小集) |
+| 7 | `dm/host/main.c` 启动序 | SDK 运行时 + init_array + nnMain | `host/host_start.c`:`_init_libc0→…→nnMain`(见 §4.3) | 已完成(真机执行待验) |
 | 8 | `dm/host/dm_*.c` 游戏特性 | 大秘境/Boss冲/易爆装备等 | 纯 C,依赖门表与镜像偏移,随 #3/#6 落地 | 待实施 |
-| 9 | `dm/gfx/nvn/`(接口层 C) | NVN 函数表与命令录制 | 平移进 `cpp/gfx/` | 待实施 |
-| 10 | `dm/gfx/nvn/nvn_mtl.m` | Metal 回放 | **Vulkan 回放后端**(新写) | 待实施 |
+| 9 | `dm/gfx/nvn/`(接口层 C) | NVN 函数表与命令录制 | `cpp/gfx/nvn`:引导表 + 512 槽 thunk + 首调记名(见 §4.7) | 骨架就绪 |
+| 10 | `dm/gfx/nvn/nvn_mtl.m` | Metal 回放 | **Vulkan 回放后端**(`dm_vk.cpp` WSI 已通,命令回放待录制层) | 部分 |
 | 11 | `gfx/tools/` 着色器链 | Maxwell→SPIR-V→MSL | 止步 SPIR-V(Ryujinx Spv.Generator 产物),Vulkan 直接消费 | 待实施 |
 | 12 | `dm/ios/Sources/front_ios.m` | iOS 前端接口 | `cpp/napi/dm_napi.cpp` + ArkUI(本仓库) | 已完成(演示) |
 | 13 | CAMetalLayer 表面 | 画面输出 | XComponent + EGL/GLES3 循环(演示渲染) | 已完成(演示) |
 | 14 | `DmTouchOverlay.m` + `dm_touch_controls.c` | 触控界面 | ArkUI 叠加层(摇杆/技能/腰带/Boss条)+ `cpp/input` | 已完成(演示) |
-| 15 | CoreAudio | 音频 | OHAudio(NDK `libohaudio.so`),接 SDK 音频服务的 HLE | 待实施 |
+| 15 | CoreAudio | 音频 | `audio/dm_audio.c`:OHAudio 48kHz/2ch/S16LE 渲染器 + 正弦自检;SDK 音频服务 HLE 待接 | 已实现(演示) |
 | 16 | `dm/ios/RomfsDownloader` | 资源下载/落盘 | 应用沙箱 files 目录 + `dmPlatSetFilesDir` 已通 | 部分 |
 | 17 | `dm/verify/`(Unicorn 回归) | 重写等价性验证 | 开发机侧复用,平台无关 | 可复用 |
 | 18 | Xcode project.yml + setup.sh | 构建管线 | hvigor + CMake(`externalNativeOptions`,arm64-v8a) | 已完成 |
@@ -179,19 +179,86 @@ ArkUI 叠加层:摇杆(精确对角线)、技能键(点按/按住/拖拽瞄准 +
 XComponent 原生触摸事件汇入同一事件环。guest 接入后,这些事件改由
 `dm_cursor.c` / `hle_private_aim.c` 平移版消费。
 
-## 5. 实施路线(建议顺序)
+### 4.6 SDK 启动序 + 服务层 HLE(host_start.c / hle_*.c,已交付)
 
-1. **M1 重写规则集**:`patch_nso.py` 增加 `hos` 规则集;`regress.sh` 全
-   绿(开发机,Unicorn)。
-2. **M2 宿主平移**:`dm/host` 核心文件(loader/thread/hle_svc/hle_thread/
-   entry.S 的 aarch64 汇编 gate 跳板)编进 `libdmhost.so`;macOS 专用
-   路径替换为 OHOS 等价物。首里程碑:nnMain 能起、日志能打到 hilog。
-3. **M3 图形后端**:NVN 录制层平移 + Vulkan 回放器;先出主菜单画面,
-   再进游戏;着色器链接 SPIR-V。
-4. **M4 音频/输入/资源**:OHAudio 接 SDK 音频服务 HLE;资源包落沙箱
-   (`filesDir` 通路已就绪);触控/手柄映射接 `dm_padmap`。
+**启动序**(`host/host_start.c`),照上游 `dm/host/main.c` 的 `guest_main`
+逐条:
+
+```
+_init_libc0 → nnosInitialize(hmain,0) → _init_libc1
+→ nninitInitializeSdkModule → nninitStartup → _init_libc2
+→ 各模块 DT_INIT(rtld InitModules 角色)→ SetHostArgc/Argv → nnMain
+```
+
+- 注释里的「rtld 传入的三个回调」:A 只置 rtld 标志(略)、B = 各模块
+  `DT_INIT`(`loader_hos.c` 的 `run_module_inits`)、C 析构(不做)。
+- `nnosInitialize` 的 x0 是主线程句柄(`dm_svc_thread_main_init()`),
+  上游注释指出 SDK 的 `ThreadManagerImplByHorizon` 会取用。
+- x86_64 构建(PC 模拟器)只做**预检**:三模块装载/9 个启动序符号/
+  DT_INIT 模块与条目数/门表/服务接管覆盖/未解析导入桩;ARM64 构建才起
+  8 MiB 栈的客体主线程真正执行,每步 `BOOT <stage>` 打到 hilog,
+  `dmHostBootStage()` 供 UI 轮询。
+
+**服务层 HLE**(`hle_sdkinit/fs/oe/hid/time/misc/account.c`)。Horizon 的
+系统服务在宿主里不存在,SDK 里的服务客户端若真去 IPC 会挂死,因此用
+`HLE_FORCE` 在**重定位时强制接管**(优先于模块内定义):
+
+| 文件 | 条目 | 内容 |
+|------|------|------|
+| `hle_sdkinit.c` | 7 | nndiag/oe/aoc/err/fs/pctl/diag 的 Initialize → 空操作 |
+| `hle_fs.c` | 24 | rom/save/temp 挂载 + 路径解析(挂载名/`..` 防逃逸)+ 句柄表(fd 下标+1)+ 全部文件/目录接口;P0 存档事务 = fsync |
+| `hle_oe.c` | 15 | 运行模式(手机=掌机)/焦点/性能模式/系统通知队列(15/30/31)/语言/伪设备号 |
+| `hle_hid.c` | 13 | Npad 状态 0x28 字节结构 + 按下沿锁存 + 触摸屏状态;`dmHidSet` 供触控层注入 |
+| `hle_time.c` | 10 | 系统时钟/日历(localtime_r)/本地时区;`time` 转调 SDK(开机时长语义) |
+| `hle_misc.c` | 14 | aoc(拥有 1 个 DLC)/err(只打日志)/ngc(profanity 掩码写 0)/nsd/pctl |
+| `hle_account.c` | 21 | 本地用户模型(Uid/UserHandle 魔数)/昵称;联网账号接口失败 |
+| `hle_libc.c` | 6 | getentropy、异常栈查询、`__rel_dyn/plt_*` 数据符号 |
+
+**导入覆盖报告**(`dm_import_report`,启动预检里显示):装载/重定位后扫
+三模块 dynsym,把每个未定义导入按解析去向分类。当前 3.3.94012 三模块实测:
+
+```
+imp:1148 模块1043 接管99 HLE6 弱0 桩0
+```
+
+即**没有任何导入落到记名桩**。真机上若出现 `UNIMPL <name>` 或桩计数增加,
+那份清单就是下一批要实现的接口排期表。
+
+**限制**(有意为之的最小集):存档未做 clonefile 事务(上游用
+`clonefile+renamex_np(RENAME_SWAP)`,OHOS 需换两次 rename);fs 的 overlay/
+`.holes` 剔零档案、friends/swkbd/codec/charname 等属 P2;hid 还没有物理手柄
+通路(触控层经 `dmHidSet` 注入)。
+
+### 4.7 NVN 接口层与 OHAudio(audio/dm_audio.c,已交付)
+
+- `gfx/nvn/dm_nvn.c` + `dm_nvn_stubs.S`:宿主 `HLE_FORCE` 接管
+  `nvnBootstrapLoader`;按名字登记入口并返回 **512 槽静态 thunk**
+  (ARM64 汇编,`movz x9,#槽号; b 入口`),每个入口第一次调用打一行
+  `NVN <名字>`(带 x0/x1/x2),这就是录制层的落点排期表。thunk 不生成
+  运行时代码,符合 .so 签名约束。
+- `gfx/dm_vk.cpp`:Vulkan WSI(实例→`VK_OHOS_surface`→交换链→呈现)已
+  在模拟器实测通过;录制层就位后逐槽换成真实命令,呈现端只换每帧命令
+  (当前为清屏色动画)。着色器链止步 SPIR-V。
+- `audio/dm_audio.c`:OHAudio 48 kHz/2ch/S16LE 渲染器 + 写数据回调
+  (`audioDataSize` 按字节、整帧填满才返 VALID)+ 800 ms 正弦自检;
+  Start/Stop/Release 在独立线程执行(Stop 可能 >50 ms,不能占 UI 线程)。
+  游戏 `nn::audio` 的 AudioOutBuffer「填一块/交一块/取回已播块」语义与
+  OHAudio 回调同构,后续按同一渲染器投递 PCM。
+
+## 5. 实施路线(当前进度)
+
+1. **M1 重写规则集**:`patch_nso_hos.py` 已交付;合成 NSO 单测 +
+   对三模块真实产物的门数/剪口/重定位计数均已核对。 ⟶ 已完成
+2. **M2 宿主平移**:loader/svc/线程/启动序/服务层最小集已编进
+   `libdmhost.so`;x86_64 模拟器跑通装载→预检→服务自检。 ⟶ 已完成
+   (真实 `nnMain` 执行需要 ARM64 鸿蒙设备)
+3. **M3 图形后端**:NVN 接口层 + 512 槽记名 thunk + Vulkan WSI 已通;
+   命令录制/回放与着色器链(Maxwell→SPIR-V)待做。 ⟶ 进行中
+4. **M4 音频/输入/资源**:OHAudio 渲染器 + 正弦自检已通;资源包落沙箱
+   (`filesDir` 通路 + fs HLE)已通;触控/手柄映射待接 `dm_padmap`/
+   `dmHidSet`。 ⟶ 进行中
 5. **M5 特性回归**:`dm_*.c` 特性逐个打开,跑上游 `verify/accept.sh` 的
-   等价 HOS 版。
+   等价 HOS 版;依赖真机 UNIMPL 清单驱动。 ⟶ 待真机
 
 ## 6. 本仓库目录与上游对照
 
@@ -200,9 +267,21 @@ d2r-mobile-hos/
 ├── entry/src/main/cpp/
 │   ├── hal/dm_platform.*        ← dm/host/thread.c 线程槽 + 计数器
 │   ├── input/dm_input.*         ← dm/ios/Sources/dm_touch_controls.c 通路
-│   ├── loader/dm_guest_loader.* ← dm/host/loader.c(骨架)+ gen_embed.py 格式
+│   ├── loader/dm_guest_loader.* ← dm/host/loader.c 容器/加载 + gen_embed.py 格式
 │   ├── loader/dm_guest_placeholder.S ← 内嵌镜像自检样例
+│   ├── host/hle_core.c          ← dm/host/hle.c(门分派/线程环境/导入覆盖)
+│   ├── host/hle_svc.c hle_thread.c hle_hostcall.c ← dm/host/hle_svc.c 等
+│   ├── host/loader_hos.c        ← dm/host/loader.c(rtld:重定位/符号/DT_INIT)
+│   ├── host/host_boot.c         ← 容器冒烟 + 模块装载探针
+│   ├── host/host_start.c        ← dm/host/main.c guest_main(SDK 启动序)
+│   ├── host/hle_sdkinit.c       ← dm/host/hle_sdkinit.c
+│   ├── host/hle_fs.c hle_oe.c hle_hid.c hle_time.c hle_misc.c hle_account.c
+│   │                            ← dm/host/hle_*.c 的服务层最小集
+│   ├── host/hle_libc.c          ← dm/host/hle_os.c 的 getentropy 等 + rel 标记
 │   ├── gfx/dm_gfx_backend.*     ← dm/gfx 后端接口 + Vulkan 探针
+│   ├── gfx/dm_vk.cpp            ← dm/gfx/nvn/nvn_mtl.m ⇢ Vulkan WSI
+│   ├── gfx/nvn/dm_nvn.c dm_nvn_stubs.S ← dm/gfx/nvn/hle_nvn.c 接口层(512 槽)
+│   ├── audio/dm_audio.c         ← CoreAudio ⇢ OHAudio
 │   ├── render/dm_renderer.*     ← CAMetalLayer ⇢ XComponent+EGL/GLES3
 │   └── napi/dm_napi.cpp         ← front_ios.m ⇢ NAPI 桥 + XComponent 回调
 ├── entry/src/main/ets/

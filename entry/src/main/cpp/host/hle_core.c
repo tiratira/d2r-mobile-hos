@@ -28,11 +28,9 @@ uint64_t unimpl_c(unsigned idx, uint64_t *regs)
     return 0;
 }
 
-/* ---------- HLE 登记段(ELF 自动 __start_/__stop_ 边界,lld 支持) ---------- */
-typedef struct { const char *name; void *fn; } hle_ent;
+/* ---------- HLE 登记段(ELF 自动 __start_/__stop_ 边界,lld 支持;类型与宏见 dm.h) ---------- */
 extern const hle_ent __start_swhle[];
 extern const hle_ent __stop_swhle[];
-typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
 extern const hle_force_ent __start_swforce[];
 extern const hle_force_ent __stop_swforce[];
 
@@ -44,18 +42,32 @@ __attribute__((used, section("swforce"), aligned(8)))
 static const hle_force_ent dm_swforce_ph = {"__dm_placeholder__", (void *)dm_section_placeholder,
                                             "段占位,保证边界符号存在"};
 
-#define HLE(mangled, cname)                                                        \
-    static void cname(void);                                                        \
-    __attribute__((used, section("swhle"), aligned(8)))                             \
-    static const hle_ent hle_ent_##cname = {mangled, (void *)cname};                \
-    static void cname(void)
-
-uint64_t resolve_import(const char *name, int weak)
+uint64_t hle_lookup(const char *name)
 {
     for (const hle_ent *e = __start_swhle; e < __stop_swhle; e++) {
         if (strcmp(e->name, name) == 0) {
             return (uint64_t)e->fn;
         }
+    }
+    return 0;
+}
+
+int hle_registered_counts(uint32_t *hle, uint32_t *force)
+{
+    if (hle) {
+        *hle = (uint32_t)(__stop_swhle - __start_swhle);
+    }
+    if (force) {
+        *force = (uint32_t)(__stop_swforce - __start_swforce);
+    }
+    return 0;
+}
+
+uint64_t resolve_import(const char *name, int weak)
+{
+    uint64_t h = hle_lookup(name);
+    if (h) {
+        return h;
     }
     if (weak) {
         return 0;   /* 未解析弱导入保持零 */
@@ -163,6 +175,15 @@ uint64_t dm_param_get(unsigned key_idx)
     return (uint64_t)(uintptr_t)pthread_getspecific(g_param_keys[key_idx]);
 }
 
+void dm_param_set(unsigned key_idx, uint64_t v)
+{
+    if (key_idx >= 8) {
+        return;
+    }
+    pthread_once(&g_once, keys_create);
+    pthread_setspecific(g_param_keys[key_idx], (void *)(uintptr_t)v);
+}
+
 /* ---------- 观测门回调(上游 gate_obs_set) ---------- */
 #define OBS_MAX 32
 static void (*g_obs_fn[OBS_MAX])(const uint64_t *regs);
@@ -254,6 +275,11 @@ uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs)
             die("unknown gate");
         }
     }
+}
+
+uint32_t dm_gate_count(void)
+{
+    return (uint32_t)g_ngate;
 }
 
 /* ---------- 模块注册表(host_boot 登记加载好的 guest 模块;门表 orig 查询、

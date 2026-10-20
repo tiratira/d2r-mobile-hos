@@ -17,13 +17,23 @@ add_library(dmhost SHARED
     host/hle_svc.c
     host/hle_thread.c
     host/hle_hostcall.c
+    host/hle_libc.c
+    host/hle_sdkinit.c
+    host/hle_fs.c
+    host/hle_oe.c
+    host/hle_hid.c
+    host/hle_time.c
+    host/hle_misc.c
+    host/hle_account.c
     host/loader_hos.c
     host/front_hos.c
     host/host_boot.c
+    host/host_start.c
     gfx/dm_gfx_backend.c
     gfx/dm_vk.cpp
     gfx/nvn/dm_nvn.c
     render/dm_renderer.cpp
+    audio/dm_audio.c
 )
 
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
@@ -32,6 +42,7 @@ if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
     target_sources(dmhost PRIVATE
         host/entry_hos.S
         loader/dm_guest_placeholder.S
+        gfx/nvn/dm_nvn_stubs.S
     )
     set(GUEST_S "")
     foreach(m main sdk subsdk0)
@@ -67,4 +78,5 @@ target_link_libraries(dmhost PUBLIC
     libhilog_ndk.z.so
     libvulkan.so
     libz.so
+    libohaudio.so
 )

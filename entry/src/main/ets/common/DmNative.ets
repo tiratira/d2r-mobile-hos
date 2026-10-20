@@ -22,6 +22,30 @@ export class DmNative {
     return dmhost.hostSelfTest();
   }
 
+  /** 真实 SDK 启动序预检(x86 只预检;ARM64 真机起客体主线程) */
+  static hostStart(): string {
+    return dmhost.hostStart();
+  }
+
+  static bootStage(): string {
+    return dmhost.bootStage();
+  }
+
+  /** fs/oe/hid/time 服务层 HLE 自检 */
+  static serviceSelfTest(): string {
+    return dmhost.serviceSelfTest();
+  }
+
+  /** OHAudio 渲染器自检 */
+  static audioSelfTest(): string {
+    return dmhost.audioSelfTest();
+  }
+
+  /** 播 800ms 440Hz 正弦(音频通路自检) */
+  static playTone(): string {
+    return dmhost.playTone();
+  }
+
   static gfxProbe(): string {
     return dmhost.gfxProbe();
   }

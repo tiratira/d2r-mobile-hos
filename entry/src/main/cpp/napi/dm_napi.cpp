@@ -156,6 +156,67 @@ static napi_value HostSelfTest(napi_env env, napi_callback_info info)
     return result;
 }
 
+static napi_value HostStart(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    char report[1024];
+    int rc = dmHostStart(report, sizeof(report));
+    char out[1100];
+    snprintf(out, sizeof(out), "%s%s", report, rc == 0 ? "" : " (FAIL)");
+    napi_value result;
+    napi_create_string_utf8(env, out, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value BootStage(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    napi_value result;
+    napi_create_string_utf8(env, dmHostBootStage(), NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value ServiceSelfTest(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    char fs[224], oe[128], hid[160], tmv[128], misc[128], acc[160];
+    int r1 = dmFsSelfTest(fs, sizeof(fs));
+    int r2 = dmOeSelfTest(oe, sizeof(oe));
+    int r3 = dmHidSelfTest(hid, sizeof(hid));
+    int r4 = dmTimeSelfTest(tmv, sizeof(tmv));
+    int r5 = dmMiscSelfTest(misc, sizeof(misc));
+    int r6 = dmAccountSelfTest(acc, sizeof(acc));
+    char out[1100];
+    snprintf(out, sizeof(out), "%s | %s | %s | %s | %s | %s%s", fs, oe, hid, tmv, misc, acc,
+             (r1 || r2 || r3 || r4 || r5 || r6) ? " (FAIL)" : "");
+    napi_value result;
+    napi_create_string_utf8(env, out, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value AudioSelfTest(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    char report[192];
+    int rc = dmAudioSelfTest(report, sizeof(report));
+    char out[220];
+    snprintf(out, sizeof(out), "%s%s", report, rc == 0 ? "" : " (FAIL)");
+    napi_value result;
+    napi_create_string_utf8(env, out, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
+static napi_value PlayTone(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    int rc = dmAudioPlayTone(800);
+    char out[160];
+    snprintf(out, sizeof(out), "playTone(800ms) -> %d | %s", rc, dmAudioReport());
+    napi_value result;
+    napi_create_string_utf8(env, out, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
 static napi_value GfxProbe(napi_env env, napi_callback_info info)
 {
     (void)info;
@@ -252,6 +313,11 @@ static napi_value Init(napi_env env, napi_value exports)
         {"setFilesDir", nullptr, SetFilesDir, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"guestSelfTest", nullptr, GuestSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hostSelfTest", nullptr, HostSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"hostStart", nullptr, HostStart, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"bootStage", nullptr, BootStage, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"serviceSelfTest", nullptr, ServiceSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"audioSelfTest", nullptr, AudioSelfTest, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"playTone", nullptr, PlayTone, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"gfxProbe", nullptr, GfxProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"useVulkan", nullptr, UseVulkan, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"useGles", nullptr, UseGles, nullptr, nullptr, nullptr, napi_default, nullptr},

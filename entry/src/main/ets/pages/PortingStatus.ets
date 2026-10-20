@@ -24,13 +24,15 @@ struct PortingStatus {
     { system: '门分派汇编', upstream: 'dm/host/entry.S(Mach-O)', hos: 'cpp/host/entry_hos.S(ELF,x18 保持)', state: '已完成' },
     { system: '线程槽/计数器', upstream: 'dm/host/thread.c + hle.c', hos: 'cpp/hal + hle_core(pthread TSD + 19.2MHz)', state: '已完成' },
     { system: '系统调用接管', upstream: 'dm/host/hle_svc.c / hle_thread.c', hos: '内存/查询类 + 线程/同步类 + 0x80 起宿主调用(zlib/转调),自检 17/17', state: '已实现' },
-    { system: 'NVN 命令层', upstream: 'dm/gfx/nvn/hle_nvn.c(纯 C)', hos: 'cpp/gfx/nvn:引导 + 函数表 + 记名桩', state: '骨架就绪' },
-    { system: '回放后端', upstream: 'dm/gfx/nvn/nvn_mtl.m(Metal)', hos: 'cpp/gfx/dm_vk:实例→VK_OHOS_surface→交换链→呈现', state: '骨架就绪' },
+    { system: 'SDK 启动链', upstream: 'dm/host/main.c guest_main', hos: 'host_start.c:_init_libc0→nnosInitialize→…→DT_INIT→nnMain', state: '已实现(真机执行)' },
+    { system: '服务层 HLE', upstream: 'hle_fs/oe/hid/time/misc', hos: 'fs/oe/hid/time 最小集 + 服务初始化强制接管 + 导入覆盖报告', state: '骨架就绪' },
+    { system: 'NVN 命令层', upstream: 'dm/gfx/nvn/hle_nvn.c(纯 C)', hos: 'cpp/gfx/nvn:引导 + 512 槽 thunk 表 + 记名记录', state: '骨架就绪' },
+    { system: '回放后端', upstream: 'dm/gfx/nvn/nvn_mtl.m(Metal)', hos: 'cpp/gfx/dm_vk:实例→VK_OHOS_surface→交换链→呈现(双后端已验证)', state: '已实现(演示)' },
     { system: '着色器翻译', upstream: 'gfx/tools:Maxwell→SPIR-V→MSL', hos: '止步 SPIR-V,供 Vulkan 消费', state: '待实施' },
     { system: 'App 壳', upstream: 'dm/ios(Sources/*.m,UIKit)', hos: 'ArkUI + XComponent(本仓库 entry)', state: '已完成' },
     { system: '触控界面', upstream: 'DmTouchOverlay.m + dm_touch_controls.c', hos: 'ArkUI 叠加层 + cpp/input 通路', state: '已完成(演示)' },
     { system: '表面渲染', upstream: 'CAMetalLayer', hos: 'XComponent + EGL/GLES3 与 Vulkan 双后端', state: '已完成(演示)' },
-    { system: '音频', upstream: 'CoreAudio', hos: 'OHAudio(待接入)', state: '待实施' },
+    { system: '音频', upstream: 'CoreAudio', hos: 'OHAudio 48kHz/2ch/S16LE 渲染器 + 正弦自检', state: '已实现(演示)' },
     { system: '构建管线', upstream: 'setup.sh + Xcode project.yml', hos: 'hvigor + CMake(本仓库)', state: '已完成' },
     { system: '验证框架', upstream: 'dm/verify(Unicorn 回归)', hos: 'tools/test_patch_nso_hos.py 合成 NSO 测试 + 上游复用', state: '骨架就绪' }
   ];
@@ -93,6 +95,44 @@ struct PortingStatus {
           // 自检与图形后端切换(进入游戏页建立表面后可切换)
           Column({ space: 8 }) {
             Row({ space: 10 }) {
+              Text('启动预检')
+                .fontSize(12)
+                .fontColor('#ffe0b0')
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(80,50,20,0.7)')
+                .borderRadius(8)
+                .onClick(() => {
+                  this.bootReport = DmNative.hostStart();
+                })
+              Text('服务自检')
+                .fontSize(12)
+                .fontColor('#ffe0b0')
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(80,50,20,0.7)')
+                .borderRadius(8)
+                .onClick(() => {
+                  this.bootReport = DmNative.serviceSelfTest();
+                })
+              Text('音频自检')
+                .fontSize(12)
+                .fontColor('#ffe0b0')
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(80,50,20,0.7)')
+                .borderRadius(8)
+                .onClick(() => {
+                  this.bootReport = DmNative.audioSelfTest();
+                })
+              Text('播放音')
+                .fontSize(12)
+                .fontColor('#ffe0b0')
+                .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                .backgroundColor('rgba(80,50,20,0.7)')
+                .borderRadius(8)
+                .onClick(() => {
+                  this.bootReport = DmNative.playTone();
+                })
+            }
+            Row({ space: 10 }) {
               Text('宿主全链路自检')
                 .fontSize(12)
                 .fontColor('#ffd9a0')
@@ -122,9 +162,9 @@ struct PortingStatus {
                 })
             }
             Text(this.bootReport)
-              .fontSize(11)
+              .fontSize(10)
               .fontColor('#9fbf8a')
-              .maxLines(2)
+              .maxLines(6)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
           .margin({ top: 6 })

@@ -282,3 +282,131 @@ int dm_loader_report(char *buf, int size)
     off += snprintf(buf + off, size - off, "| boot syms %d/%d", found, n);
     return 0;
 }
+
+/* ---------- 各模块 DT_INIT(扮演 rtld 的 InitModules) ----------
+ * 时机照 nn::init::Start:nninitStartup 与 _init_libc2 之后、nnMain 之前。
+ * init_array 同理:DT_INIT 就是 rtld 调 init_array 的入口。 */
+void run_module_inits(void)
+{
+    for (int i = 0; i < dm_max_modules(); i++) {
+        dm_module_t *m = dm_module_at(i);
+        if (m->init == 0) {
+            continue;
+        }
+        DMLOG_I("%{public}s: DT_INIT +%{public}llx(init_array %{public}llu 项)",
+                m->name, (unsigned long long)m->init,
+                (unsigned long long)(m->init_arraysz / 8));
+        ((void (*)(void))(m->base + m->init))();
+    }
+}
+
+/* ---------- 导入解析覆盖统计 ----------
+ * 装载/重定位完成后扫每个模块的 dynsym,把未定义符号按解析去向分类。
+ * 真机上「落记名桩」的名字就是下一批 HLE 的排期表;x86_64 data-only
+ * 构建同样能跑,把「还差什么」量化成一条可回归的报告。 */
+#define IMP_MAX_NAME 72
+#define IMP_MAX_UNIQ 4096
+#define IMP_STUB_LIST 12
+static int s_imp_done;
+static int s_imp_total, s_imp_mod, s_imp_force, s_imp_hle, s_imp_weak, s_imp_stub;
+static char s_imp_stub_names[IMP_STUB_LIST][IMP_MAX_NAME];
+static int s_imp_stub_shown;
+
+static int imp_seen(const char seen[][IMP_MAX_NAME], int n, const char *name)
+{
+    for (int i = 0; i < n; i++) {
+        if (strcmp(seen[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void import_scan(void)
+{
+    if (s_imp_done) {
+        return;
+    }
+    s_imp_done = 1;
+    static char seen[IMP_MAX_UNIQ][IMP_MAX_NAME];
+    int nseen = 0;
+    for (int mi = 0; mi < dm_max_modules(); mi++) {
+        dm_module_t *m = dm_module_at(mi);
+        if (!m->symh || !m->symtab) {
+            continue;
+        }
+        for (uint32_t i = 1; i < m->nsym; i++) {
+            const Elf64_Sym *s = &((const Elf64_Sym *)m->symtab)[i];
+            if (s->st_shndx != 0 || s->st_name == 0) {
+                continue;   /* 只看未定义导入 */
+            }
+            const char *nm = m->strtab + s->st_name;
+            if (!nm[0] || strcmp(nm, "__dm_placeholder__") == 0) {
+                continue;
+            }
+            if (nseen < IMP_MAX_UNIQ && imp_seen((const char (*)[IMP_MAX_NAME])seen, nseen, nm)) {
+                continue;
+            }
+            if (nseen < IMP_MAX_UNIQ) {
+                snprintf(seen[nseen++], IMP_MAX_NAME, "%s", nm);
+            }
+            s_imp_total++;
+            int weak = ELF64_ST_BIND(s->st_info) == STB_WEAK;
+            if (weak && !hle_lookup(nm) && !dm_swforce_lookup(nm)) {
+                s_imp_weak++;   /* 弱导入未解析保持 0(上游同语义) */
+                continue;
+            }
+            if (dm_swforce_lookup(nm)) {
+                s_imp_force++;
+            } else if (dm_guest_sym(nm)) {
+                s_imp_mod++;
+            } else if (hle_lookup(nm)) {
+                s_imp_hle++;
+            } else {
+                s_imp_stub++;
+                if (s_imp_stub_shown < IMP_STUB_LIST) {
+                    snprintf(s_imp_stub_names[s_imp_stub_shown++], IMP_MAX_NAME, "%s", nm);
+                }
+            }
+        }
+    }
+    uint32_t nhle = 0, nforce = 0;
+    hle_registered_counts(&nhle, &nforce);
+    DMLOG_I("imports: total=%{public}d module=%{public}d force=%{public}d hle=%{public}d "
+            "weak=%{public}d stub=%{public}d | registries hle=%{public}u force=%{public}u",
+            s_imp_total, s_imp_mod, s_imp_force, s_imp_hle, s_imp_weak, s_imp_stub,
+            (unsigned)nhle, (unsigned)nforce);
+    for (int i = 0; i < s_imp_stub_shown; i++) {
+        DMLOG_W("UNIMPL import: %{public}s", s_imp_stub_names[i]);
+    }
+}
+
+int dm_import_report(char *buf, int size)
+{
+    import_scan();
+    int off = snprintf(buf, size,
+                       "imp:%d 模块%d 接管%d HLE%d 弱%d 桩%d",
+                       s_imp_total, s_imp_mod, s_imp_force, s_imp_hle,
+                       s_imp_weak, s_imp_stub);
+    if (s_imp_stub_shown > 0 && off < size) {
+        off += snprintf(buf + off, size - off, " [");
+        for (int i = 0; i < s_imp_stub_shown && off < size; i++) {
+            off += snprintf(buf + off, size - off, "%s%s", i ? "," : "",
+                            s_imp_stub_names[i]);
+        }
+        snprintf(buf + off, size - off, "]");
+    }
+    return 0;
+}
+
+int dm_import_stub_count(void)
+{
+    import_scan();
+    return s_imp_stub;
+}
+
+int dm_import_total_count(void)
+{
+    import_scan();
+    return s_imp_total;
+}
