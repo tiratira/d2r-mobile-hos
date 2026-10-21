@@ -30,6 +30,9 @@ static pthread_t g_thread;
 static volatile int g_running = 0;
 static float g_clear[4] = {-1.0f, -1.0f, -1.0f, -1.0f};   /* <0 = 演示动画 */
 static _Atomic uint64_t g_vk_frames;
+static VkDevice g_upload_dev;
+static VkQueue g_upload_queue;
+static VkPhysicalDevice g_upload_pd;
 
 extern "C" void dmVkSetClearColor(float r, float g, float b, float a)
 {
@@ -91,6 +94,7 @@ struct VkLoop {
 
 static void vk_teardown(struct VkLoop *v)
 {
+    g_upload_dev = VK_NULL_HANDLE; g_upload_queue = VK_NULL_HANDLE; g_upload_pd = VK_NULL_HANDLE;
     if (v->dev) {
         vkDeviceWaitIdle(v->dev);
     }
@@ -178,6 +182,7 @@ static void *vk_loop(void *arg)
         return nullptr;
     }
     vkGetDeviceQueue(v.dev, v.qfam, 0, &v.queue);
+    g_upload_dev = v.dev; g_upload_queue = v.queue; g_upload_pd = pd;
 
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, v.surf, &caps);
@@ -381,4 +386,117 @@ extern "C" __attribute__((visibility("default"))) int dmVkRunning(void)
 extern "C" __attribute__((visibility("default"))) uint64_t dmVkFrames(void)
 {
     return g_vk_frames;
+}
+
+
+/* ================= M2-upload:Tegra 纹理 → Vulkan 图像 =================
+ * 回放线程在 nvnQueueSubmitCommands 时调用:线性像素(已 decodable/deswizzle)→
+ * VkImage(device-local, SAMPLED|TRANSFER_DST)。返回不透明句柄(当前为 VkImage
+ * 地址),失败 0。上传走临时 command pool + staging buffer,同步等待完成。 */
+extern "C" uint64_t dmVkUploadTexture(const void *pixels, uint32_t w, uint32_t h,
+                                      uint32_t vkfmt, uint32_t bpp);
+extern "C" uint64_t dmVkUploadCount(void);
+static _Atomic uint64_t g_tex_uploads;
+extern "C" uint64_t dmVkUploadCount(void) { return g_tex_uploads; }
+
+static int vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want)
+{
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(g_upload_pd, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return (int)i;
+    }
+    return -1;
+}
+
+static int vk_buf_create(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *out,
+                         VkDeviceMemory *mem, bool host)
+{
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size; bci.usage = usage; bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(g_upload_dev, &bci, nullptr, out) != VK_SUCCESS) return -1;
+    VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(g_upload_dev, *out, &mr);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size;
+    int mi = vk_mem_type(mr.memoryTypeBits, host ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                                                : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mi < 0) return -1;
+    mai.memoryTypeIndex = (uint32_t)mi;
+    if (vkAllocateMemory(g_upload_dev, &mai, nullptr, mem) != VK_SUCCESS) return -1;
+    vkBindBufferMemory(g_upload_dev, *out, *mem, 0);
+    return 0;
+}
+
+extern "C" uint64_t dmVkUploadTexture(const void *pixels, uint32_t w, uint32_t h,
+                                      uint32_t vkfmt, uint32_t bpp)
+{
+    if (g_upload_dev == VK_NULL_HANDLE || pixels == NULL || w == 0 || h == 0 || bpp == 0) return 0;
+    uint64_t bytes = (uint64_t)w * h * bpp;
+    VkImage img = VK_NULL_HANDLE; VkDeviceMemory imem = VK_NULL_HANDLE;
+    VkBuffer stg = VK_NULL_HANDLE; VkDeviceMemory smem = VK_NULL_HANDLE;
+    VkCommandPool pool = VK_NULL_HANDLE; VkCommandBuffer cb = VK_NULL_HANDLE;
+    uint64_t r = 0;
+    auto cleanup = [&]() {
+        if (cb) { vkFreeCommandBuffers(g_upload_dev, pool, 1, &cb); cb = VK_NULL_HANDLE; }
+        if (pool) { vkDestroyCommandPool(g_upload_dev, pool, nullptr); pool = VK_NULL_HANDLE; }
+        if (stg) { vkDestroyBuffer(g_upload_dev, stg, nullptr); stg = VK_NULL_HANDLE; }
+        if (smem) { vkFreeMemory(g_upload_dev, smem, nullptr); smem = VK_NULL_HANDLE; }
+        if (img) { vkDestroyImage(g_upload_dev, img, nullptr); img = VK_NULL_HANDLE; }
+        if (imem) { vkFreeMemory(g_upload_dev, imem, nullptr); imem = VK_NULL_HANDLE; }
+    };
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = (VkFormat)vkfmt;
+    ici.extent = { w, h, 1 }; ici.mipLevels = 1; ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT; ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(g_upload_dev, &ici, nullptr, &img) != VK_SUCCESS) { cleanup(); return 0; }
+    VkMemoryRequirements imr{}; vkGetImageMemoryRequirements(g_upload_dev, img, &imr);
+    VkMemoryAllocateInfo imai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; imai.allocationSize = imr.size;
+    int imi = vk_mem_type(imr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (imi < 0) { cleanup(); return 0; }
+    imai.memoryTypeIndex = (uint32_t)imi;
+    if (vkAllocateMemory(g_upload_dev, &imai, nullptr, &imem) != VK_SUCCESS) { cleanup(); return 0; }
+    vkBindImageMemory(g_upload_dev, img, imem, 0);
+    if (vk_buf_create(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &stg, &smem, true) != 0) { cleanup(); return 0; }
+    void *map = nullptr;
+    if (vkMapMemory(g_upload_dev, smem, 0, bytes, 0, &map) != VK_SUCCESS) { cleanup(); return 0; }
+    memcpy(map, pixels, (size_t)bytes);
+    vkUnmapMemory(g_upload_dev, smem);
+    {
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.queueFamilyIndex = 0;
+        if (vkCreateCommandPool(g_upload_dev, &pci, nullptr, &pool) != VK_SUCCESS) { cleanup(); return 0; }
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = pool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(g_upload_dev, &cai, &cb) != VK_SUCCESS) { cleanup(); return 0; }
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cb, &bi);
+        VkImageMemoryBarrier b1{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b1.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b1.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b1.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b1.image = img; b1.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        b1.srcAccessMask = 0; b1.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &b1);
+        VkBufferImageCopy bic{}; bic.bufferOffset = 0;
+        bic.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        bic.imageExtent = { w, h, 1 };
+        vkCmdCopyBufferToImage(cb, stg, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
+        VkImageMemoryBarrier b2 = b1;
+        b2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &b2);
+        vkEndCommandBuffer(cb);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+        if (vkQueueSubmit(g_upload_queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) {
+            vkQueueWaitIdle(g_upload_queue);
+            g_tex_uploads++;
+            r = (uint64_t)(uintptr_t)img;   /* 句柄:回放层据此建 VkImageView */
+            img = VK_NULL_HANDLE;           /* 不销毁 */
+        }
+    }
+    return r;
 }

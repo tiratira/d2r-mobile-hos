@@ -19,6 +19,8 @@
 #include <string.h>
 #include <unistd.h>
 extern uint64_t dmVkFrames(void);
+extern uint64_t dmVkUploadTexture(const void *pixels, uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp);
+extern uint64_t dmVkUploadCount(void);
 
 #define NVN_TABLE_MAX 512
 
@@ -715,15 +717,27 @@ static int nvn_texb_getrawclass(const void *b) { (void)b; return 0; }
 static void *nvn_stats_thread(void *arg)
 {
     (void)arg;
+    int up_tested = 0;
     for (;;) {
         sleep(2);
+        if (!up_tested && dmVkFrames() > 0) {
+            up_tested = 1;
+            static uint8_t px[64 * 64 * 4];
+            for (int i = 0; i < 64 * 64; i++) {
+                px[i * 4 + 0] = (uint8_t)i; px[i * 4 + 1] = (uint8_t)(i >> 6);
+                px[i * 4 + 2] = 0x40; px[i * 4 + 3] = 0xff;
+            }
+            uint64_t h = dmVkUploadTexture(px, 64, 64, 37 /* VK_FORMAT_R8G8B8A8_UNORM */, 4);
+            DMLOG_I("M2 tex upload self-test h=%{public}llx count=%{public}llu",
+                    (unsigned long long)h, (unsigned long long)dmVkUploadCount());
+        }
         /* hilog 在热路径下轮转很快,计数落盘更可靠 */
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
-                    (unsigned long long)dmVkFrames());
+                    (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount());
             fclose(f);
         }
     }
