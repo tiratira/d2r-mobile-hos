@@ -156,6 +156,7 @@ int dmHostStart(char *report, int report_size)
     dmCrashInstall();
     dmHostProbeModules(mods, sizeof(mods));
     dmServiceInitAll();
+    dmNvnInit();
     hle_force_report();
 
     /* 2) 预检(两种 ABI 都跑) */

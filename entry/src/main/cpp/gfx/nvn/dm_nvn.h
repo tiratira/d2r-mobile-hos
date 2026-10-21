@@ -23,8 +23,11 @@ extern "C" {
 /* 宿主侧 nvnBootstrapLoader 实现:按名字取 NVN 函数表指针。 */
 uint64_t dmNvnBootstrapLoader(const char *name);
 
-/* 登记一个 NVN 入口(记名桩;录制层就位后换成真实录制函数)。 */
+/* 登记宿主已实现的 NVN 入口(bootstrap/proc 分发时优先返回真实函数)。 */
 void dmNvnRegister(const char *name, nvn_func_t fn);
+
+/* 启动时登记最小真实入口(当前:nvnDeviceGetProcAddress)。 */
+void dmNvnInit(void);
 
 /* 已登记入口数 / 被调用过的入口数(观测骨架是否被走到)。 */
 uint32_t dmNvnEntryCount(void);

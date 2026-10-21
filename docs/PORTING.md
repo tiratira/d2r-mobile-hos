@@ -214,6 +214,7 @@ _init_libc0 → nnosInitialize(hmain,0) → _init_libc1
 | `hle_account.c` | 21 | 本地用户模型(Uid/UserHandle 魔数)/昵称;联网账号接口失败 |
 | `hle_net.c` | 93 | socket/nifm/ssl 离线化:Initialize 成功不建会话,联网调用按 BSD 回 -1/ENETDOWN;`nn::socket::Initialize` 必须接管,否则 SDK 自己走 hipc 连 `sm:` → diag::Abort |
 | `hle_vi.c` | 4 | nn::vi 显示层:Initialize/OpenDefaultDisplay/CreateLayer/GetNativeWindow → 宿主静态对象,不走 vi 服务 |
+| `hle_friends.c` | 26 | friends 服务全剪:好友/资料/游玩记录/通知/邀请/在线状态;Result 失败、列表为空、事件永不触发 |
 | `hle_libc.c` | 6 | getentropy、异常栈查询、`__rel_dyn/plt_*` 数据符号 |
 
 **导入覆盖报告**(`dm_import_report`,启动预检里显示):装载/重定位后扫
@@ -274,6 +275,15 @@ NVN 命令录制 → Vulkan 回放后才有游戏画面。
   (ARM64 汇编,`movz x9,#槽号; b 入口`),每个入口第一次调用打一行
   `NVN <名字>`(带 x0/x1/x2),这就是录制层的落点排期表。thunk 不生成
   运行时代码,符合 .so 签名约束。
+- **真机推进(3.3.94012)**:`nvnDeviceGetProcAddress` 已换成真实宿主函数
+  (`dmNvnInit` 登记 + proc 分发),真机第一次进入游戏即解析出 **128 个
+  NVN 入口**(清单见 [nvn_capture.md](nvn_capture.md));未实现的入口返回
+  统一非空占位(不再跳 0)。当前引擎在 `nvnDeviceInitialize` 之后解引用
+  未初始化的 NVN 对象而崩(NULL deref),说明下一步必须实现 NVN 对象语义。
+- 旁路服务已补齐:`hle_vi.c`(显示层 4 条)、`hle_friends.c`(好友/在线/
+  邀请/游玩记录 26 条,真机实测挡住 `friends::GetPlayHistoryRegistrationKey
+  → sm:` 的 diag::Abort)、`hle_net.c`(socket/nifm/ssl 离线化)、
+  `nv::InitializeGraphics` 等 SDK NVN 驱动入口强制空操作。
 - `gfx/dm_vk.cpp`:Vulkan WSI(实例→`VK_OHOS_surface`→交换链→呈现)已
   在模拟器实测通过;录制层就位后逐槽换成真实命令,呈现端只换每帧命令
   (当前为清屏色动画)。着色器链止步 SPIR-V。

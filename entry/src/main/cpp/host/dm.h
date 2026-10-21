@@ -137,6 +137,7 @@ int dmHostProbeModules(char *report, int report_size);
 int dmHostStart(char *report, int report_size);   /* 真实 SDK 启动序;ARM64 才执行 */
 const char *dmHostBootStage(void);                /* 最后到达的启动阶段(UI/hilog) */
 void dmCrashInstall(void);                        /* SIGSEGV/ABRT 现场记录到 hilog */
+void dmNvnInit(void);                             /* 登记宿主已实现的 NVN 入口 */
 
 /* 服务层 HLE(host/hle_fs.c、hle_oe.c、hle_hid.c、hle_time.c) */
 void dmFsInit(void);                                     /* 建挂载表(沙箱目录) */

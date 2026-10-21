@@ -23,9 +23,50 @@ typedef struct {
 } nvn_slot;
 
 static nvn_slot g_table[NVN_TABLE_MAX];
+static nvn_func_t g_fns[NVN_TABLE_MAX];
 static uint32_t g_count;
 static uint32_t g_called;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* 未知 NVN 入口的统一占位函数:返回 0(NVN 句柄/结果),不跳空 */
+static uint64_t nvn_unimpl_fn(void)
+{
+    return 0;
+}
+
+/* nvnDeviceGetProcAddress(device, name):游戏/引擎用它取 NVN 设备函数表。
+ * 返回宿主已实现的真实函数;没有实现的回统一占位函数(非空,避免引擎把
+ * 0 存进函数表后跳飞)。每个名字首次解析时打一行 hilog —— 这就是接下来
+ * 要逐个实现的 NVN 录制入口清单。 */
+static uint64_t h_nvn_device_get_proc(void *dev, const char *name)
+{
+    (void)dev;
+    static uint32_t n;
+    if (name != NULL && name[0] != 0 && n < 128) {
+        DMLOG_I("NVN proc: %{public}s", name);
+        n++;
+    }
+    if (name != NULL) {
+        pthread_mutex_lock(&g_mu);
+        for (uint32_t i = 0; i < g_count; i++) {
+            if (strcmp(g_table[i].name, name) == 0) {
+                nvn_func_t fn = g_fns[i];
+                pthread_mutex_unlock(&g_mu);
+                if (fn != NULL) {
+                    return (uint64_t)(uintptr_t)fn;
+                }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_mu);
+    }
+    return (uint64_t)(uintptr_t)&nvn_unimpl_fn;
+}
+
+void dmNvnInit(void)
+{
+    dmNvnRegister("nvnDeviceGetProcAddress", (nvn_func_t)h_nvn_device_get_proc);
+}
 
 #ifdef __aarch64__
 extern uint8_t dm_nvn_thunks[];
@@ -52,13 +93,13 @@ static uint64_t nvn_stub0(void)
 
 void dmNvnRegister(const char *name, nvn_func_t fn)
 {
-    (void)fn;
     if (name == NULL) {
         return;
     }
     pthread_mutex_lock(&g_mu);
     for (uint32_t i = 0; i < g_count; i++) {
         if (strcmp(g_table[i].name, name) == 0) {
+            g_fns[i] = fn;
             pthread_mutex_unlock(&g_mu);
             return;
         }
@@ -66,6 +107,7 @@ void dmNvnRegister(const char *name, nvn_func_t fn)
     if (g_count < NVN_TABLE_MAX) {
         snprintf(g_table[g_count].name, sizeof(g_table[0].name), "%s", name);
         g_table[g_count].called = 0;
+        g_fns[g_count] = fn;
         g_count++;
     }
     pthread_mutex_unlock(&g_mu);
@@ -94,6 +136,9 @@ uint64_t dmNvnBootstrapLoader(const char *name)
         g_count++;
     }
     pthread_mutex_unlock(&g_mu);
+    if (id < g_count && g_fns[id] != NULL) {
+        return (uint64_t)(uintptr_t)g_fns[id];   /* 已实现/录制入口 */
+    }
 #ifdef __aarch64__
     return (uint64_t)(uintptr_t)(dm_nvn_thunks + (size_t)id * 8);
 #else
@@ -105,8 +150,27 @@ uint64_t dmNvnBootstrapLoader(const char *name)
 HLE_FORCE("nvnBootstrapLoader", "NVN 图形接口整块换成宿主(后续 Vulkan 回放),sdk 的 NVN 驱动不执行",
           void *, h_nvn_bootstrap, const char *name)
 {
-    return (void *)(uintptr_t)dmNvnBootstrapLoader(name);
+    static uint32_t boot_n;
+    uint64_t r = dmNvnBootstrapLoader(name);
+    if (boot_n < 8) {
+        DMLOG_I("NVN bootstrap(%{public}s) -> %{public}#llx", name ? name : "?", (unsigned long long)r);
+        boot_n++;
+    }
+    return (void *)(uintptr_t)r;
 }
+
+/* SDK 的 NVN 驱动初始化入口:正常路径由宿主 nvnBootstrapLoader 拦截,不应执行。
+ * 真机实测仍会走到 nv::InitializeGraphics → NvOsDrvOpen → sm: IPC,
+ * 这里再按符号强制接管一次(重定位能覆盖到的调用点),把驱动整段挡掉。 */
+HLE_FORCE("_ZN2nv18InitializeGraphicsEPvm", "NVN 驱动初始化:宿主不跑 sdk 图形驱动", uint32_t,
+          h_nv_InitGfx, void *mem, size_t size) { (void)mem; (void)size; return 0; }
+HLE_FORCE("_ZN2nv16FinalizeGraphicsEv", "NVN 驱动收尾:空操作", void, h_nv_FinGfx, void) {}
+HLE_FORCE("_ZN2nv22SetGraphicsServiceNameEPKc", "NVN 服务名:记录但不连服务", void,
+          h_nv_SetName, const char *n) { (void)n; }
+HLE_FORCE("_ZN2nv26InitializeGraphicsDevtoolsEPvm", "NVN devtools:宿主不支持", uint32_t,
+          h_nv_InitDev, void *mem, size_t size) { (void)mem; (void)size; return 0; }
+HLE_FORCE("_ZN2nv21GetGraphicsMemoryInfoEPNS_10MemoryInfoE", "NVN 显存统计:给 0", void,
+          h_nv_MemInfo, void *info) { (void)info; }
 
 uint32_t dmNvnEntryCount(void)
 {
