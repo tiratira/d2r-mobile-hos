@@ -241,7 +241,7 @@ int dmNvnNextRequestedPair(char *k0, char *k1)
     return 1;
 }
 
-static uint64_t g_rec_bind2, g_rec_bind3, g_rec_draw3, g_rec_draw4, g_rec_prog;
+static uint64_t g_rec_bind2, g_rec_bind3, g_rec_draw3, g_rec_draw4, g_rec_prog, g_rec_vattr;
 static int dmNvnProgramKeysOf(void *prog, char *k0, char *k1);
 static uint64_t g_nvn_bufs, g_nvn_textures;
 
@@ -327,7 +327,7 @@ static uint32_t nvn_queue_init(void *q, const void *b)
  */
 #define DM_OP_WORDS 8
 typedef struct { uint32_t op, n; uint64_t a, b, c, d; float f[4]; } dm_op_t;
-enum { DM_OP_END = 0, DM_OP_CLEAR, DM_OP_BARRIER, DM_OP_DRAW, DM_OP_BIND, DM_OP_COPY, DM_OP_DISPATCH, DM_OP_PROG };
+enum { DM_OP_END = 0, DM_OP_CLEAR, DM_OP_BARRIER, DM_OP_DRAW, DM_OP_BIND, DM_OP_COPY, DM_OP_DISPATCH, DM_OP_PROG, DM_OP_VATTR };
 static nvn_cb_t *g_cur_cb;
 static uint64_t g_addcmd_n, g_begin_n, g_end_n, g_cbinit_n;
 static void *g_addcmd_cb[4]; static void *g_addcmd_pool[4]; static long long g_addcmd_off[4]; static unsigned long long g_addcmd_size[4];
@@ -394,6 +394,7 @@ static uint64_t op_draw3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { g_re
 static uint64_t op_draw4(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { g_rec_draw4++; dm_op_write4((nvn_cb_t *)cb, DM_OP_DRAW, a, b, c, d); return 0; }
 static uint64_t op_bind2(uint64_t cb, uint64_t a, uint64_t b) { g_rec_bind2++; dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, a, b, 0, 0); return 0; }
 static uint64_t op_bind_prog(uint64_t cb, uint64_t prog) { g_rec_prog++; dm_op_write4((nvn_cb_t *)cb, DM_OP_PROG, cb, prog, 0, 0); return 0; }
+static uint64_t op_bind_vattr(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { g_rec_vattr++; dm_op_write4((nvn_cb_t *)cb, DM_OP_VATTR, cb, a, b, c); return 0; }
 static uint64_t op_bind3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { g_rec_bind3++; dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, cb, a, b, c); return 0; }
 static uint64_t op_copy(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { dm_op_write((nvn_cb_t *)cb, DM_OP_COPY, NULL, 0); (void)a;(void)b;(void)c;(void)d; return 0; }
 static uint64_t op_dispatch(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_DISPATCH, NULL, 0); (void)a;(void)b;(void)c; return 0; }
@@ -1099,7 +1100,7 @@ static void *nvn_stats_thread(void *arg)
                 DMLOG_I("M4 shader keys loaded=%d cspipes=%d real_gpipes=%d", g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(),
                     (unsigned long long)g_draws, (unsigned long long)g_pipe_hits,
                     (unsigned long long)g_rec_bind2, (unsigned long long)g_rec_bind3,
-                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), (unsigned long long)g_rec_prog, (unsigned long long)dmVkReplayDrawCount(), dmVkReplayCond(), g_real_gpipes);
+                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), (unsigned long long)g_rec_prog, (unsigned long long)g_rec_vattr, (unsigned long long)dmVkReplayDrawCount(), dmVkReplayCond(), g_real_gpipes);
             }
             DMLOG_I("M2 tex upload self-test h=%{public}llx count=%{public}llu",
                     (unsigned long long)h, (unsigned long long)dmVkUploadCount());
@@ -1108,7 +1109,7 @@ static void *nvn_stats_thread(void *arg)
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
             fprintf(f, "progs=%d keys=%d ", g_progs, g_prog_key_n);
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d rgpipe=%d pcache=%d pobj=%d draws=%llu pbh=%llu recb2=%llu recb3=%llu recdl=%llu recprog=%llu rpdraw=%llu rpc=%d pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d rgpipe=%d pcache=%d pobj=%d draws=%llu pbh=%llu recb2=%llu recb3=%llu recdl=%llu recprog=%llu recva=%llu rpdraw=%llu rpc=%d pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
                     (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount(),
@@ -1116,7 +1117,7 @@ static void *nvn_stats_thread(void *arg)
                     (unsigned long long)dmVkShaderTestCount(), g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(),
                     (unsigned long long)g_draws, (unsigned long long)g_pipe_hits,
                     (unsigned long long)g_rec_bind2, (unsigned long long)g_rec_bind3,
-                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), (unsigned long long)g_rec_prog, (unsigned long long)dmVkReplayDrawCount(), dmVkReplayCond(),
+                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), (unsigned long long)g_rec_prog, (unsigned long long)g_rec_vattr, (unsigned long long)dmVkReplayDrawCount(), dmVkReplayCond(),
                     (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);
@@ -1292,7 +1293,7 @@ void dmNvnInit(void)
     dmNvnRegister("nvnCommandBufferDispatchCompute", (nvn_func_t)op_dispatch);
     dmNvnRegister("nvnCommandBufferBindProgram", (nvn_func_t)op_bind_prog);
     dmNvnRegister("nvnCommandBufferBindVertexBuffers", (nvn_func_t)op_bind3);
-    dmNvnRegister("nvnCommandBufferBindVertexAttribState", (nvn_func_t)op_bind3);
+    dmNvnRegister("nvnCommandBufferBindVertexAttribState", (nvn_func_t)op_bind_vattr);
     dmNvnRegister("nvnCommandBufferBindUniformBuffer", (nvn_func_t)op_bind3);
     dmNvnRegister("nvnCommandBufferBindSeparateTextures", (nvn_func_t)op_bind3);
     dmNvnRegister("nvnCommandBufferCallCommands", (nvn_func_t)op_draw4);
