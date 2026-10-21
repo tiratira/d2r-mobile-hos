@@ -113,8 +113,14 @@ int main(int argc, char **argv)
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
-    VkPhysicalDeviceFeatures feats{};
-    dci.pEnabledFeatures = &feats;
+    VkPhysicalDeviceVulkan11Features v11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2q.pNext=&v11q;
+    vkGetPhysicalDeviceFeatures2(pd,&f2q);
+    VkPhysicalDeviceVulkan11Features v11e{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    v11e.shaderDrawParameters=v11q.shaderDrawParameters; v11e.multiview=v11q.multiview;
+    VkPhysicalDeviceFeatures2 f2e{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2e.features=f2q.features; f2e.pNext=&v11e;
+    dci.pNext=&f2e; dci.pEnabledFeatures=nullptr;
     VkDevice dev = VK_NULL_HANDLE;
     if (vkCreateDevice(pd, &dci, nullptr, &dev) != VK_SUCCESS) { fprintf(stderr, "no device\n"); return 2; }
 
