@@ -470,15 +470,42 @@ static void nvn_texb_setdepth(void *b, int d) { if (b) ((nvn_texb_t *)b)->depth 
 static void nvn_texb_setlevels(void *b, int l) { if (b) ((nvn_texb_t *)b)->levels = l; }
 static void nvn_texb_setformat(void *b, int f) { if (b) ((nvn_texb_t *)b)->format = (uint32_t)f; }
 static void nvn_texb_setsamples(void *b, int s) { if (b) ((nvn_texb_t *)b)->samples = s; }
+/* NVNformat -> 每像素字节数(见 nvn.h 的 NVN_FORMAT_* 枚举;R8=1 ... RGBA8=0x25) */
+static unsigned nvn_format_bpp(unsigned f)
+{
+    if (f >= 0x1 && f <= 0x4) return 1;      /* R8 */
+    if (f >= 0x5 && f <= 0x9) return 2;      /* R16 */
+    if (f >= 0xA && f <= 0xC) return 4;      /* R32 */
+    if (f >= 0xD && f <= 0x10) return 2;     /* RG8 */
+    if (f >= 0x11 && f <= 0x15) return 4;    /* RG16 */
+    if (f >= 0x16 && f <= 0x18) return 8;    /* RG32 */
+    if (f >= 0x19 && f <= 0x1C) return 3;    /* RGB8 */
+    if (f >= 0x1D && f <= 0x21) return 6;    /* RGB16 */
+    if (f >= 0x22 && f <= 0x24) return 12;   /* RGB32 */
+    if (f >= 0x25 && f <= 0x28) return 4;    /* RGBA8 */
+    if (f >= 0x29 && f <= 0x2D) return 8;    /* RGBA16 */
+    if (f >= 0x2E && f <= 0x32) return 16;   /* RGBA32 */
+    return 4;
+}
 static uint64_t nvn_texb_size(const void *b)
 {
     const nvn_texb_t *t = (const nvn_texb_t *)b;
     if (t == NULL) return 0;
-    uint64_t px = (uint64_t)(t->width > 0 ? t->width : 1) * (uint64_t)(t->height > 0 ? t->height : 1);
+    uint64_t w = t->width > 0 ? (uint64_t)t->width : 1;
+    uint64_t h = t->height > 0 ? (uint64_t)t->height : 1;
     uint64_t depth = t->depth > 0 ? (uint64_t)t->depth : 1;
     uint64_t levels = t->levels > 0 ? (uint64_t)t->levels : 1;
-    uint64_t bytes = px * depth * levels * 4;    /* 保守按 4 字节/像素 */
-    return (bytes + 4095) & ~(uint64_t)4095;
+    unsigned bpp = nvn_format_bpp(t->format);
+    uint64_t bytes = 0;
+    for (uint64_t l = 0; l < levels; l++) {
+        uint64_t lw = w >> l; if (lw == 0) lw = 1;
+        uint64_t lh = h >> l; if (lh == 0) lh = 1;
+        bytes += lw * lh * depth * bpp;
+    }
+    uint64_t aligned = (bytes + 4095) & ~(uint64_t)4095;
+    DMLOG_I("NVN texb size %{public}dx%{public}dx%{public}d lv=%{public}d fmt=%{public}u bpp=%{public}u -> %{public}llu",
+            t->width, t->height, t->depth, t->levels, t->format, bpp, (unsigned long long)aligned);
+    return aligned;
 }
 static uint64_t nvn_texb_align(const void *b) { (void)b; return 4096; }
 
@@ -517,7 +544,40 @@ static int64_t nvn_texture_get_view_offset(const void *t, const void *view)
     return 0;
 }
 
+
+/* 其余 texture builder setter/getter:引擎会用 SetSize2D 等,补上才能算出正确
+ * GetStorageSize(此前只 SetWidth/Height 时尺寸对,但别的路径可能用 Size2D)。 */
+static void nvn_texb_set1d(void *b, int w) { if (b) { ((nvn_texb_t *)b)->width = w; ((nvn_texb_t *)b)->height = 1; ((nvn_texb_t *)b)->depth = 1; } }
+static void nvn_texb_set2d(void *b, int w, int h) { if (b) { ((nvn_texb_t *)b)->width = w; ((nvn_texb_t *)b)->height = h; ((nvn_texb_t *)b)->depth = 1; } }
+static void nvn_texb_set3d(void *b, int w, int h, int d) { if (b) { ((nvn_texb_t *)b)->width = w; ((nvn_texb_t *)b)->height = h; ((nvn_texb_t *)b)->depth = d; } }
+static void nvn_texb_setswizzle(void *b, int r, int g, int bl, int a) { (void)b; (void)r; (void)g; (void)bl; (void)a; }
+static void nvn_texb_setdsmode(void *b, int m) { (void)b; (void)m; }
+static void nvn_texb_setstride(void *b, int st) { (void)b; (void)st; }
+static void nvn_texb_setstorage(void *b, void *pool, int64_t off) { (void)b; (void)pool; (void)off; }
+static void nvn_texb_setpkgdata(void *b, void *d) { (void)b; (void)d; }
+static void nvn_texb_setpkglayout(void *b, int l) { (void)b; (void)l; }
+static void nvn_texb_setgln(void *b, unsigned n) { (void)b; (void)n; }
+static int nvn_texb_gettarget(const void *b) { return b ? (int)((const nvn_texb_t *)b)->target : 0; }
+static int nvn_texb_getwidth(const void *b) { return b ? ((const nvn_texb_t *)b)->width : 0; }
+static int nvn_texb_getheight(const void *b) { return b ? ((const nvn_texb_t *)b)->height : 0; }
+static int nvn_texb_getdepth(const void *b) { return b ? ((const nvn_texb_t *)b)->depth : 0; }
+static int nvn_texb_getlevels(const void *b) { return b ? ((const nvn_texb_t *)b)->levels : 0; }
+static int nvn_texb_getformat(const void *b) { return b ? (int)((const nvn_texb_t *)b)->format : 0; }
+static int nvn_texb_getsamples(const void *b) { return b ? ((const nvn_texb_t *)b)->samples : 0; }
+static int nvn_texb_getstoreclass(const void *b) { (void)b; return 0; }
+static int nvn_texb_getdsmode(const void *b) { (void)b; return 0; }
+static int nvn_texb_getswizzle(const void *b) { (void)b; return 0; }
+static uint64_t nvn_texb_getpkgdata(const void *b) { (void)b; return 0; }
+static int nvn_texb_getpkglayout(const void *b) { (void)b; return 0; }
+static int nvn_texb_getstride(const void *b) { (void)b; return 0; }
+static int nvn_texb_getglname(const void *b) { (void)b; return 0; }
+static int nvn_texb_getzull(const void *b) { (void)b; return 0; }
+static uint64_t nvn_texb_getpool(const void *b) { (void)b; return 0; }
+static int64_t nvn_texb_getoff(const void *b) { (void)b; return 0; }
+static int nvn_texb_getrawclass(const void *b) { (void)b; return 0; }
+
 void dmNvnInit(void)
+
 
 {
     dm_nvn_register_traces();
@@ -633,6 +693,35 @@ void dmNvnInit(void)
     dmNvnRegister("nvnTextureBuilderSetSamples", (nvn_func_t)nvn_texb_setsamples);
     dmNvnRegister("nvnTextureBuilderGetStorageSize", (nvn_func_t)nvn_texb_size);
     dmNvnRegister("nvnTextureBuilderGetStorageAlignment", (nvn_func_t)nvn_texb_align);
+    dmNvnRegister("nvnTextureBuilderSetSize1D", (nvn_func_t)nvn_texb_set1d);
+    dmNvnRegister("nvnTextureBuilderSetSize2D", (nvn_func_t)nvn_texb_set2d);
+    dmNvnRegister("nvnTextureBuilderSetSize3D", (nvn_func_t)nvn_texb_set3d);
+    dmNvnRegister("nvnTextureBuilderSetSwizzle", (nvn_func_t)nvn_texb_setswizzle);
+    dmNvnRegister("nvnTextureBuilderSetDepthStencilMode", (nvn_func_t)nvn_texb_setdsmode);
+    dmNvnRegister("nvnTextureBuilderSetStride", (nvn_func_t)nvn_texb_setstride);
+    dmNvnRegister("nvnTextureBuilderSetStorage", (nvn_func_t)nvn_texb_setstorage);
+    dmNvnRegister("nvnTextureBuilderSetPackagedTextureData", (nvn_func_t)nvn_texb_setpkgdata);
+    dmNvnRegister("nvnTextureBuilderSetPackagedTextureLayout", (nvn_func_t)nvn_texb_setpkglayout);
+    dmNvnRegister("nvnTextureBuilderSetGLTextureName", (nvn_func_t)nvn_texb_setgln);
+    dmNvnRegister("nvnTextureBuilderGetTarget", (nvn_func_t)nvn_texb_gettarget);
+    dmNvnRegister("nvnTextureBuilderGetWidth", (nvn_func_t)nvn_texb_getwidth);
+    dmNvnRegister("nvnTextureBuilderGetHeight", (nvn_func_t)nvn_texb_getheight);
+    dmNvnRegister("nvnTextureBuilderGetDepth", (nvn_func_t)nvn_texb_getdepth);
+    dmNvnRegister("nvnTextureBuilderGetLevels", (nvn_func_t)nvn_texb_getlevels);
+    dmNvnRegister("nvnTextureBuilderGetFormat", (nvn_func_t)nvn_texb_getformat);
+    dmNvnRegister("nvnTextureBuilderGetSamples", (nvn_func_t)nvn_texb_getsamples);
+    dmNvnRegister("nvnTextureBuilderGetStorageClass", (nvn_func_t)nvn_texb_getstoreclass);
+    dmNvnRegister("nvnTextureBuilderGetDepthStencilMode", (nvn_func_t)nvn_texb_getdsmode);
+    dmNvnRegister("nvnTextureBuilderGetSwizzle", (nvn_func_t)nvn_texb_getswizzle);
+    dmNvnRegister("nvnTextureBuilderGetPackagedTextureData", (nvn_func_t)nvn_texb_getpkgdata);
+    dmNvnRegister("nvnTextureBuilderGetPackagedTextureLayout", (nvn_func_t)nvn_texb_getpkglayout);
+    dmNvnRegister("nvnTextureBuilderGetStride", (nvn_func_t)nvn_texb_getstride);
+    dmNvnRegister("nvnTextureBuilderGetGLTextureName", (nvn_func_t)nvn_texb_getglname);
+    dmNvnRegister("nvnTextureBuilderGetZCullStorageSize", (nvn_func_t)nvn_texb_getzull);
+    dmNvnRegister("nvnTextureBuilderGetMemoryPool", (nvn_func_t)nvn_texb_getpool);
+    dmNvnRegister("nvnTextureBuilderGetMemoryOffset", (nvn_func_t)nvn_texb_getoff);
+    dmNvnRegister("nvnTextureBuilderGetRawStorageClass", (nvn_func_t)nvn_texb_getrawclass);
+
     dmNvnRegister("nvnBufferBuilderSetDefaults", (nvn_func_t)nvn_bufb_defaults);
     dmNvnRegister("nvnBufferBuilderSetDevice", (nvn_func_t)nvn_bufb_setdev);
     dmNvnRegister("nvnBufferBuilderSetSize", (nvn_func_t)nvn_bufb_setsize);
