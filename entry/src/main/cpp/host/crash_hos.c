@@ -68,6 +68,12 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         Dl_info di = {0}; dladdr((void *)pc, &di);
         int n = snprintf(line, sizeof line, "signal=%d address=%lx pc=%lx lr=%lx sp=%lx module=%s offset=%lx\n", sig, fault, pc, lr, sp, di.dli_fname ? di.dli_fname : "?", pc-(uintptr_t)di.dli_fbase);
         write(diagnostic_fd, line, (size_t)n);
+        const dm_module_t *guest = dm_module_of(pc);
+        if (guest) {
+            n = snprintf(line, sizeof line, "guest=%s offset=%lx\n", guest->name,
+                         pc - (uintptr_t)guest->base);
+            write(diagnostic_fd, line, (size_t)n);
+        }
         dladdr((void *)lr, &di);
         n = snprintf(line, sizeof line, "lr module=%s offset=%lx\n", di.dli_fname ? di.dli_fname : "?", lr-(uintptr_t)di.dli_fbase); write(diagnostic_fd,line,(size_t)n);
         for (int i=0;i<31;i++) { n=snprintf(line,sizeof line,"x%d=%lx ",i,regs[i]);write(diagnostic_fd,line,(size_t)n); }

@@ -80,6 +80,11 @@ export class DmNative {
     dmhost.setPadButton(bit, pressed);
   }
 
+  /** 从下一帧起抓取 n 帧呈现画面到 files/flash/ */
+  static armCapture(frames: number): void {
+    dmhost.armCapture(frames);
+  }
+
   static setStick(dx: number, dy: number): void {
     dmhost.setStick(dx, dy);
   }

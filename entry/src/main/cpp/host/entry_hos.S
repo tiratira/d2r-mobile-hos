@@ -125,6 +125,36 @@ dm_gate:
     add sp, sp, #800
     ret
 
+// Forward a cut call using its saved argument registers, including the hidden
+// aggregate result pointer in x8. regs has the dm_gate layout above.
+    .globl dm_guest_call_regs
+    .p2align 2
+dm_guest_call_regs:
+    stp x19, x30, [sp, #-32]!
+    str x18, [sp, #16]
+    mov x16, x0
+    mov x19, x1
+    ldp x0, x1, [x19, #0]
+    ldp x2, x3, [x19, #16]
+    ldp x4, x5, [x19, #32]
+    ldp x6, x7, [x19, #48]
+    ldr x8, [x19, #64]
+    ldr x18, [x19, #144]
+    ldp q0, q1, [x19, #256]
+    ldp q2, q3, [x19, #288]
+    ldp q4, q5, [x19, #320]
+    ldp q6, q7, [x19, #352]
+    blr x16
+    stp x0, x1, [x19, #0]
+    stp q0, q1, [x19, #256]
+    stp q2, q3, [x19, #288]
+    stp q4, q5, [x19, #320]
+    stp q6, q7, [x19, #352]
+    str x18, [x19, #144]
+    ldr x18, [sp, #16]
+    ldp x19, x30, [sp], #32
+    ret
+
     .globl dm_thread_enter
     .p2align 2
 dm_thread_enter:

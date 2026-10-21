@@ -36,3 +36,4 @@ export const setStick: (dx: number, dy: number) => void;
 export const castSkill: (slot: number, aimDx: number, aimDy: number, hold: number) => void;
 
 export const setPadButton: (bit: number, pressed: number) => void;
+export const armCapture: (frames: number) => void;

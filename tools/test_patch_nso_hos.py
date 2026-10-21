@@ -69,9 +69,12 @@ class TestRewriterHos(unittest.TestCase):
         except ImportError:
             self.skipTest('lz4 未安装')
         here = os.path.dirname(os.path.abspath(__file__))
-        up = None
+        up = os.environ.get('DM_UPSTREAM')
         for cand in (os.path.join(here, '..', 'd2r-mobile-src'),
-                     os.path.join(here, '..', '..', 'd2r-mobile-src')):
+                     os.path.join(here, '..', '..', 'd2r-mobile-src'),
+                     os.path.join(here, '..', '..', 'd2r-mobile')):
+            if up:
+                break
             p = os.path.join(cand, 'dm', 'tools', 'patch_nso.py')
             if os.path.isfile(p):
                 up = p

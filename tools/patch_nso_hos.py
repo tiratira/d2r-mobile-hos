@@ -28,7 +28,8 @@ src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
 def _find_upstream():
     here = os.path.dirname(os.path.abspath(__file__))
     for cand in (os.path.join(here, '..', 'd2r-mobile-src'),
-                 os.path.join(here, '..', '..', 'd2r-mobile-src')):
+                 os.path.join(here, '..', '..', 'd2r-mobile-src'),
+                 os.path.join(here, '..', '..', 'd2r-mobile')):
         p = os.path.join(cand, 'dm', 'tools', 'patch_nso.py')
         if os.path.isfile(p):
             return p

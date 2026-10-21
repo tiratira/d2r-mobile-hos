@@ -64,6 +64,9 @@ struct Game {
         Text('‹ 返回').fontSize(12).fontColor('#ead7ab')
           .padding(8).backgroundColor('rgba(0,0,0,0.5)').borderRadius(10)
           .onClick(() => { router.back(); })
+        Text('● 录制').fontSize(12).fontColor('#ffd28a')
+          .padding(8).backgroundColor('rgba(0,0,0,0.5)').borderRadius(10)
+          .onClick(() => { DmNative.armCapture(20); })
         Text(this.bootStage).fontSize(10).fontColor('#9da68a')
       }.margin(8)
       Row({ space: 8 }) {

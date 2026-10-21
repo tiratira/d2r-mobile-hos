@@ -47,7 +47,14 @@ static uint64_t fwd_main_off(uint64_t off, uint64_t *regs, uint32_t num)
         return 0;
     }
     guest_fn8 fn = (guest_fn8)(uintptr_t)((uint64_t)(uintptr_t)m->base + off);
+#ifdef __aarch64__
+    /* x8 carries AAPCS64's indirect result pointer (the ground-asset
+     * function returns a string). A C eight-argument call loses it. */
+    extern uint64_t dm_guest_call_regs(void *fn, uint64_t *regs);
+    return dm_guest_call_regs((void *)fn, regs);
+#else
     return fn(regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]);
+#endif
 }
 
 /* DecodeZlib(u8 *out, u32 out_cap, const u8 *in, u32 in_len, u32 flags,

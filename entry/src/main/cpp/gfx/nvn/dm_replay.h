@@ -9,6 +9,7 @@ uint64_t dmReplaySerial(void);
 uint64_t dmReplayFrames(void);
 void dmReplaySubmit(int n, const uint64_t *handles);
 void dmReplayPresent(const tex_t *t, const int crop[4]);
+void dmReplayArmCapture(int frames);
 void mtl_pool_add(void *p, size_t n);
 void mtl_pool_del(void *p);
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v);

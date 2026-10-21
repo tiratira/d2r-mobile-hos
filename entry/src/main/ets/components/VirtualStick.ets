@@ -54,13 +54,15 @@ export struct VirtualStick {
       PanGesture({ fingers: 1, distance: 1 })
         .onActionStart((event: GestureEvent) => {
           this.active = true;
-          if (event.fingerList.length > 0) {
-            this.update(event.fingerList[0].localX, event.fingerList[0].localY);
+          const f = event.fingerList?.[0];
+          if (f !== undefined) {
+            this.update(f.localX, f.localY);
           }
         })
         .onActionUpdate((event: GestureEvent) => {
-          if (event.fingerList.length > 0) {
-            this.update(event.fingerList[0].localX, event.fingerList[0].localY);
+          const f = event.fingerList?.[0];
+          if (f !== undefined) {
+            this.update(f.localX, f.localY);
           }
         })
         .onActionEnd(() => {

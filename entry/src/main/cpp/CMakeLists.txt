@@ -97,6 +97,12 @@ target_link_libraries(dmhost PUBLIC
 # 隐式函数声明一律报错:guest 导入解析返回 uint64_t,漏声明会按 int 截断成
 # 32 位(真机表现为跳到 0x7d19ed4 这种半截地址、SIGSEGV@低地址)。
 target_compile_options(dmhost PRIVATE -Werror=implicit-function-declaration)
+# Texture decoding, deswizzling and command replay also run in debug builds.
+# Keep symbols/frame pointers while avoiding an unoptimized CPU render path.
+target_compile_options(dmhost PRIVATE
+    $<$<COMPILE_LANGUAGE:C,CXX>:-O2>
+    $<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>
+)
 
 # 独立的 XComponent napi 模块:libdmhost.so 被 ArkTS import 先初始化后,
 # XComponent 复用同一模块不再调 Init,导致原生 surface 回调注册不上。

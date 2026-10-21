@@ -19,6 +19,7 @@
 #include "gfx/dm_gfx_backend.h"
 #include "gfx/dm_vk.h"
 #include "gfx/nvn/dm_nvn.h"
+#include "gfx/nvn/dm_replay.h"
 #include "render/dm_renderer.h"
 #include "host/dm.h"
 
@@ -375,12 +376,24 @@ static napi_value CastSkill(napi_env env, napi_callback_info info)
     return nullptr;
 }
 
+static napi_value ArmCapture(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1]{};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    int frames = 20;
+    if (argc >= 1) napi_get_value_int32(env, argv[0], &frames);
+    dmReplayArmCapture(frames);
+    napi_value undef{};
+    return undef;
+}
+
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports)
 {
     DMLOG_I("napi Init called");
     napi_property_descriptor desc[] = {
         {"getHostInfo", nullptr, GetHostInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"armCapture", nullptr, ArmCapture, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hostAbi", nullptr, HostAbi, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"guestExecSupported", nullptr, GuestExecSupported, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setFilesDir", nullptr, SetFilesDir, nullptr, nullptr, nullptr, napi_default, nullptr},

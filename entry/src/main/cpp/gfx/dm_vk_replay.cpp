@@ -1,4 +1,5 @@
 #include "gfx/nvn/nvn_dirty.h"
+#include "gfx/nvn/index_range.h"
 // Vulkan replay of the upstream NVN record ABI. All submissions and presentation
 // share one mutex; a submit returns only after GPU completion, preserving guest
 // command-memory, uniform-update, event and fence lifetimes.
@@ -15,12 +16,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/stat.h>
 #include <map>
 #include <mutex>
 #include <native_window/external_window.h>
 #include <string>
 #include <set>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <vulkan/vulkan.h>
@@ -47,10 +50,11 @@ VkSurfaceKHR surface{};
 VkSwapchainKHR swapchain{};
 VkExtent2D extent{};
 uint32_t qfamily{};
-VkSemaphore acquired{}, rendered{};
-VkCommandPool cmdpool{};
+// `cmd` mirrors the recording slot's command buffer; recording is single-threaded
+// under `mu` while submissions complete asynchronously on their per-slot fences.
 VkCommandBuffer cmd{};
-VkDescriptorPool descpool{};
+VkDescriptorPool setpool{};      // descriptor-set cache pool; sets live across frames
+VkPipelineCache pipelineCache{};
 VkPhysicalDeviceProperties properties{};
 struct Buffer {
     VkBuffer b{};
@@ -58,28 +62,105 @@ struct Buffer {
     uint8_t *map{};
     size_t size{};
 };
-Buffer arena;
-std::vector<Buffer> arenaPages;
-size_t arenaPage{};
-size_t cursor{};
+// Immutable staging (zero/support slices, per-shader constant banks, content-keyed
+// driver banks) lives in append-only pages that never unwind; per-submit scratch
+// lives in each slot's own rewinding arena.
+Buffer persistentArena;
+std::vector<Buffer> persistentPages;
+size_t persistentCursor{};
 struct Slice {
     VkBuffer b{};
     size_t off{}, size{};
     uint8_t *mapped{};
 };
 std::map<std::pair<uint64_t, uint64_t>, Slice> copies;
+std::map<std::pair<uint64_t, uint64_t>, Slice> dynCopies;
+std::map<std::tuple<uint64_t, int, int>, uint32_t> indexRanges;
+void invalidateCopies() {
+    copies.clear();
+    dynCopies.clear();
+    indexRanges.clear();
+}
+// Uniform updates must not discard unrelated vertex/index/storage snapshots.
+// Every cached guest slice is at most 64 MiB; start at the earliest possible
+// overlapping address and keep immutable slices already referenced by draws.
+void invalidateCopies(uint64_t address, uint64_t size) {
+    if (!size)
+        return;
+    uint64_t end = address + size;
+    if (end < address) {
+        invalidateCopies();
+        return;
+    }
+    uint64_t first = address > (64ull << 20) ? address - (64ull << 20) : 0;
+    for (auto it = copies.lower_bound({first, 0}); it != copies.end() && it->first.first < end;) {
+        if (it->first.second > address - std::min(address, it->first.first))
+            it = copies.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = dynCopies.lower_bound({first, 0}); it != dynCopies.end() && it->first.first < end;) {
+        if (it->first.second > address - std::min(address, it->first.first))
+            it = dynCopies.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = indexRanges.lower_bound({first, 0, 0});
+         it != indexRanges.end() && std::get<0>(it->first) < end;) {
+        auto [start, count, type] = it->first;
+        uint64_t bytes = uint64_t(count) * (type == 2 ? 4 : type == 1 ? 2 : 1);
+        if (bytes > address - std::min(address, start))
+            it = indexRanges.erase(it);
+        else
+            ++it;
+    }
+}
 Slice zeroSlice{}, supportSlice{};
 std::map<std::string, Slice> constantSlices;
 struct Writeback {
     uint64_t addr;
     Slice slice;
+    size_t size;
 };
-std::vector<Writeback> writebacks;
-std::vector<VkFramebuffer> framebuffers;
-std::vector<VkBufferView> bufferViews;
+struct DeferredEvent {   // guest-visible event write, applied on GPU completion
+    uint32_t *ptr;
+    uint32_t mode, value;
+};
+struct DeferredCounter { // guest-visible counter report, applied on GPU completion
+    uint64_t *ptr;
+    uint64_t a, b;
+    int query{-1};   // >= 0: report the GPU occlusion result of this slot-local query
+};
 uint64_t draws{}, dispatches{}, uploads{}, missing{}, pipelineErrors{}, submits{};
+using Clock = std::chrono::steady_clock;
+uint64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+}
+double replayMs{}, gpuMs{}, writebackMs{};
+double descriptorMs{}, stagingMs{}, indexMs{}, submitLatencyMs{};
+uint64_t stagedBytes{};
+uint64_t setAllocs{}, setHits{}, setInvalidations{}, bankHits{}, bankBuilds{}, syncDrains{};
+uint64_t submittedSerial{}, completedSerial{};   // completed = GPU done AND effects applied
+std::atomic<int> armedCapture{0};
+uint64_t capturedFrames{};
+// Real occlusion queries for NVN_COUNTER_TYPE_SAMPLES_PASSED: a zero report
+// tells the game "fully occluded" and it culls light sources and items (the
+// upstream Metal port documents this exact failure).
+enum { QUERIES_PER_SLOT = 256 };
+VkQueryPool queryPool{};
+Buffer queryResults;
+int queryCount{}, queryOpen{-1};
+struct Timer {
+    double &total;
+    Clock::time_point start{Clock::now()};
+    ~Timer() { total += std::chrono::duration<double, std::milli>(Clock::now() - start).count(); }
+};
+Clock::time_point recordingStart;
 bool deviceLost{};
-unsigned debugFlags{};
+// Bisect switches (compiled default 0 = all optimizations on): 8 residency
+// off, 32 descriptor-cache off, 64 bank-cache off, 16 fully synchronous
+// finish, 128 legacy synchronous present.
+unsigned debugFlags = 0;
 std::string lastGraphics, lastCompute;
 FILE *diagnostic{};
 void note(const char *fmt, ...) {
@@ -94,16 +175,20 @@ void note(const char *fmt, ...) {
     fputc('\n', diagnostic);
     fflush(diagnostic);
 }
-void check(VkResult r, const char *where) {
+void stats();
+bool check(VkResult r, const char *where) {
     if (r != VK_SUCCESS) {
         note("%s: VkResult=%d submit=%llu draws=%llu dispatch=%llu", where, r, (unsigned long long)submits,
              (unsigned long long)draws, (unsigned long long)dispatches);
         if (r == VK_ERROR_DEVICE_LOST) {
             deviceLost = true;
             note("last graphics=%s compute=%s", lastGraphics.c_str(), lastCompute.c_str());
+            stats();
         }
         RLOG("replay %{public}s: %{public}d", where, r);
+        return false;
     }
+    return true;
 }
 int memtype(uint32_t mask, VkMemoryPropertyFlags flags) {
     VkPhysicalDeviceMemoryProperties p;
@@ -137,39 +222,49 @@ Buffer buffer(size_t n, VkBufferUsageFlags usage) {
     b.map = (uint8_t *)p;
     return b;
 }
-Slice bytes(const void *p, size_t n) {
-    n = std::max(n, size_t(16));
-    size_t off = (cursor + 255) & ~size_t(255);
-    if (off + n > arena.size) {
-        arenaPage++;
-        if (arenaPage >= arenaPages.size())
-            arenaPages.push_back(buffer(
-                std::max(size_t(128 << 20), n + 256),
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                    VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT));
-        arena = arenaPages[arenaPage];
-        cursor = off = 0;
-    }
-    cursor = off + n;
-    if (p)
-        memcpy(arena.map + off, p, n);
-    else
-        memset(arena.map + off, 0, n);
-    return {arena.b, off, n, arena.map + off};
+struct ResidentBuffer {
+    Buffer buffer;
+    uint64_t stamp{}, used{};
+};
+std::map<std::pair<uint64_t, uint64_t>, ResidentBuffer> residentBuffers;
+std::vector<std::pair<uint64_t, uint64_t>> gpuWrites;
+size_t residentBytes{};
+uint64_t residentHits{};
+void deferBufferDestroy(Buffer b);          // defined after the submission ring
+void invalidateSetsForBuffer(VkBuffer b);   // defined with the descriptor cache
+void invalidateSetsForTexture(uint64_t serial, uint32_t gen);
+void drainIfOverlap(uint64_t addr, uint64_t n);
+void reclaimAll();
+void destroyBuffer(Buffer &b) {
+    vkUnmapMemory(dev, b.mem);
+    vkDestroyBuffer(dev, b.b, nullptr);
+    vkFreeMemory(dev, b.mem, nullptr);
 }
-Slice guest(uint64_t addr, size_t n) {
-    if (!addr || !n)
-        return zeroSlice.b ? zeroSlice : (zeroSlice = bytes(nullptr, 65536));
-    n = std::min(n, size_t(64 << 20));
-    auto key = std::make_pair(addr, (uint64_t)n);
-    auto it = copies.find(key);
-    if (it != copies.end())
-        return it->second;
-    Slice s = bytes((const void *)(uintptr_t)addr, n);
-    copies.emplace(key, s);
-    return s;
+void retireResident(decltype(residentBuffers)::iterator it) {
+    residentBytes -= it->second.buffer.size;
+    // Cached snapshots and descriptor sets must not outlive the buffer; drop
+    // them now. The VkBuffer itself dies at the recording slot's completion.
+    for (auto c = copies.begin(); c != copies.end();)
+        c = c->second.b == it->second.buffer.b ? copies.erase(c) : std::next(c);
+    invalidateSetsForBuffer(it->second.buffer.b);
+    deferBufferDestroy(it->second.buffer);
+    residentBuffers.erase(it);
+}
+bool overlaps(uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
+    return a <= b ? b - a < n : a - b < m;
+}
+void recordGpuWrite(uint64_t address, uint64_t size) {
+    if (!address || !size) return;
+    if (std::find(gpuWrites.begin(), gpuWrites.end(), std::make_pair(address, size)) != gpuWrites.end())
+        return;
+    gpuWrites.emplace_back(address, size);
+    // A buffer read earlier in this submit can become a compute output later.
+    // Keep its allocation alive until completion, but never reuse it next frame.
+    for (auto it = residentBuffers.begin(); it != residentBuffers.end();) {
+        auto current = it++;
+        if (overlaps(address, size, current->first.first, current->first.second))
+            retireResident(current);
+    }
 }
 std::vector<uint8_t> read(const std::string &path) {
     FILE *f = fopen(path.c_str(), "rb");
@@ -219,7 +314,25 @@ struct Binding {
     uint32_t binding{};
     VkDescriptorType type{};
     int kind{}, slot{-1}, cb{}, offset{}, handle{}, cbuf{-1}, count{1}, dim{1};
-    bool separate{};
+    bool separate{}, writable{true}, dynamic{};
+};
+// A descriptor set cached across frames. `identity` fully describes the bound
+// resources; a lookup only reuses an entry when the identity matches verbatim.
+struct SetEntry {
+    VkDescriptorSet set{};
+    uint64_t hash{};
+    std::vector<uint64_t> identity;
+    std::vector<VkBufferView> views;                        // texel views owned here
+    std::vector<VkBuffer> refBuffers;                       // retire invalidation keys
+    std::vector<std::pair<uint64_t, uint32_t>> refTextures; // serial, gen
+    std::vector<std::pair<int, uint32_t>> refSamplers;      // id, gen
+    uint64_t lastUsed{};
+    bool dead{};
+};
+struct RetiredSet {
+    VkDescriptorSet set{};
+    std::vector<VkBufferView> views;
+    uint64_t freeAt{};
 };
 struct Shader {
     VkShaderModule module{};
@@ -228,6 +341,9 @@ struct Shader {
     std::string key;
     std::vector<Binding> bindings;
     std::vector<uint32_t> inputs;
+    std::vector<SetEntry> entries;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> byHash;
+    size_t dead{};
     bool logged{};
     bool drawLogged{};
 };
@@ -244,13 +360,229 @@ struct Texture {
     VkFormat format{};
     uint32_t w{}, h{}, depth{}, layers{}, levels{1};
     int target{};
-    uint64_t stamp{}, seen{};
+    uint64_t stamp{}, seen{}, serial{};
+    uint32_t gen{};   // bumped when a live serial is replaced by new contents
     std::map<std::string, VkImageView> views;
     VkImageAspectFlags aspect{VK_IMAGE_ASPECT_COLOR_BIT};
 };
 std::map<uint64_t, Texture> textures;
 std::multimap<uint64_t, uint64_t> retiredTextures;
-std::vector<Texture> replacedTextures;
+
+// ---------------- submission ring ----------------
+// Up to RING submissions are in flight; each owns its command pool, fence,
+// present semaphores, staging arena and the list of work that must happen only
+// after the GPU signals (writebacks, events, resource destruction).
+enum { RING = 4 };
+struct Slot {
+    VkCommandPool pool{};
+    VkCommandBuffer buffer{};
+    VkFence fence{};
+    VkSemaphore acquireSem{}, renderSem{};
+    bool live{};
+    uint64_t submitSerial{}, submittedAtNs{}, completedAtNs{};
+    std::vector<VkFramebuffer> framebuffers;
+    std::vector<Writeback> writebacks;
+    std::vector<Buffer> deadBuffers;
+    std::vector<Texture> deadTextures;
+    std::vector<DeferredEvent> events;
+    std::vector<DeferredCounter> counters;
+    std::vector<Buffer> arenaPages;
+    size_t arenaPage{}, cursor{}, dynStart{};
+    Buffer arena;
+};
+Slot ring[RING];
+int curSlot{};
+Slot *cur{};
+// One shared staging ring backs every dynamic UBO/storage binding: descriptor
+// sets reference it once and draws supply per-bind offsets, so sets stay
+// valid while guest data moves through the ring each submission.
+Buffer dynRing;
+size_t dynCursor{}, dynAlign = 256;
+void deferBufferDestroy(Buffer b) { if (cur) cur->deadBuffers.push_back(std::move(b)); }
+
+// Per-submit scratch: the recording slot's arena unwinds when that slot is
+// reclaimed, so nothing cached across submissions may live here.
+Slice bytes(const void *p, size_t n) {
+    Timer timer{stagingMs};
+    stagedBytes += n;
+    const size_t payload = n;
+    n = std::max(n, size_t(16));
+    size_t off = (cur->cursor + 255) & ~size_t(255);
+    if (off + n > cur->arena.size) {
+        // Advance to the next page (or page 0 of a fresh slot); grow the page
+        // list only when the target index is not backed yet.
+        size_t next = cur->arenaPages.empty() ? 0 : cur->arenaPage + 1;
+        if (next >= cur->arenaPages.size())
+            cur->arenaPages.push_back(buffer(
+                std::max(size_t(96 << 20), n + 256),
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                    VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT));
+        cur->arenaPage = next;
+        cur->arena = cur->arenaPages[next];
+        cur->cursor = off = 0;
+    }
+    cur->cursor = off + n;
+    if (p) {
+        memcpy(cur->arena.map + off, p, payload);
+        if (payload < n)
+            memset(cur->arena.map + off + payload, 0, n - payload);
+    }
+    else
+        memset(cur->arena.map + off, 0, n);
+    return {cur->arena.b, off, n, cur->arena.map + off};
+}
+// Shared staging ring for dynamic-offset UBO/SSBO bindings. It rewinds lazily
+// to below the oldest still-live submission's start mark; descriptor sets
+// reference the ring buffer itself, never a position.
+void dynEnsure(size_t n) {
+    if (!dynRing.b || !dynRing.size)
+        dynRing = buffer(512u << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT);
+    if (n + 256 <= dynRing.size)
+        return;
+    note("dyn ring request %zu exceeds ring", n);
+    abort();
+}
+Slice stageDyn(const void *p, size_t n) {
+    Timer timer{stagingMs};
+    stagedBytes += n;
+    const size_t payload = n;
+    n = std::max(n, size_t(16));
+    dynEnsure(n);
+    size_t off = (dynCursor + dynAlign - 1) & ~(dynAlign - 1);
+    if (off + n > dynRing.size) {
+        size_t floorDyn = cur ? cur->dynStart : dynCursor;
+        for (auto &s : ring)
+            if (s.live)
+                floorDyn = std::min(floorDyn, s.dynStart);
+        if (n + 256 > floorDyn) {
+            reclaimAll();
+            floorDyn = cur ? cur->dynStart : dynCursor;
+            for (auto &s : ring)
+                if (s.live)
+                    floorDyn = std::min(floorDyn, s.dynStart);
+        }
+        dynCursor = 0;
+        off = 0;
+        (void)floorDyn;
+    }
+    dynCursor = off + n;
+    if (p) {
+        memcpy(dynRing.map + off, p, payload);
+        if (payload < n)
+            memset(dynRing.map + off + payload, 0, n - payload);
+    }
+    else
+        memset(dynRing.map + off, 0, n);
+    return {dynRing.b, off, n, dynRing.map + off};
+}
+// Immutable staging shared across submissions; pages are never unwound.
+Slice persistent(const void *p, size_t n) {
+    n = std::max(n, size_t(16));
+    size_t off = (persistentCursor + 255) & ~size_t(255);
+    if (off + n > persistentArena.size) {
+        persistentArena = buffer(std::max(size_t(8 << 20), n + 256),
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT);
+        persistentPages.push_back(persistentArena);
+        persistentCursor = off = 0;
+    }
+    persistentCursor = off + n;
+    if (p)
+        memcpy(persistentArena.map + off, p, n);
+    else
+        memset(persistentArena.map + off, 0, n);
+    return {persistentArena.b, off, n, persistentArena.map + off};
+}
+uint64_t fnv1a(const void *p, size_t n, uint64_t h = 1469598103934665603ull) {
+    for (const uint8_t *b = (const uint8_t *)p, *e = b + n; b < e;)
+        h = (h ^ *b++) * 1099511628211ull;
+    return h;
+}
+// Content-keyed driver-bank slices: identical binding tables reuse one
+// persistent snapshot, giving descriptor sets a stable identity across frames.
+std::map<uint64_t, std::pair<Slice, std::vector<uint8_t>>> bankCache;
+Slice bankSlice(const void *p, size_t n) {
+    if (debugFlags & 64)   // bisect switch: transient arena, no cross-frame bank
+        return bytes(p, n);
+    uint64_t h = fnv1a(p, n);
+    auto it = bankCache.find(h);
+    if (it != bankCache.end() && it->second.second.size() == n &&
+        !memcmp(it->second.second.data(), p, n)) {
+        bankHits++;
+        return it->second.first;
+    }
+    Slice s = persistent(p, n);
+    bankCache[h] = {s, std::vector<uint8_t>((const uint8_t *)p, (const uint8_t *)p + n)};
+    bankBuilds++;
+    return s;
+}
+Slice resident(uint64_t address, size_t size) {
+    if (size < 16384 || !nvn_dirty_tracked((void *)(uintptr_t)address, size)) return {};
+    for (auto [start, n] : gpuWrites)
+        if (overlaps(address, size, start, n)) return {};
+    auto key = std::make_pair(address, uint64_t(size));
+    auto it = residentBuffers.lower_bound(key);
+    if (it != residentBuffers.end() && it->first.first == address) {
+        if (!nvn_dirty_since((void *)(uintptr_t)address, it->first.second, it->second.stamp)) {
+            it->second.used = serial.load();
+            residentHits++;
+            auto &b = it->second.buffer;
+            return {b.b, 0, size, b.map};
+        }
+        retireResident(it);
+    }
+    // Bound both memory use and Vulkan allocation count. Evicted buffers are
+    // destroyed at the recording slot's completion.
+    while (!residentBuffers.empty() &&
+           (residentBytes + size > (192u << 20) || residentBuffers.size() >= 768)) {
+        auto victim = std::min_element(residentBuffers.begin(), residentBuffers.end(),
+            [](const auto &a, const auto &b) { return a.second.used < b.second.used; });
+        retireResident(victim);
+    }
+    Timer timer{stagingMs};
+    uint64_t stamp = nvn_dirty_now();
+    nvn_dirty_protect((void *)(uintptr_t)address, size);
+    Buffer b = buffer(size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+        VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT);
+    memcpy(b.map, (void *)(uintptr_t)address, size);
+    stagedBytes += size;
+    residentBuffers.emplace(key, ResidentBuffer{b, stamp, serial.load()});
+    residentBytes += size;
+    return {b.b, 0, size, b.map};
+}
+Slice guest(uint64_t addr, size_t n, bool readOnly = false, bool keep = false, bool dyn = false) {
+    if (!addr || !n)
+        return zeroSlice.b ? zeroSlice : (zeroSlice = persistent(nullptr, 65536));
+    n = std::min(n, size_t(64 << 20));
+    auto &cache = dyn ? dynCopies : copies;
+    auto key = std::make_pair(addr, (uint64_t)n);
+    auto it = cache.lower_bound(key);
+    if (it != cache.end() && it->first.first == addr &&
+        (it->first.second == n || (readOnly && n >= 16))) {
+        // Several meshes bind different prefixes of the same vertex/storage
+        // buffer. Reuse an existing larger snapshot rather than recopy it for
+        // every prefix; expose only the requested descriptor range.
+        Slice s = it->second;
+        s.size = std::max(n, size_t(16));
+        return s;
+    }
+    // Render diagnostic flag 8 disables residency for an in-place A/B test.
+    Slice s = keep && !(debugFlags & 8) ? resident(addr, n) : Slice{};
+    if (!s.b)
+        s = dyn ? stageDyn((const void *)(uintptr_t)addr, n) : bytes((const void *)(uintptr_t)addr, n);
+    cache.emplace(key, s);
+    return s;
+}
 struct Registration {
     tex_t tex{};
     view_t view{};
@@ -259,6 +591,9 @@ struct Registration {
 std::map<int, Registration> registrations;
 std::map<int, samp_par> samplerParams;
 std::map<int, VkSampler> samplers;
+std::map<int, uint32_t> samplerGen;   // bumped when a sampler id is re-registered
+std::vector<RetiredSet> retiredSets;  // freed once the GPU passes lastUsed
+std::vector<std::pair<VkSampler, uint64_t>> retiredSamplers;
 struct State {
     const prog_t *prog{};
     p_set_rt rt{};
@@ -526,7 +861,7 @@ Texture makeTexture(const tex_t &t) {
                 copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
                 copy.imageExtent = {width, height, depth};
                 vkCmdCopyBufferToImage(cmd, src.b, out.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-                uploads++;
+                        uploads++;
             }
         }
     } else if (out.aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -561,10 +896,12 @@ Texture *texture(const tex_t *t) {
     uint64_t stamp = nvn_dirty_now();
     if (packaged) nvn_dirty_protect(t->mem,t->L.size);
     Texture value = makeTexture(*t);
-    value.stamp = stamp; value.seen = stamp;
+    value.stamp = stamp; value.seen = stamp; value.serial = t->serial;
     if (!value.image) return nullptr;
     if (it != textures.end()) {
-        replacedTextures.push_back(std::move(it->second));
+        value.gen = it->second.gen + 1;
+        invalidateSetsForTexture(t->serial, it->second.gen);
+        cur->deadTextures.push_back(std::move(it->second));
         it->second = std::move(value);
         return &it->second;
     }
@@ -702,6 +1039,7 @@ Shader *shader(const NVNshaderData &sd) {
     if (jr.empty())
         jr = read(std::string(base) + "shaders/" + key + ".spv.res.json");
     std::string json(jr.begin(), jr.end());
+    uint32_t dynU{}, dynS{};
     for (uint32_t id = 1; id < bind.size(); id++)
         if (bind[id] != UINT32_MAX) {
             Binding b;
@@ -742,6 +1080,10 @@ Shader *shader(const NVNshaderData &sd) {
                     b.slot = field(o, "slot", -1);
                     b.cb = field(o, "cb_slot");
                     b.offset = field(o, "cb_offset") * 4;
+                    // Ryujinx BufferUsageFlags.Write is bit 0. Missing
+                    // reflection stays conservative; explicit read-only buffers
+                    // must never be copied back over concurrently updated data.
+                    b.writable = (field(o, "flags", 1) & 1) != 0;
                 }
             for (auto &section : {"textures", "images"})
                 for (auto &o : objects(json, section))
@@ -751,6 +1093,21 @@ Shader *shader(const NVNshaderData &sd) {
                         b.separate = field(o, "separate") != 0;
                         b.count = field(o, "array", 1);
                     }
+            // Dynamic-offset bindings: the set references the shared ring and
+            // each draw supplies the offset, so per-frame data churn stops
+            // invalidating cached sets. Device limits cap how many may be
+            // dynamic; the rest fall back to per-slice descriptors.
+            // The device dynamic-offset limits apply to the whole pipeline
+            // layout (vertex + fragment sets summed), so each stage gets half.
+            if (b.kind == 1 && b.slot >= 3 && b.slot < 19 &&
+                dynU < properties.limits.maxDescriptorSetUniformBuffersDynamic / 2) {
+                b.dynamic = true;
+                dynU++;
+            } else if (b.kind == 2 &&
+                       dynS < properties.limits.maxDescriptorSetStorageBuffersDynamic / 2) {
+                b.dynamic = true;
+                dynS++;
+            }
             sh.bindings.push_back(b);
         }
     for (uint32_t id = 1; id < loc.size(); id++)
@@ -762,12 +1119,20 @@ Shader *shader(const NVNshaderData &sd) {
     mc.pCode = w;
     check(vkCreateShaderModule(dev, &mc, nullptr, &sh.module), "shader module");
     std::vector<VkDescriptorSetLayoutBinding> layout;
-    for (auto &b : sh.bindings)
-        layout.push_back({b.binding, b.type, (uint32_t)b.count,
+    for (auto &b : sh.bindings) {
+        VkDescriptorType t = b.type;
+        if (b.dynamic) {
+            if (t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
+                t = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            else if (t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+                t = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+        }
+        layout.push_back({b.binding, t, (uint32_t)b.count,
                           sh.stage == 0   ? VK_SHADER_STAGE_VERTEX_BIT
                           : sh.stage == 1 ? VK_SHADER_STAGE_FRAGMENT_BIT
                                           : VK_SHADER_STAGE_COMPUTE_BIT,
                           nullptr});
+    }
     VkDescriptorSetLayoutCreateInfo lc{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     lc.bindingCount = layout.size();
     lc.pBindings = layout.data();
@@ -889,7 +1254,7 @@ bool beginpass() {
     VkFramebuffer fb{};
     if (vkCreateFramebuffer(dev, &fc, nullptr, &fb))
         return false;
-    framebuffers.push_back(fb);
+    cur->framebuffers.push_back(fb);
     VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rb.renderPass = currentPass;
     rb.framebuffer = fb;
@@ -981,8 +1346,8 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
     VkPipelineLayoutCreateInfo lc{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     lc.setLayoutCount = ps ? 2 : 1;
     lc.pSetLayouts = layouts;
-    if (vkCreatePipelineLayout(dev, &lc, nullptr, &out.layout))
-        return nullptr;
+    if (!check(vkCreatePipelineLayout(dev, &lc, nullptr, &out.layout), "pipeline layout"))
+        return &pipelines.emplace(key, out).first->second;   // cache the failure
     VkPipelineShaderStageCreateInfo stages[2]{};
     for (int i = 0; i < (ps ? 2 : 1); i++) {
         stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -999,7 +1364,7 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = stages[0];
         ci.layout = out.layout;
-        result = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &out.pipe);
+        result = vkCreateComputePipelines(dev, pipelineCache, 1, &ci, nullptr, &out.pipe);
     } else {
         std::vector<VkVertexInputAttributeDescription> attrs;
         std::vector<VkVertexInputBindingDescription> bindings;
@@ -1112,7 +1477,7 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
         ci.pDynamicState = &dynamic;
         ci.layout = out.layout;
         ci.renderPass = currentPass;
-        result = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &out.pipe);
+        result = vkCreateGraphicsPipelines(dev, pipelineCache, 1, &ci, nullptr, &out.pipe);
     }
     if (result) {
         if (pipelineErrors++ < 50)
@@ -1172,43 +1537,46 @@ Slice bindingBuffer(const Binding &b, Shader &sh) {
         std::array<uint8_t, 65536> support{};
         for (int i = 0; i < 73; i++)
             *(float *)(support.data() + 192 + 16 * i) = 1;
-        return supportSlice = bytes(support.data(), support.size());
+        return supportSlice = persistent(support.data(), support.size());
     }
     if (b.kind == 1) {
         if (b.slot >= 3 && b.slot < 19) {
             auto &u = S.ub[stage][b.slot - 3];
-            return guest(u.addr, u.size);
+            return guest(u.addr, u.size, true, !b.dynamic, b.dynamic);
         }
         if (b.slot == 1) {
             auto it = constantSlices.find(sh.key);
             if (it != constantSlices.end())
                 return it->second;
         }
-        std::array<uint8_t, 65536> driver{};
+        // Driver banks mirror the current binding table; identical tables reuse
+        // one content-keyed persistent slice so descriptor identities stay stable.
+        uint8_t bank[4096]{};
         if (b.slot == 2) {
-            memcpy(driver.data() + 0x168, S.tex[stage], sizeof S.tex[stage]);
-            memcpy(driver.data() + 0x568, S.samp[stage], sizeof S.samp[stage]);
-            memcpy(driver.data() + 0x120, S.img[stage], 8 * 8);
+            memcpy(bank + 0x168, S.tex[stage], sizeof S.tex[stage]);
+            memcpy(bank + 0x568, S.samp[stage], sizeof S.samp[stage]);
+            memcpy(bank + 0x120, S.img[stage], 8 * 8);
         }
         if (b.slot == 0) {
             int offset = stage == 0 ? 0x110 : stage == 1 ? 0x510 : 0x310;
             for (int i = 0; i < 16; i++) {
-                memcpy(driver.data() + offset + 16 * i, &S.ssbo[stage][i].addr, 8);
+                memcpy(bank + offset + 16 * i, &S.ssbo[stage][i].addr, 8);
                 uint32_t sz = S.ssbo[stage][i].size;
-                memcpy(driver.data() + offset + 16 * i + 8, &sz, 4);
+                memcpy(bank + offset + 16 * i + 8, &sz, 4);
             }
         }
         if (submits < 2)
             note("driver bank %d stage=%d", b.slot, stage);
         if (b.slot == 1) {
+            std::array<uint8_t, 65536> driver{};
             auto it = shaderConstants.find(sh.key);
             if (it != shaderConstants.end())
                 memcpy(driver.data(), it->second.data(), std::min(driver.size(), it->second.size()));
-        }
-        Slice result = bytes(driver.data(), b.slot == 1 ? driver.size() : 4096);
-        if (b.slot == 1)
+            Slice result = persistent(driver.data(), driver.size());
             constantSlices[sh.key] = result;
-        return result;
+            return result;
+        }
+        return bankSlice(bank, sizeof bank);
     }
     if (b.kind == 2) {
         int baseoff = stage == 0 ? 0x110 : stage == 1 ? 0x510 : 0x310;
@@ -1221,89 +1589,316 @@ Slice bindingBuffer(const Binding &b, Shader &sh) {
         if (submits < 8)
             note("storage binding=%u stage=%d cbOffset=%x slot=%d addr=%llx size=%llu", b.binding, stage,
                  b.offset, slot, (unsigned long long)u.addr, (unsigned long long)u.size);
-        Slice s = guest(u.addr, u.size);
-        if (u.addr && u.size)
-            writebacks.push_back({u.addr, s});
+        if (b.writable) recordGpuWrite(u.addr, u.size);
+        Slice s = guest(u.addr, u.size, !b.writable, !b.writable && !b.dynamic, b.dynamic);
+        if (b.writable && u.addr && u.size)
+            cur->writebacks.push_back({u.addr, s, std::min(size_t(u.size), s.size)});
         return s;
     }
-    return zeroSlice.b ? zeroSlice : (zeroSlice = bytes(nullptr, 65536));
+    return zeroSlice.b ? zeroSlice : (zeroSlice = persistent(nullptr, 65536));
 }
-VkDescriptorSet descriptors(Shader &sh) {
+// ---------------- descriptor-set cache ----------------
+// Sets are resolved to a full identity (buffer slices, texture generations,
+// view keys, sampler generations) and reused verbatim across frames. Dead
+// entries are freed once the GPU has passed their last use.
+void retireSet(Shader &sh, size_t idx) {
+    SetEntry &e = sh.entries[idx];
+    if (e.dead)
+        return;
+    auto bucket = sh.byHash.find(e.hash);
+    if (bucket != sh.byHash.end()) {
+        auto &v = bucket->second;
+        for (auto it = v.begin(); it != v.end(); ++it)
+            if (*it == idx) {
+                *it = v.back();
+                v.pop_back();
+                break;
+            }
+    }
+    e.dead = true;
+    sh.dead++;
+    e.identity.clear();
+    e.identity.shrink_to_fit();
+    e.refBuffers.clear();
+    e.refBuffers.shrink_to_fit();
+    e.refTextures.clear();
+    e.refTextures.shrink_to_fit();
+    e.refSamplers.clear();
+    e.refSamplers.shrink_to_fit();
+    retiredSets.push_back({e.set, std::move(e.views), e.lastUsed});
+    e.set = VK_NULL_HANDLE;
+    e.views.clear();
+    setInvalidations++;
+    // Tombstones must never make lookups or invalidation scans slower over
+    // time; compact once they dominate the table.
+    if (sh.dead > 32 && sh.dead * 2 > sh.entries.size()) {
+        std::vector<SetEntry> live;
+        live.reserve(sh.entries.size() - sh.dead);
+        for (auto &entry : sh.entries)
+            if (!entry.dead)
+                live.push_back(std::move(entry));
+        sh.entries = std::move(live);
+        sh.dead = 0;
+        sh.byHash.clear();
+        for (size_t i = 0; i < sh.entries.size(); i++)
+            sh.byHash[sh.entries[i].hash].push_back(uint32_t(i));
+    }
+}
+void processRetiredSets() {
+    for (auto it = retiredSets.begin(); it != retiredSets.end();) {
+        if (it->freeAt > completedSerial) {
+            ++it;
+            continue;
+        }
+        if (it->set)
+            vkFreeDescriptorSets(dev, setpool, 1, &it->set);
+        for (auto v : it->views)
+            vkDestroyBufferView(dev, v, nullptr);
+        it = retiredSets.erase(it);
+    }
+}
+void invalidateSetsForBuffer(VkBuffer b) {
+    for (auto &[k, sh] : shaders)
+        for (size_t i = 0; i < sh.entries.size(); i++)
+            if (!sh.entries[i].dead &&
+                std::find(sh.entries[i].refBuffers.begin(), sh.entries[i].refBuffers.end(), b) !=
+                    sh.entries[i].refBuffers.end())
+                retireSet(sh, i);
+}
+void invalidateSetsForTexture(uint64_t serial, uint32_t gen) {
+    for (auto &[k, sh] : shaders)
+        for (size_t i = 0; i < sh.entries.size(); i++)
+            if (!sh.entries[i].dead &&
+                std::find(sh.entries[i].refTextures.begin(), sh.entries[i].refTextures.end(),
+                          std::make_pair(serial, gen)) != sh.entries[i].refTextures.end())
+                retireSet(sh, i);
+}
+void invalidateAllSets() {
+    for (auto &[k, sh] : shaders) {
+        for (size_t i = 0; i < sh.entries.size(); i++)
+            retireSet(sh, i);
+        sh.byHash.clear();
+    }
+}
+// A slot's arena memory unwinds at its completion; every entry that staged
+// scratch inside it must be rebuilt afterwards.
+void invalidateSetsForArena(const Slot &s) {
+    for (auto &[k, sh] : shaders)
+        for (size_t i = 0; i < sh.entries.size(); i++) {
+            bool hit = false;
+            for (VkBuffer b : sh.entries[i].refBuffers)
+                for (auto &page : s.arenaPages)
+                    if (b == page.b)
+                        hit = true;
+            if (hit && !sh.entries[i].dead)
+                retireSet(sh, i);
+        }
+}
+VkDescriptorSet descriptors(Shader &sh, std::vector<std::pair<uint32_t, uint32_t>> *dynOffsets) {
+    Timer timer{descriptorMs};
+    struct Resolved {
+        Slice slice{};
+        Texture *tex{};
+        const view_t *view{};
+        uint64_t viewKey{}, serial{};
+        uint32_t gen{}, sampGen{};
+        int sampId{-1};
+        size_t range{};
+        VkFormat fmt{};
+    };
+    // Scratch buffers are reused across calls; this path runs thousands of
+    // times per frame.
+    static thread_local std::vector<Resolved> rs;
+    static thread_local std::vector<uint64_t> identity;
+    rs.clear();
+    rs.resize(sh.bindings.size());
+    identity.clear();
+    identity.reserve(sh.bindings.size() * 4);
+    for (size_t i = 0; i < sh.bindings.size(); i++) {
+        const Binding &b = sh.bindings[i];
+        Resolved &r = rs[i];
+        if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+            r.slice = bindingBuffer(b, sh);
+            if (!r.slice.b) {
+                if (setAllocs + setHits < 16)
+                    note("descriptors %s bail: empty slice binding=%u kind=%d slot=%d dyn=%d", sh.key.c_str(),
+                         b.binding, b.kind, b.slot, int(b.dynamic));
+                return {};
+            }
+            size_t range = std::min(r.slice.size,
+                                    b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                                        ? size_t(properties.limits.maxUniformBufferRange)
+                                        : size_t(properties.limits.maxStorageBufferRange));
+            r.range = range;
+            if (b.dynamic) {
+                // Position rides in the draw's dynamic offset; the cached set
+                // identity needs the backing buffer (ring vs zero slice) and
+                // the declared range. Buffer-less identities conflated empty
+                // bindings with real data and produced wrong-content draws.
+                if (dynOffsets)
+                    dynOffsets->push_back({b.binding, uint32_t(r.slice.off)});
+                identity.push_back(4);
+                identity.push_back((uint64_t)r.slice.b);
+                identity.push_back(range);
+            } else {
+                identity.push_back(1);
+                identity.push_back((uint64_t)r.slice.b);
+                identity.push_back(r.slice.off);
+                identity.push_back(range);
+            }
+        } else if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                   b.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+            uint64_t h = bindingHandle(b, sh.stage);
+            auto it = registrations.find(h & 0xfffff);
+            if (it != registrations.end() && it->second.tex.mem) {
+                auto &t = it->second.tex;
+                r.slice = guest((uint64_t)(uintptr_t)t.mem, t.L.size, true);
+                r.fmt = format(t.d.format);
+            } else {
+                r.slice = bytes(nullptr, 4096);
+                r.fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
+            }
+            identity.push_back(2);
+            identity.push_back((uint64_t)r.slice.b);
+            identity.push_back(r.slice.off);
+            identity.push_back(r.slice.size);
+            identity.push_back(r.fmt);
+        } else {
+            uint64_t h = bindingHandle(b, sh.stage);
+            r.sampId = int(h >> 20);
+            r.sampGen = samplerGen.count(r.sampId) ? samplerGen[r.sampId] : 0;
+            r.tex = b.kind == 4 ? nullptr : texid(h & 0xfffff);
+            if (!r.tex && b.kind != 4)
+                r.tex = dummyTexture(b.dim);
+            if (!r.tex && b.kind != 4)
+                return {};
+            if (r.tex) {
+                r.serial = r.tex->serial;
+                r.gen = r.tex->gen;
+                auto reg = registrations.find(h & 0xfffff);
+                if (reg != registrations.end() && reg->second.hasView) r.view = &reg->second.view;
+                r.viewKey = r.view ? fnv1a(r.view, sizeof(view_t)) : 0;
+            }
+            identity.push_back(3);
+            identity.push_back(r.serial);
+            identity.push_back(r.gen);
+            identity.push_back(r.viewKey);
+            identity.push_back((uint64_t)r.sampId);
+            identity.push_back(r.sampGen);
+        }
+        if (submits < 2)
+            note("descriptor %s binding=%u kind=%d type=%d slot=%d", sh.key.c_str(), b.binding, b.kind, b.type,
+                 b.slot);
+    }
+    uint64_t hash = fnv1a(identity.data(), identity.size() * sizeof(uint64_t));
+    if (!(debugFlags & 32)) {   // bisect switch 32: rebuild sets every call
+        auto &bucket = sh.byHash[hash];
+        for (uint32_t idx : bucket) {
+            SetEntry &e = sh.entries[idx];
+            if (!e.dead && e.identity == identity) {
+                e.lastUsed = submittedSerial + 1;
+                setHits++;
+                return e.set;
+            }
+        }
+    }
     if (submits < 2)
-        note("allocate descriptors %s layout=%p pool=%p", sh.key.c_str(), (void *)sh.layout,
-             (void *)descpool);
+        note("allocate descriptors %s layout=%p pool=%p", sh.key.c_str(), (void *)sh.layout, (void *)setpool);
     VkDescriptorSet set{};
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = descpool;
+    ai.descriptorPool = setpool;
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &sh.layout;
-    if (vkAllocateDescriptorSets(dev, &ai, &set))
-        return {};
+    if (vkAllocateDescriptorSets(dev, &ai, &set)) {
+        // Pool exhausted: flush everything reclaimable and retry once.
+        note("descriptor pool exhausted entries=%zu retired=%zu", sh.entries.size(), retiredSets.size());
+        processRetiredSets();
+        if (vkAllocateDescriptorSets(dev, &ai, &set)) {
+            invalidateAllSets();
+            processRetiredSets();
+            if (vkAllocateDescriptorSets(dev, &ai, &set)) {
+                note("descriptor allocation failed for %s", sh.key.c_str());
+                return {};
+            }
+        }
+    }
+    SetEntry entry;
+    entry.set = set;
+    entry.identity = identity;
+    entry.lastUsed = submittedSerial + 1;
+    static thread_local std::vector<VkWriteDescriptorSet> writes;
+    static thread_local std::vector<std::vector<VkDescriptorBufferInfo>> buffers;
+    static thread_local std::vector<std::vector<VkDescriptorImageInfo>> images;
+    static thread_local std::vector<std::vector<VkBufferView>> texels;
+    writes.clear();
+    buffers.clear();
+    buffers.resize(sh.bindings.size());
+    images.clear();
+    images.resize(sh.bindings.size());
+    texels.clear();
+    texels.resize(sh.bindings.size());
+    size_t bindingIndex = 0;
     for (auto &b : sh.bindings) {
-        if (submits < 2)
-            note("descriptor %s binding=%u kind=%d type=%d slot=%d", sh.key.c_str(), b.binding, b.kind,
-                 b.type, b.slot);
+        Resolved &r = rs[bindingIndex];
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w.dstSet = set;
         w.dstBinding = b.binding;
         w.descriptorCount = b.count;
         w.descriptorType = b.type;
-        std::vector<VkDescriptorBufferInfo> bs(b.count);
-        std::vector<VkDescriptorImageInfo> is(b.count);
-        std::vector<VkBufferView> views(b.count);
+        auto &bs = buffers[bindingIndex];
+        auto &is = images[bindingIndex];
+        auto &views = texels[bindingIndex++];
         if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-            Slice s = bindingBuffer(b, sh);
-            for (auto &v : bs)
-                v = {s.b, s.off,
-                     std::min(s.size, b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-                                          ? size_t(properties.limits.maxUniformBufferRange)
-                                          : size_t(properties.limits.maxStorageBufferRange))};
+            bs.resize(b.count);
+            if (b.dynamic) {
+                w.descriptorType = b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                                       ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+                for (auto &v : bs)
+                    v = {r.slice.b, 0, r.range};
+            } else {
+                entry.refBuffers.push_back(r.slice.b);
+                for (auto &v : bs)
+                    v = {r.slice.b, r.slice.off, r.range};
+            }
             w.pBufferInfo = bs.data();
         } else if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
                    b.type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
-            uint64_t h = bindingHandle(b, sh.stage);
-            auto it = registrations.find(h & 0xfffff);
-            Slice slice;
-            VkFormat fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
-            if (it != registrations.end() && it->second.tex.mem) {
-                auto &t = it->second.tex;
-                slice = guest((uint64_t)(uintptr_t)t.mem, t.L.size);
-                fmt = format(t.d.format);
-            } else
-                slice = bytes(nullptr, 4096);
+            views.resize(b.count);
+            entry.refBuffers.push_back(r.slice.b);
             VkBufferViewCreateInfo vi{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
-            vi.buffer = slice.b;
-            vi.format = fmt;
-            vi.offset = slice.off;
-            vi.range = slice.size;
+            vi.buffer = r.slice.b;
+            vi.format = r.fmt;
+            vi.offset = r.slice.off;
+            vi.range = r.slice.size;
             VkBufferView view{};
             if (vkCreateBufferView(dev, &vi, nullptr, &view))
                 return {};
-            bufferViews.push_back(view);
+            entry.views.push_back(view);
             std::fill(views.begin(), views.end(), view);
             w.pTexelBufferView = views.data();
         } else {
-            uint64_t h = bindingHandle(b, sh.stage);
-            Texture *t = b.kind == 4 ? nullptr : texid(h & 0xfffff);
-            if (!sh.logged)
-                note("image binding=%u stage=%d kind=%d dim=%d tid=%u sid=%u view=%p fmt=%d shape=%ux%ux%u",
-                     b.binding, sh.stage, b.kind, b.dim, (unsigned)(h & 0xfffff), (unsigned)(h >> 20),
-                     t ? (void *)t->view : nullptr, t ? t->format : 0, t ? t->w : 0, t ? t->h : 0,
-                     t ? t->depth : 0);
-            if (!t && b.kind != 4)
-                t = dummyTexture(b.dim);
-            if (!t && b.kind != 4)
-                return {};
-            const view_t *view = nullptr;
-            auto reg = registrations.find(h & 0xfffff);
-            if (reg != registrations.end() && reg->second.hasView) view = &reg->second.view;
-            VkImageView iv = t ? textureView(*t, view) : VK_NULL_HANDLE;
+            is.resize(b.count);
+            if (r.tex)
+                entry.refTextures.push_back({r.serial, r.gen});
+            if (r.sampId >= 0)
+                entry.refSamplers.push_back({r.sampId, r.sampGen});
             for (auto &v : is)
-                v = {sampler(h >> 20), iv, VK_IMAGE_LAYOUT_GENERAL};
+                v = {r.sampId >= 0 ? sampler(r.sampId) : VK_NULL_HANDLE,
+                     r.tex ? textureView(*r.tex, r.view) : VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
             w.pImageInfo = is.data();
         }
-        vkUpdateDescriptorSets(dev, 1, &w, 0, nullptr);
+        writes.push_back(w);
     }
+    vkUpdateDescriptorSets(dev, writes.size(), writes.data(), 0, nullptr);
+    setAllocs++;
+    if (debugFlags & 32) {   // uncached mode: retire as soon as this submit completes
+        retiredSets.push_back({set, std::move(entry.views), entry.lastUsed});
+        return set;
+    }
+    entry.hash = hash;
+    sh.entries.push_back(std::move(entry));
+    sh.byHash[hash].push_back(uint32_t(sh.entries.size() - 1));
     sh.logged = true;
     return set;
 }
@@ -1327,14 +1922,31 @@ void draw(const p_draw *dw, const p_draw_idx *di) {
         return;
     lastGraphics = p->sh[0]->key + "/" + (p->sh[1] ? p->sh[1]->key : "depth");
     // Resource creation and transfer commands must precede the render pass.
-    VkDescriptorSet sets[2]{descriptors(*p->sh[0]), p->sh[1] ? descriptors(*p->sh[1]) : VK_NULL_HANDLE};
-    if (!sets[0] || (p->sh[1] && !sets[1]) || !beginpass())
+    std::vector<std::pair<uint32_t, uint32_t>> dyn0, dyn1;
+    VkDescriptorSet sets[2]{descriptors(*p->sh[0], &dyn0),
+                            p->sh[1] ? descriptors(*p->sh[1], &dyn1) : VK_NULL_HANDLE};
+    if (!sets[0] || (p->sh[1] && !sets[1]) || !beginpass()) {
+        if (draws + dispatches < 16)
+            note("draw bail: vs_set=%d ps_set=%d pass=%d vs=%s", sets[0] != 0, p->sh[1] ? sets[1] != 0 : 1,
+                 inPass, p->sh[0]->key.c_str());
         return;
+    }
     Pipeline *pipe = pipeline(*p, di ? di->prim : dw->prim);
-    if (!pipe || !pipe->pipe)
+    if (!pipe || !pipe->pipe) {
+        if (draws + dispatches < 16)
+            note("draw bail: pipe=%d vs=%s ps=%s", pipe && pipe->pipe, p->sh[0]->key.c_str(),
+                 p->sh[1] ? p->sh[1]->key.c_str() : "-");
         return;
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipe);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->layout, 0, p->sh[1] ? 2 : 1, sets, 0, nullptr);
+    std::sort(dyn0.begin(), dyn0.end());
+    std::sort(dyn1.begin(), dyn1.end());
+    std::vector<uint32_t> offsets;
+    offsets.reserve(dyn0.size() + dyn1.size());
+    for (auto &[binding, off] : dyn0) offsets.push_back(off);
+    for (auto &[binding, off] : dyn1) offsets.push_back(off);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->layout, 0, p->sh[1] ? 2 : 1, sets,
+                            uint32_t(offsets.size()), offsets.data());
     dynamic();
     if (draws < 4) {
         note("draw %llu vs=%s ps=%s rt=%dx%d viewport=%g,%g,%g,%g count=%d first=%d",
@@ -1382,16 +1994,18 @@ void draw(const p_draw *dw, const p_draw_idx *di) {
     Slice indices{};
     VkIndexType it = VK_INDEX_TYPE_UINT16;
     if (di) {
+        Timer timer{indexMs};
         size_t unit = di->itype == 2 ? 4 : di->itype == 1 ? 2 : 1;
         const uint8_t *ptr = (const uint8_t *)(uintptr_t)di->ibuf;
         if (!ptr || di->count <= 0 || di->count > 10000000)
             return;
-        for (int i = 0; i < di->count; i++) {
-            uint32_t v = 0;
-            memcpy(&v, ptr + i * unit, unit);
-            if ((unit == 2 && v == 65535) || (unit == 4 && v == UINT32_MAX))
-                continue;
-            maxIndex = std::max(maxIndex, v + 1);
+        auto key = std::make_tuple(di->ibuf, di->count, di->itype);
+        auto range = indexRanges.find(key);
+        if (range != indexRanges.end()) {
+            maxIndex = range->second;
+        } else {
+            maxIndex = nvnIndexLimit(ptr, di->count, di->itype);
+            indexRanges.emplace(key, maxIndex);
         }
         if (di->itype == 0) {
             std::vector<uint16_t> expanded(di->count);
@@ -1399,7 +2013,7 @@ void draw(const p_draw *dw, const p_draw_idx *di) {
                 expanded[i] = ptr[i];
             indices = bytes(expanded.data(), expanded.size() * 2);
         } else
-            indices = guest(di->ibuf, di->count * unit);
+            indices = guest(di->ibuf, di->count * unit, true, true);
         it = di->itype == 2 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     }
     std::array<bool, 16> bound{};
@@ -1416,7 +2030,7 @@ void draw(const p_draw *dw, const p_draw_idx *di) {
         if (S.streams[stream].divisor)
             needed = (uint64_t)(di ? di->instances : 1) * S.streams[stream].stride + 256;
         size_t n = std::min<uint64_t>(v.size, needed);
-        Slice b = v.address && n ? guest(v.address, n) : bytes(nullptr, 4096);
+        Slice b = v.address && n ? guest(v.address, n, true, true) : bytes(nullptr, 4096);
         VkDeviceSize off = b.off;
         vkCmdBindVertexBuffers(cmd, stream, 1, &b.b, &off);
     }
@@ -1442,6 +2056,10 @@ bool builtinDispatch() {
     auto u = S.ub[5][0], src = S.ssbo[5][0], dst = S.ssbo[5][1];
     if (!u.addr || u.size < 4 || !src.addr || !dst.addr)
         return true;
+    // CPU-side emulation must observe GPU-produced inputs and not be clobbered
+    // by pending writebacks of the same ranges.
+    drainIfOverlap(src.addr, src.size);
+    drainIfOverlap(dst.addr, dst.size);
     uint32_t n;
     memcpy(&n, (void *)(uintptr_t)u.addr, 4);
     n = std::min<uint64_t>(n, dst.size / 8);
@@ -1456,7 +2074,7 @@ bool builtinDispatch() {
         uint64_t v = mode >= 2 ? b - a : a;
         memcpy((void *)(uintptr_t)(dst.addr + i * 8), &v, 8);
     }
-    copies.clear();
+    invalidateCopies(dst.addr, uint64_t(n) * 8);
     return true;
 }
 void dispatch(const p_dispatch &d) {
@@ -1470,12 +2088,18 @@ void dispatch(const p_dispatch &d) {
         return;
     Shader &sh = *p->sh[5];
     lastCompute = sh.key;
-    VkDescriptorSet set = descriptors(sh);
+    std::vector<std::pair<uint32_t, uint32_t>> dyn0;
+    VkDescriptorSet set = descriptors(sh, &dyn0);
     Pipeline *pipe = pipeline(*p, 0, true);
     if (!set || !pipe || !pipe->pipe)
         return;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->pipe);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout, 0, 1, &set, 0, nullptr);
+    std::sort(dyn0.begin(), dyn0.end());
+    std::vector<uint32_t> offsets;
+    offsets.reserve(dyn0.size());
+    for (auto &[binding, off] : dyn0) offsets.push_back(off);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe->layout, 0, 1, &set,
+                            uint32_t(offsets.size()), offsets.data());
     vkCmdDispatch(cmd, d.x, d.y, d.z);
     dispatches++;
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1652,15 +2276,17 @@ void execute(const uint8_t *p, int depth = 0) {
             uint64_t address, n;
             memcpy(&address, a, 8);
             memcpy(&n, (const uint8_t *)a + 8, 8);
+            drainIfOverlap(address, n);
             memcpy((void *)(uintptr_t)address, (const uint8_t *)a + 16, n);
-            copies.clear();
+            invalidateCopies(address, n);
             break;
         }
         case OP_COPY_B2B: {
             uint64_t x[3];
             memcpy(x, a, 24);
+            drainIfOverlap(x[1], x[2]);
             memmove((void *)(uintptr_t)x[1], (void *)(uintptr_t)x[0], x[2]);
-            copies.clear();
+            invalidateCopies(x[1], x[2]);
             break;
         }
         case OP_COPY_B2T:
@@ -1682,7 +2308,7 @@ void execute(const uint8_t *p, int depth = 0) {
                                    c.dr.zoffset + std::max(1, c.dr.depth)};
                 vkCmdBlitImage(cmd, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1,
                                &b, VK_FILTER_NEAREST);
-            }
+                    }
             break;
         }
         case OP_COPY_STRIDE:
@@ -1707,8 +2333,35 @@ void execute(const uint8_t *p, int depth = 0) {
         case OP_REPORT_COUNTER: {
             uint64_t x[2];
             memcpy(x, a, 16);
-            uint64_t values[2]{0, serial.load()};
-            memcpy((void *)(uintptr_t)x[1], values, 16);
+            // The report becomes guest-visible only when this submission's
+            // GPU work has completed.
+            int query = -1;
+            if (queryPool && x[0] == 1 && queryOpen >= 0) {
+                vkCmdEndQuery(cmd, queryPool, queryOpen);
+                query = queryOpen;
+                queryOpen = -1;
+            }
+            cur->counters.push_back({(uint64_t *)x[1], 0, serial.load(), query});
+            break;
+        }
+        case OP_RESET_COUNTER: {
+            uint64_t t;
+            memcpy(&t, a, 8);
+            if (queryPool && t == 1) {
+                // Occlusion counting resumes from zero for subsequent draws;
+                // vkCmdBeginQuery must sit outside a render pass.
+                endpass();
+                size_t slot = size_t(cur - ring);
+                uint32_t idx = uint32_t(slot * QUERIES_PER_SLOT + queryCount);
+                if (queryCount < QUERIES_PER_SLOT) {
+                    queryCount++;
+                    vkCmdBeginQuery(cmd, queryPool, idx, 0);
+                    queryOpen = int(idx);
+                } else if (queryOpen >= 0) {
+                    vkCmdEndQuery(cmd, queryPool, queryOpen);   // exhausted: keep the last value
+                    queryOpen = -1;
+                }
+            }
             break;
         }
         case OP_SIGNAL_EVENT: {
@@ -1717,12 +2370,7 @@ void execute(const uint8_t *p, int depth = 0) {
             memcpy(&v, a, 8);
             memcpy(&mode, (const uint8_t *)a + 8, 4);
             memcpy(&value, (const uint8_t *)a + 12, 4);
-            if (v) {
-                if (mode == 1)
-                    *v += value;
-                else
-                    *v = value;
-            }
+            cur->events.push_back({v, mode, value});
             break;
         }
         default:
@@ -1731,35 +2379,158 @@ void execute(const uint8_t *p, int depth = 0) {
         p += h.size;
     }
 }
-void begin() {
-    for (auto it = retiredTextures.begin(); it != retiredTextures.end() && it->first <= serial.load();) {
+// ---------------- completion processing ----------------
+// The fence has signaled: make this submission's effects visible (counters,
+// events, writebacks) and free everything it owned.
+void slotProcess(Slot &s) {
+    completedSerial = std::max(completedSerial, s.submitSerial);
+    submitLatencyMs += double(nowNs() - s.submittedAtNs) / 1e6;
+    for (auto &c : s.counters) {
+        uint64_t values[2]{c.a, c.b};
+        if (c.query >= 0 && queryResults.map) {
+            size_t slot = size_t(&s - ring);
+            memcpy(&values[0], queryResults.map + (slot * QUERIES_PER_SLOT + c.query % QUERIES_PER_SLOT) * 8, 8);
+        }
+        memcpy((void *)c.ptr, values, 16);
+    }
+
+    // Writebacks land BEFORE events: an event is the guest's "you may read the
+    // results now" signal, and the reader wakes concurrently with this loop.
+    auto wbStart = Clock::now();
+    for (auto &w : s.writebacks)
+        if (w.slice.b) {
+            nvn_dirty_prepare_write((void *)(uintptr_t)w.addr, w.size);
+            memcpy((void *)(uintptr_t)w.addr, w.slice.mapped, w.size);
+        }
+    writebackMs += std::chrono::duration<double, std::milli>(Clock::now() - wbStart).count();
+    for (auto &e : s.events) {
+        if (!e.ptr)
+            continue;
+        if (e.mode == 1)
+            *e.ptr += e.value;
+        else
+            *e.ptr = e.value;
+    }
+    for (auto &t : s.deadTextures) destroyTexture(t);
+    s.deadTextures.clear();
+    for (auto &b : s.deadBuffers) destroyBuffer(b);
+    s.deadBuffers.clear();
+    for (auto fb : s.framebuffers)
+        vkDestroyFramebuffer(dev, fb, nullptr);
+    s.framebuffers.clear();
+    for (auto it = retiredTextures.begin(); it != retiredTextures.end() && it->first <= completedSerial;) {
         auto t = textures.find(it->second);
         if (t != textures.end()) {
-            for (auto &v : t->second.views) vkDestroyImageView(dev, v.second, nullptr);
-            vkDestroyImageView(dev, t->second.view, nullptr);
-            vkDestroyImage(dev, t->second.image, nullptr);
-            vkFreeMemory(dev, t->second.memory, nullptr);
+            invalidateSetsForTexture(it->second, t->second.gen);
+            destroyTexture(t->second);
             textures.erase(t);
         }
         it = retiredTextures.erase(it);
     }
-    arenaPage = 0;
-    arena = arenaPages[0];
-    cursor = 0;
-    zeroSlice = {};
-    supportSlice = {};
-    constantSlices.clear();
-    copies.clear();
-    writebacks.clear();
-    framebuffers.clear();
-    vkResetCommandPool(dev, cmdpool, 0);
-    vkResetDescriptorPool(dev, descpool, 0);
+    processRetiredSets();
+    for (auto it = retiredSamplers.begin(); it != retiredSamplers.end();) {
+        if (it->second <= completedSerial) {
+            vkDestroySampler(dev, it->first, nullptr);
+            it = retiredSamplers.erase(it);
+        } else
+            ++it;
+    }
+    invalidateSetsForArena(s);
+    vkResetCommandPool(dev, s.pool, 0);
+    vkResetFences(dev, 1, &s.fence);
+    s.arenaPage = 0;
+    s.cursor = 0;
+    s.arena = s.arenaPages.empty() ? Buffer{} : s.arenaPages[0];
+    s.writebacks.clear();
+    s.events.clear();
+    s.counters.clear();
+    s.live = false;
+}
+void reclaim(Slot &s) {
+    if (!s.live)
+        return;
+    auto waitStart = Clock::now();
+    check(vkWaitForFences(dev, 1, &s.fence, VK_TRUE, UINT64_MAX), "fence");
+    gpuMs += std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count();
+    slotProcess(s);
+}
+void reclaimSignaled() {
+    for (auto &s : ring)
+        if (s.live && vkGetFenceStatus(dev, s.fence) == VK_SUCCESS)
+            slotProcess(s);
+}
+void reclaimAll() {
+    for (auto &s : ring)
+        reclaim(s);
+}
+// A pending writeback memcpy could clobber a newer CPU write into the same
+// guest range; when they overlap, finish all in-flight work first.
+void drainIfOverlap(uint64_t addr, uint64_t n) {
+    if (!addr || !n)
+        return;
+    for (auto &s : ring)
+        if (s.live)
+            for (auto &w : s.writebacks)
+                if (overlaps(addr, n, w.addr, w.size)) {
+                    reclaimAll();
+                    syncDrains++;
+                    return;
+                }
+}
+void readFlags() {
+    // Only override the compiled-in default when a flags file is readable;
+    // missing files must not clobber the bisect default.
+    for (const char *path : {"/data/local/tmp/dm_render_flags.txt",
+                             (std::string(base) + "dm_render_flags.txt").c_str()}) {
+        if (FILE *config = fopen(path, "r")) {
+            unsigned flags = 0;
+            if (fscanf(config, "%u", &flags) == 1)
+                debugFlags = flags;
+            fclose(config);
+        }
+    }
+}
+void begin() {
+    readFlags();
+    recordingStart = Clock::now();
+    gpuWrites.clear();
+    queryCount = 0;
+    queryOpen = -1;
+    reclaimSignaled();
+    Slot &s = ring[curSlot];
+    if (s.live)
+        reclaim(s);
+    cur = &s;
+    s.dynStart = dynCursor;
+    cmd = s.buffer;
+    if (queryPool)   // region reset in-command: host vkResetQueryPool needs Vulkan 1.2
+        vkCmdResetQueryPool(cmd, queryPool, uint32_t((&s - ring) * QUERIES_PER_SLOT), QUERIES_PER_SLOT);
+    // slotProcess resets the pool at completion, so the buffer is in its
+    // initial state here; an individual reset would need the pool flag.
     VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(cmd, &b), "begin command");
+    // Submissions execute in queue order, but Vulkan does not guarantee memory
+    // visibility of the previous submission's storage writes (the game's
+    // per-frame nvnCommandBufferWaitSync is stubbed out). One full barrier up
+    // front replaces what Metal gives each encoder for free.
+    VkMemoryBarrier lead{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    lead.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    lead.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+                         &lead, 0, nullptr, 0, nullptr);
 }
 void finish(VkSemaphore wait, VkSemaphore signal) {
     endpass();
+    if (queryPool) {
+        size_t slot = size_t(cur - ring);
+        for (auto &c : cur->counters)
+            if (c.query >= 0)
+                vkCmdCopyQueryPoolResults(cmd, queryPool, c.query, 1, queryResults.b,
+                                          (slot * QUERIES_PER_SLOT + c.query % QUERIES_PER_SLOT) * 8, 8,
+                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        queryOpen = -1;
+    }
     check(vkEndCommandBuffer(cmd), "end command");
     VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     s.commandBufferCount = 1;
@@ -1774,35 +2545,84 @@ void finish(VkSemaphore wait, VkSemaphore signal) {
         s.signalSemaphoreCount = 1;
         s.pSignalSemaphores = &signal;
     }
-    check(vkQueueSubmit(queue, 1, &s, VK_NULL_HANDLE), "submit");
-    check(vkQueueWaitIdle(queue), "wait GPU");
-    for (auto &t : replacedTextures) destroyTexture(t);
-    replacedTextures.clear();
-    for (auto &w : writebacks)
-        if (w.slice.b)
-            memcpy((void *)(uintptr_t)w.addr, w.slice.mapped, w.slice.size);
-    for (auto fb : framebuffers)
-        vkDestroyFramebuffer(dev, fb, nullptr);
-    framebuffers.clear();
-    for (auto v : bufferViews)
-        vkDestroyBufferView(dev, v, nullptr);
-    bufferViews.clear();
+    auto submitted = Clock::now();
+    replayMs += std::chrono::duration<double, std::milli>(submitted - recordingStart).count();
+    // Scratch-arena snapshots must never outlive this submission: another slot
+    // still executing could reference them after the arena unwinds. Cross-
+    // submission reuse goes through resident/persistent buffers only.
+    copies.clear();
+    dynCopies.clear();
+    indexRanges.clear();
+    cur->submitSerial = ++submittedSerial;
+    serial.store(submittedSerial);
+    cur->submittedAtNs = nowNs();
+    if (check(vkQueueSubmit(queue, 1, &s, cur->fence), "submit")) {
+        cur->live = true;
+        curSlot = (curSlot + 1) % RING;
+    }
+    if (debugFlags & 0x10000)   // synchronous fallback for A/B comparison
+        reclaimAll();
+}
+void savePipelineCache() {
+    if (!pipelineCache)
+        return;
+    size_t n = 0;
+    if (vkGetPipelineCacheData(dev, pipelineCache, &n, nullptr) || !n || n > (96u << 20))
+        return;
+    std::vector<uint8_t> data(n);
+    if (vkGetPipelineCacheData(dev, pipelineCache, &n, data.data()))
+        return;
+    std::string path = std::string(base) + "dm_pipeline_cache.bin";
+    FILE *f = fopen((path + ".tmp").c_str(), "wb");
+    if (!f)
+        return;
+    fwrite(data.data(), 1, n, f);
+    fclose(f);
+    rename((path + ".tmp").c_str(), path.c_str());
 }
 void stats() {
     FILE *f = fopen((std::string(base) + "dm_replay_stats.txt").c_str(), "w");
     if (f) {
         fprintf(f,
                 "submit=%llu present=%llu draws=%llu dispatch=%llu upload=%llu shaders=%zu pipelines=%zu "
-                "pipeline_errors=%llu missing_shader=%llu textures=%zu arena=%zu\n",
+                "pipeline_errors=%llu missing_shader=%llu textures=%zu arena=%zu "
+                "replay_ms=%.1f gpu_ms=%.1f writeback_ms=%.1f latency_ms=%.1f "
+                "descriptor_ms=%.1f staging_ms=%.1f index_ms=%.1f staged_mb=%.1f "
+                "resident_mb=%.1f resident_hits=%llu "
+                "set_alloc=%llu set_hits=%llu set_invalid=%llu bank_hits=%llu bank_builds=%llu sync_drains=%llu debug_flags=%u retired_sets=%zu\n",
                 (unsigned long long)submits, (unsigned long long)frames.load(), (unsigned long long)draws,
                 (unsigned long long)dispatches, (unsigned long long)uploads, shaders.size(), pipelines.size(),
-                (unsigned long long)pipelineErrors, (unsigned long long)missing, textures.size(), cursor);
+                (unsigned long long)pipelineErrors, (unsigned long long)missing, textures.size(),
+                cur ? cur->cursor : 0,
+                replayMs, gpuMs, writebackMs, submitLatencyMs, descriptorMs, stagingMs, indexMs,
+                double(stagedBytes) / (1024 * 1024), double(residentBytes) / (1024 * 1024),
+                (unsigned long long)residentHits,
+                (unsigned long long)setAllocs, (unsigned long long)setHits, (unsigned long long)setInvalidations,
+                (unsigned long long)bankHits, (unsigned long long)bankBuilds, (unsigned long long)syncDrains,
+                debugFlags, retiredSets.size());
         fclose(f);
+    }
+    savePipelineCache();
+}
+// Applies completions promptly even while the game thread is between submits
+// (e.g. spinning on a guest event between command batches).
+std::atomic<bool> completionRun{false};
+void completionLoop() {
+    while (completionRun.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::lock_guard<std::recursive_mutex> lock(mu);
+        if (ready && !deviceLost)
+            reclaimSignaled();
     }
 }
 } // namespace
 extern "C" uint64_t dmReplayFrames() { return frames.load(); }
 extern "C" uint64_t dmReplaySerial() { return serial.load(); }
+extern "C" void dmReplayArmCapture(int n) {
+    std::lock_guard<std::recursive_mutex> lock(mu);
+    capturedFrames = 0;
+    armedCapture.store(n);
+}
 extern "C" void dmReplaySubmit(int n, const uint64_t *h) {
     std::lock_guard<std::recursive_mutex> lock(mu);
     if (!ready || deviceLost)
@@ -1811,7 +2631,6 @@ extern "C" void dmReplaySubmit(int n, const uint64_t *h) {
     for (int i = 0; i < n; i++)
         execute((const uint8_t *)(uintptr_t)h[i]);
     finish();
-    serial++;
     submits++;
     if (submits % 30 == 0)
         stats();
@@ -1820,16 +2639,14 @@ extern "C" void dmReplayPresent(const tex_t *t, const int *crop) {
     std::lock_guard<std::recursive_mutex> lock(mu);
     if (!ready || !t || deviceLost)
         return;
+    begin();
+    VkSemaphore acquireSem = cur->acquireSem, renderSem = cur->renderSem;
     uint32_t index;
-    VkResult r = vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &index);
+    VkResult r = vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, acquireSem, VK_NULL_HANDLE, &index);
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         check(r, "acquire");
         return;
     }
-    if (FILE *config = fopen((std::string(base)+"dm_render_flags.txt").c_str(),"r")) {
-        unsigned flags = 0; if (fscanf(config,"%u",&flags)==1) debugFlags=flags; fclose(config);
-    } else debugFlags=0;
-    begin();
     Texture *src = texture(t);
     struct Dump { int id; Texture *texture; Slice data; };
     std::vector<Dump> dumps;
@@ -1857,8 +2674,12 @@ extern "C" void dmReplayPresent(const tex_t *t, const int *crop) {
         }
         fclose(request); remove(requestPath.c_str());
     }
+    bool flashCapture = armedCapture.load() > 0;
+    if (flashCapture)
+        mkdir((std::string(base) + "flash").c_str(), 0755);
     Slice capture{};
-    if (src && (frames == 1 || frames == 60 || frames == 1800) && src->aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+    if (src && (flashCapture || frames == 1 || frames == 60 || frames == 1800) &&
+        src->aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
         (src->format == VK_FORMAT_R8G8B8A8_UNORM || src->format == VK_FORMAT_R8G8B8A8_SRGB)) {
         capture = bytes(nullptr, (size_t)src->w * src->h * 4);
         VkBufferImageCopy cp{};
@@ -1895,7 +2716,11 @@ extern "C" void dmReplayPresent(const tex_t *t, const int *crop) {
         vkCmdClearColorImage(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &range);
     }
     imageBarrier(target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    finish(acquired, rendered);
+    Slot *submitted = cur;
+    bool legacyPresent = debugFlags & 128;
+    finish(acquireSem, renderSem);
+    if (legacyPresent || !dumps.empty() || capture.b)
+        reclaim(*submitted);   // legacy mode: blit complete before present; debug readbacks need the bytes
     for (auto &dump : dumps) {
         FILE *f = fopen((std::string(base)+"capture_"+std::to_string(dump.id)+".bin").c_str(),"wb");
         if(f) {
@@ -1903,7 +2728,23 @@ extern "C" void dmReplayPresent(const tex_t *t, const int *crop) {
             fwrite(header,1,sizeof header,f); fwrite(dump.data.mapped,1,dump.data.size,f);fclose(f);
         }
     }
-    if (capture.b) {
+    if (capture.b && flashCapture && armedCapture.fetch_sub(1) > 0) {
+        char name[96];
+        snprintf(name, sizeof name, "flash/f%llu.ppm", (unsigned long long)capturedFrames++);
+        FILE *f = fopen((std::string(base) + name).c_str(), "wb");
+        size_t nonzero = 0;
+        if (f) {
+            fprintf(f, "P6\n%u %u\n255\n", src->w, src->h);
+            std::vector<uint8_t> rgb((size_t)src->w * src->h * 3);
+            for (size_t i = 0; i < (size_t)src->w * src->h; i++) {
+                const uint8_t *p = capture.mapped + i * 4;
+                memcpy(rgb.data() + i * 3, p, 3);
+                nonzero += (p[0] || p[1] || p[2]);
+            }
+            fwrite(rgb.data(), 1, rgb.size(), f);
+            fclose(f);
+        }
+    } else if (capture.b) {
         FILE *f = fopen((std::string(base) + "dm_present.ppm").c_str(), "wb");
         size_t nonzero = 0;
         if (f) {
@@ -1922,18 +2763,42 @@ extern "C" void dmReplayPresent(const tex_t *t, const int *crop) {
     }
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
-    pi.pWaitSemaphores = &rendered;
+    pi.pWaitSemaphores = &renderSem;
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain;
     pi.pImageIndices = &index;
     check(vkQueuePresentKHR(queue, &pi), "present");
-    vkQueueWaitIdle(queue);
+    if (debugFlags & 0x10000 || legacyPresent)   // synchronous fallback for A/B comparison
+        vkQueueWaitIdle(queue);
     frames++;
     if (frames % 10 == 0)
         stats();
 }
 extern "C" void mtl_pool_add(void *p, size_t n) { nvn_dirty_add_range(p,n); }
-extern "C" void mtl_pool_del(void *p) { nvn_dirty_remove_range(p); }
+extern "C" void mtl_pool_del(void *p) {
+    std::lock_guard<std::recursive_mutex> lock(mu);
+    if (!ready)
+        return;
+    // Pending writebacks memcpy into pool memory; the old synchronous design
+    // guaranteed they were applied before pool destruction. Keep that guarantee.
+    reclaimAll();
+    // A newly allocated pool may reuse both address and zero generations.
+    // Pool destruction therefore invalidates resident snapshots and every
+    // address-keyed snapshot: a same-submit reallocation at the same address
+    // must never hit the dead pool's bytes (area transitions, text atlases).
+    copies.clear();
+    dynCopies.clear();
+    indexRanges.clear();
+    for (auto it = residentBuffers.begin(); it != residentBuffers.end();) {
+        for (auto c = copies.begin(); c != copies.end();)
+            c = c->second.b == it->second.buffer.b ? copies.erase(c) : std::next(c);
+        invalidateSetsForBuffer(it->second.buffer.b);
+        destroyBuffer(it->second.buffer);
+        residentBytes -= it->second.buffer.size;
+        it = residentBuffers.erase(it);
+    }
+    nvn_dirty_remove_range(p);
+}
 extern "C" void mtl_reg_tex(int id, const tex_t *t, const view_t *v) {
     std::lock_guard<std::recursive_mutex> lock(mu);
     if (t)
@@ -1946,7 +2811,16 @@ extern "C" void mtl_reg_samp(int id, const samp_par *p) {
     samplerParams[id] = *p;
     auto it = samplers.find(id);
     if (it != samplers.end()) {
-        vkDestroySampler(dev, it->second, nullptr);
+        // Cached sets referencing the old sampler object must be rebuilt; the
+        // object itself is retired once the GPU passes the current serial.
+        uint32_t gen = samplerGen[id]++;
+        for (auto &[k, sh] : shaders)
+            for (size_t i = 0; i < sh.entries.size(); i++)
+                if (!sh.entries[i].dead &&
+                    std::find(sh.entries[i].refSamplers.begin(), sh.entries[i].refSamplers.end(),
+                              std::make_pair(id, gen)) != sh.entries[i].refSamplers.end())
+                    retireSet(sh, i);
+        retiredSamplers.push_back({it->second, submittedSerial + 1});
         samplers.erase(it);
     }
 }
@@ -1959,15 +2833,52 @@ extern "C" void mtl_tex_release(tex_t *t) {
 extern "C" void mtl_prog_release(prog_t *) {}
 extern "C" void mtl_finish() {
     std::lock_guard<std::recursive_mutex> lock(mu);
-    if (ready)
+    if (ready && !deviceLost) {
+        reclaimAll();
         vkQueueWaitIdle(queue);
+    }
 }
-extern "C" int mtl_wait(uint64_t s, uint64_t) { return serial.load() >= s; }
+// A fenced sync releases only after the GPU completed that submission AND its
+// guest-visible effects (writebacks, events) were applied.
+extern "C" int mtl_wait(uint64_t s, uint64_t timeout) {
+    std::lock_guard<std::recursive_mutex> lock(mu);
+    if (completedSerial >= s)
+        return 1;
+    if (!ready || deviceLost)
+        return completedSerial >= s;
+    auto deadline = timeout == UINT64_MAX ? Clock::time_point::max()
+                                          : Clock::now() + std::chrono::nanoseconds(timeout);
+    while (completedSerial < s) {
+        Slot *oldest = nullptr;
+        for (auto &slot : ring)
+            if (slot.live && (!oldest || slot.submitSerial < oldest->submitSerial))
+                oldest = &slot;
+        if (!oldest)
+            break;
+        uint64_t leftNs = UINT64_MAX;
+        if (deadline != Clock::time_point::max()) {
+            auto left = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - Clock::now()).count();
+            if (left <= 0)
+                return 0;
+            leftNs = uint64_t(left);
+        }
+        auto waitStart = Clock::now();
+        VkResult r = vkWaitForFences(dev, 1, &oldest->fence, VK_TRUE, (leftNs + 999999) / 1000000);
+        gpuMs += std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count();
+        if (r == VK_TIMEOUT)
+            return 0;
+        slotProcess(*oldest);
+    }
+    return completedSerial >= s;
+}
 extern "C" void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer, const NVNcopyRegion *r,
                                 uint8_t *dst, size_t row, size_t img) {
     std::lock_guard<std::recursive_mutex> lock(mu);
     if (!t || !dst || !r)
         return;
+    // Reads guest memory directly; pending writebacks must be applied first.
+    if (ready && !deviceLost)
+        reclaimAll();
     int bw, bh, bpp = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpp)
         return;
@@ -1987,6 +2898,23 @@ static void replayCleanup() {
     if (dev)
         vkDeviceWaitIdle(dev);
     ready = false;
+    for (auto &s : shaders)
+        for (auto &e : s.second.entries)
+            for (auto v : e.views)
+                vkDestroyBufferView(dev, v, nullptr);
+    for (auto &r : retiredSets) {
+        if (r.set)
+            vkFreeDescriptorSets(dev, setpool, 1, &r.set);
+        for (auto v : r.views)
+            vkDestroyBufferView(dev, v, nullptr);
+    }
+    retiredSets.clear();
+    for (auto &s : retiredSamplers)
+        vkDestroySampler(dev, s.first, nullptr);
+    retiredSamplers.clear();
+    for (auto &[key, r] : residentBuffers) destroyBuffer(r.buffer);
+    residentBuffers.clear();
+    residentBytes = 0;
     for (auto &[k, p] : pipelines) {
         if (p.pipe)
             vkDestroyPipeline(dev, p.pipe, nullptr);
@@ -1994,6 +2922,10 @@ static void replayCleanup() {
             vkDestroyPipelineLayout(dev, p.layout, nullptr);
     }
     pipelines.clear();
+    if (pipelineCache) {
+        vkDestroyPipelineCache(dev, pipelineCache, nullptr);
+        pipelineCache = {};
+    }
     for (auto &[k, s] : shaders) {
         if (s.module)
             vkDestroyShaderModule(dev, s.module, nullptr);
@@ -2012,25 +2944,70 @@ static void replayCleanup() {
         vkFreeMemory(dev, t.memory, nullptr);
     }
     textures.clear();
+    retiredTextures.clear();
     for (auto &[k, s] : samplers)
         vkDestroySampler(dev, s, nullptr);
     samplers.clear();
-    for (auto &page : arenaPages) {
-        arena = page;
-        vkUnmapMemory(dev, arena.mem);
-        vkDestroyBuffer(dev, arena.b, nullptr);
-        vkFreeMemory(dev, arena.mem, nullptr);
+    for (auto &page : persistentPages) {
+        persistentArena = page;
+        vkUnmapMemory(dev, persistentArena.mem);
+        vkDestroyBuffer(dev, persistentArena.b, nullptr);
+        vkFreeMemory(dev, persistentArena.mem, nullptr);
     }
-    arenaPages.clear();
-    arena = {};
-    if (descpool)
-        vkDestroyDescriptorPool(dev, descpool, nullptr);
-    if (cmdpool)
-        vkDestroyCommandPool(dev, cmdpool, nullptr);
-    if (acquired)
-        vkDestroySemaphore(dev, acquired, nullptr);
-    if (rendered)
-        vkDestroySemaphore(dev, rendered, nullptr);
+    persistentPages.clear();
+    persistentArena = {};
+    persistentCursor = 0;
+    bankCache.clear();
+    copies.clear();
+    dynCopies.clear();
+    indexRanges.clear();
+    if (dynRing.b) {
+        vkUnmapMemory(dev, dynRing.mem);
+        vkDestroyBuffer(dev, dynRing.b, nullptr);
+        vkFreeMemory(dev, dynRing.mem, nullptr);
+        dynRing = {};
+        dynCursor = 0;
+    }
+    if (queryPool) {
+        vkDestroyQueryPool(dev, queryPool, nullptr);
+        queryPool = {};
+    }
+    if (queryResults.b)
+        destroyBuffer(queryResults);
+    for (auto &s : ring) {
+        for (auto &page : s.arenaPages) {
+            s.arena = page;
+            vkUnmapMemory(dev, s.arena.mem);
+            vkDestroyBuffer(dev, s.arena.b, nullptr);
+            vkFreeMemory(dev, s.arena.mem, nullptr);
+        }
+        s.arenaPages.clear();
+        s.arena = {};
+        s.cursor = s.arenaPage = 0;
+        s.live = false;
+        for (auto &t : s.deadTextures) destroyTexture(t);
+        s.deadTextures.clear();
+        for (auto &b : s.deadBuffers) destroyBuffer(b);
+        s.deadBuffers.clear();
+        if (s.pool)
+            vkDestroyCommandPool(dev, s.pool, nullptr);
+        if (s.fence)
+            vkDestroyFence(dev, s.fence, nullptr);
+        if (s.acquireSem)
+            vkDestroySemaphore(dev, s.acquireSem, nullptr);
+        if (s.renderSem)
+            vkDestroySemaphore(dev, s.renderSem, nullptr);
+        s.pool = {};
+        s.fence = {};
+        s.acquireSem = s.renderSem = {};
+        s.buffer = {};
+    }
+    curSlot = 0;
+    cur = {};
+    cmd = {};
+    if (setpool)
+        vkDestroyDescriptorPool(dev, setpool, nullptr);
+    setpool = {};
     if (swapchain)
         vkDestroySwapchainKHR(dev, swapchain, nullptr);
     if (dev)
@@ -2043,10 +3020,7 @@ static void replayCleanup() {
     instance = {};
     surface = {};
     swapchain = {};
-    cmdpool = {};
-    descpool = {};
-    acquired = {};
-    rendered = {};
+    submittedSerial = completedSerial = 0;
 }
 extern "C" void dmReplayLoop(OHNativeWindow *window, volatile int *running) {
     {
@@ -2161,37 +3135,66 @@ extern "C" void dmReplayLoop(OHNativeWindow *window, volatile int *running) {
             return;
         }
         VkSemaphoreCreateInfo sm{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-        vkCreateSemaphore(dev, &sm, nullptr, &acquired);
-        vkCreateSemaphore(dev, &sm, nullptr, &rendered);
-        VkCommandPoolCreateInfo pc{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        pc.queueFamilyIndex = qfamily;
-        pc.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        vkCreateCommandPool(dev, &pc, nullptr, &cmdpool);
-        VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        ca.commandPool = cmdpool;
-        ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        ca.commandBufferCount = 1;
-        vkAllocateCommandBuffers(dev, &ca, &cmd);
-        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 65536},
-                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384},
-                                        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536},
-                                        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 65536},
-                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8192},
-                                        {VK_DESCRIPTOR_TYPE_SAMPLER, 16384},
-                                        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 16384},
-                                        {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 16384}};
+        VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        for (auto &s : ring) {
+            VkCommandPoolCreateInfo pc{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+            pc.queueFamilyIndex = qfamily;
+            check(vkCreateCommandPool(dev, &pc, nullptr, &s.pool), "command pool");
+            VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            ca.commandPool = s.pool;
+            ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            ca.commandBufferCount = 1;
+            check(vkAllocateCommandBuffers(dev, &ca, &s.buffer), "command buffer");
+            check(vkCreateFence(dev, &fc, nullptr, &s.fence), "fence");
+            check(vkCreateSemaphore(dev, &sm, nullptr, &s.acquireSem), "semaphore");
+            check(vkCreateSemaphore(dev, &sm, nullptr, &s.renderSem), "semaphore");
+        }
+        cur = &ring[0];
+        cmd = ring[0].buffer;
+        dynAlign = 256;
+        for (auto limit : {properties.limits.minUniformBufferOffsetAlignment,
+                           properties.limits.minStorageBufferOffsetAlignment})
+            while (dynAlign < limit)
+                dynAlign <<= 1;
+        note("dyn ring align=%zu maxDynamicU=%u maxDynamicS=%zu", dynAlign,
+             properties.limits.maxDescriptorSetUniformBuffersDynamic,
+             size_t(properties.limits.maxDescriptorSetStorageBuffersDynamic));
+        {
+            VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+            auto blob = read(std::string(base) + "dm_pipeline_cache.bin");
+            if (!blob.empty()) {
+                pci.initialDataSize = blob.size();
+                pci.pInitialData = blob.data();
+            }
+            check(vkCreatePipelineCache(dev, &pci, nullptr, &pipelineCache), "pipeline cache");
+        }
+        VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 131072},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32768},
+                                        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 131072},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 32768},
+                                        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 131072},
+                                        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 131072},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16384},
+                                        {VK_DESCRIPTOR_TYPE_SAMPLER, 32768},
+                                        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 32768},
+                                        {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 32768}};
         VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dp.maxSets = 8192;
-        dp.poolSizeCount = 8;
+        dp.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        dp.maxSets = 32768;
+        dp.poolSizeCount = 10;
         dp.pPoolSizes = sizes;
-        check(vkCreateDescriptorPool(dev, &dp, nullptr, &descpool), "descriptor pool");
-        arena =
-            buffer(128 << 20, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                  VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
-                                  VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT);
-        arenaPages.push_back(arena);
+        check(vkCreateDescriptorPool(dev, &dp, nullptr, &setpool), "descriptor pool");
+        {
+            VkQueryPoolCreateInfo qc{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qc.queryType = VK_QUERY_TYPE_OCCLUSION;
+            qc.queryCount = RING * QUERIES_PER_SLOT;
+            if (!vkCreateQueryPool(dev, &qc, nullptr, &queryPool)) {
+                queryResults = buffer(RING * QUERIES_PER_SLOT * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                note("occlusion queries enabled %u slots", qc.queryCount);
+            } else
+                note("occlusion query pool unavailable; counters stay zero");
+        }
+        persistentArena = {};   // first persistent() call allocates page 0
         {
             auto blob = read(std::string(base) + "shaders/constants.bin");
             if (blob.size() >= 4) {
@@ -2215,8 +3218,12 @@ extern "C" void dmReplayLoop(OHNativeWindow *window, volatile int *running) {
         note("ready %s %ux%u qfamily=%u", properties.deviceName, extent.width, extent.height, qfamily);
         RLOG("NVN Vulkan replay ready %{public}s", properties.deviceName);
     }
+    completionRun = true;
+    std::thread completion(completionLoop);
     while (*running)
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    completionRun = false;
+    completion.join();
     std::lock_guard<std::recursive_mutex> lock(mu);
     stats();
     replayCleanup();
