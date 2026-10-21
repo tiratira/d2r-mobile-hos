@@ -48,6 +48,7 @@ static VkImageView g_dummy_view;
 static VkSampler g_dummy_samp;   /* 实验:M4 首绘开关(缺省关,保持已验证的清屏通路) */
 extern "C" uint64_t dmVkLoadShaderModule(const char *path);
 extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
+extern "C" int dmNvnVertexLayout(const uint32_t **attr, int *nattr, const uint32_t **stream, int *nstream);
 static int vk_buf_create(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *out, VkDeviceMemory *mem, bool host);
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
 extern "C" uint64_t dmVkCachedPipeline(const char *k0, const char *k1);
@@ -818,6 +819,60 @@ static VkShaderModule load_module(const char *path)
     return mod;
 }
 
+
+/* ================= M4-6:从 vs SPIR-V 推导顶点输入 ================= */
+typedef struct { uint32_t loc, comp, ctype, offset, bytes; } vin_t;
+static int parse_vs_inputs(const uint32_t *w, size_t nwords, vin_t *out, int maxn, uint32_t *stride)
+{
+    if (nwords < 6 || w[0] != 0x07230203u) return 0;
+    uint32_t loc_of[1024] = {0}; int have_loc[1024] = {0}; uint32_t builtin_of[1024] = {0};
+    size_t i = 5;
+    while (i < nwords) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (wc == 0) break;
+        if (op == 71 && wc >= 4) {
+            uint32_t tgt = w[i + 1], dec = w[i + 2];
+            if (tgt < 1024 && dec == 30) { loc_of[tgt] = w[i + 3]; have_loc[tgt] = 1; }
+            if (tgt < 1024 && dec == 11) builtin_of[tgt] = 1;
+        }
+        i += wc;
+    }
+    uint32_t scalar_w[1024] = {0}; int scalar_kind[1024] = {0};
+    uint32_t vec_n[1024] = {0}, vec_c[1024] = {0}, ptr_pointee[1024] = {0};
+    i = 5;
+    while (i < nwords) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (wc == 0) break;
+        if (op == 22 && wc >= 3 && w[i + 1] < 1024) { scalar_w[w[i + 1]] = w[i + 2]; scalar_kind[w[i + 1]] = 1; }
+        if (op == 21 && wc >= 5 && w[i + 1] < 1024) { scalar_w[w[i + 1]] = w[i + 2]; scalar_kind[w[i + 1]] = w[i + 3] ? 2 : 3; }
+        if (op == 23 && wc >= 4 && w[i + 1] < 1024) { vec_c[w[i + 1]] = w[i + 2]; vec_n[w[i + 1]] = w[i + 3]; }
+        if (op == 32 && wc >= 4 && w[i + 1] < 1024) { ptr_pointee[w[i + 1]] = w[i + 2]; }
+        i += wc;
+    }
+    int n = 0; uint32_t off = 0;
+    i = 5;
+    while (i < nwords) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (wc == 0) break;
+        if (op == 59 && wc >= 4) {
+            uint32_t ptr = w[i + 1], res = w[i + 2], storage = w[i + 3];
+            if (storage == 1 && res < 1024 && have_loc[res] && !builtin_of[res] && n < maxn) {
+                uint32_t ty = ptr_pointee[ptr];
+                uint32_t comp = vec_c[ty] ? vec_c[ty] : 1;
+                uint32_t sc = vec_c[ty] ? vec_n[ty] : ty;
+                uint32_t kind = scalar_kind[sc] ? scalar_kind[sc] : 1;
+                uint32_t bytes = scalar_w[sc] / 8 * comp;
+                out[n].loc = loc_of[res]; out[n].comp = comp; out[n].ctype = kind;
+                out[n].offset = off; out[n].bytes = bytes;
+                off += bytes; n++;
+            }
+        }
+        i += wc;
+    }
+    if (stride) *stride = off;
+    return n;
+}
+
 extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath)
 {
     if (g_upload_dev == VK_NULL_HANDLE || !vsPath || !psPath) return 0;
@@ -870,7 +925,61 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
     st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = ps; st[1].pName = "main";
+    vin_t vin[16]; uint32_t vin_stride = 0; int vin_n = 0;
+    {
+        FILE *vf = fopen(vsPath, "rb");
+        if (vf != NULL) {
+            fseek(vf, 0, SEEK_END); long vn = ftell(vf); fseek(vf, 0, SEEK_SET);
+            if (vn > 20 && vn < (1 << 22)) {
+                uint32_t *vw = (uint32_t *)malloc((size_t)vn);
+                if (vw != NULL) {
+                    if (fread(vw, 1, (size_t)vn, vf) == (size_t)vn) vin_n = parse_vs_inputs(vw, (size_t)vn / 4, vin, 16, &vin_stride);
+                    free(vw);
+                }
+            }
+            fclose(vf);
+        }
+    }
+    VkVertexInputBindingDescription vib{0, vin_stride, VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription via[16];
+    for (int k = 0; k < vin_n; k++) {
+        via[k].location = vin[k].loc; via[k].binding = 0; via[k].offset = vin[k].offset;
+        int comps = (int)vin[k].comp;
+        VkFormat f;
+        if (vin[k].ctype == 1)
+            f = comps == 1 ? VK_FORMAT_R32_SFLOAT : comps == 2 ? VK_FORMAT_R32G32_SFLOAT : comps == 3 ? VK_FORMAT_R32G32B32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+        else
+            f = comps == 1 ? VK_FORMAT_R32_SINT : comps == 2 ? VK_FORMAT_R32G32_SINT : comps == 3 ? VK_FORMAT_R32G32B32_SINT : VK_FORMAT_R32G32B32A32_SINT;
+        via[k].format = f;
+    }
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    {
+        const uint32_t *lva = NULL, *lvs = NULL; int lna = 0, lns = 0;
+        if (dmNvnVertexLayout(&lva, &lna, &lvs, &lns) && lna > 0) {
+            VkVertexInputBindingDescription vbs[8]; uint32_t nvb = 0;
+            VkVertexInputAttributeDescription vas[16]; uint32_t nva = 0;
+            for (int k = 0; k < lna && k < 16 && nva < 16; k++) {
+                uint32_t stream = (lva[k] >> 27) & 0x1F;
+                uint32_t off = (lva[k] >> 8) & 0x7FFFF;
+                if (stream >= 8) continue;
+                uint32_t stride = (lns > (int)(stream * 2 + 1)) ? lvs[stream * 2] : 32;
+                int found = -1;
+                for (uint32_t b = 0; b < nvb; b++) if (vbs[b].binding == stream) { found = (int)b; break; }
+                if (found < 0 && nvb < 8) { vbs[nvb].binding = stream; vbs[nvb].stride = stride; vbs[nvb].inputRate = VK_VERTEX_INPUT_RATE_VERTEX; nvb++; }
+                int comps = (k < vin_n) ? (int)vin[k].comp : 4;
+                int ctype = (k < vin_n) ? (int)vin[k].ctype : 1;
+                VkFormat f;
+                if (ctype == 1) f = comps == 1 ? VK_FORMAT_R32_SFLOAT : comps == 2 ? VK_FORMAT_R32G32_SFLOAT : comps == 3 ? VK_FORMAT_R32G32B32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+                else f = comps == 1 ? VK_FORMAT_R32_SINT : comps == 2 ? VK_FORMAT_R32G32_SINT : comps == 3 ? VK_FORMAT_R32G32B32_SINT : VK_FORMAT_R32G32B32A32_SINT;
+                vas[nva].location = (k < vin_n) ? vin[k].loc : (uint32_t)k;
+                vas[nva].binding = stream; vas[nva].offset = off; vas[nva].format = f; nva++;
+            }
+            if (nva > 0 && nvb > 0) {
+                vi.vertexBindingDescriptionCount = nvb; vi.pVertexBindingDescriptions = vbs;
+                vi.vertexAttributeDescriptionCount = nva; vi.pVertexAttributeDescriptions = vas;
+            }
+        }
+    }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
