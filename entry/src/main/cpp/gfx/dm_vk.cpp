@@ -979,9 +979,11 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
         if (lna > 0) {
             VkVertexInputBindingDescription vbs[8]; uint32_t nvb = 0;
             VkVertexInputAttributeDescription vas[16]; uint32_t nva = 0;
-            for (int k = 0; k < lna && k < 16 && nva < 16; k++) {
-                uint32_t stream = (lva[k] >> 27) & 0x1F;
-                uint32_t off = (lva[k] >> 8) & 0x7FFFF;
+            /* 补齐 SPIR-V 里出现、但录制布局没有的 location(VUID-Input-07904) */
+            int total = (vin_n > lna) ? vin_n : lna;
+            for (int k = 0; k < total && k < 16 && nva < 16; k++) {
+                uint32_t stream = (k < lna) ? ((lva[k] >> 27) & 0x1F) : 0;
+                uint32_t off = (k < lna) ? ((lva[k] >> 8) & 0x7FFFF) : (uint32_t)(k * 4);
                 if (stream >= 8) continue;
                 uint32_t stride = (lns > (int)(stream * 2 + 1)) ? lvs[stream * 2] : 32;
                 int found = -1;
