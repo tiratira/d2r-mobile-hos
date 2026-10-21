@@ -432,6 +432,51 @@ static int nvn_winb_get_interval(const void *b) { return b ? ((const nvn_winb_t 
 static void *nvn_winb_get_native(const void *b) { return b ? ((const nvn_winb_t *)b)->native : NULL; }
 static int nvn_winb_get_nbuf(const void *b) { return b ? ((const nvn_winb_t *)b)->ntex : 0; }
 
+/* ---- 纹理/缓冲 builder:nvn.h 里 GetStorageSize/Alignment/GetFlags 都是
+ * 「直接返回」而不是写 out 参数。之前用跟踪桩返回 0,引擎按 0 字节/0 对齐
+ * 分配存储,随后分配器返回 NULL → 崩溃(真机日志:640x384 纹理构建后崩)。 */
+#define NVN_MAGIC_TEXB 0x42584554U
+#define NVN_MAGIC_BUFB 0x42465542U
+typedef struct { uint32_t magic, flags, target, format; int32_t width, height, depth, levels, samples; } nvn_texb_t;
+typedef struct { uint32_t magic; void *dev; void *pool; int64_t off; uint64_t size; } nvn_bufb_t;
+
+static void nvn_texb_defaults(void *b)
+{
+    if (b) { memset(b, 0, sizeof(nvn_texb_t)); ((nvn_texb_t *)b)->magic = NVN_MAGIC_TEXB; ((nvn_texb_t *)b)->width = 1; ((nvn_texb_t *)b)->height = 1; ((nvn_texb_t *)b)->depth = 1; ((nvn_texb_t *)b)->levels = 1; }
+}
+static void nvn_texb_setflags(void *b, int f) { if (b) ((nvn_texb_t *)b)->flags = (uint32_t)f; }
+static uint32_t nvn_texb_getflags(const void *b) { return b ? ((const nvn_texb_t *)b)->flags : 0; }
+static void nvn_texb_setdev(void *b, void *d) { (void)b; (void)d; }
+static void nvn_texb_settarget(void *b, int t) { if (b) ((nvn_texb_t *)b)->target = (uint32_t)t; }
+static void nvn_texb_setwidth(void *b, int w) { if (b) ((nvn_texb_t *)b)->width = w; }
+static void nvn_texb_setheight(void *b, int h) { if (b) ((nvn_texb_t *)b)->height = h; }
+static void nvn_texb_setdepth(void *b, int d) { if (b) ((nvn_texb_t *)b)->depth = d; }
+static void nvn_texb_setlevels(void *b, int l) { if (b) ((nvn_texb_t *)b)->levels = l; }
+static void nvn_texb_setformat(void *b, int f) { if (b) ((nvn_texb_t *)b)->format = (uint32_t)f; }
+static void nvn_texb_setsamples(void *b, int s) { if (b) ((nvn_texb_t *)b)->samples = s; }
+static uint64_t nvn_texb_size(const void *b)
+{
+    const nvn_texb_t *t = (const nvn_texb_t *)b;
+    if (t == NULL) return 0;
+    uint64_t px = (uint64_t)(t->width > 0 ? t->width : 1) * (uint64_t)(t->height > 0 ? t->height : 1);
+    uint64_t depth = t->depth > 0 ? (uint64_t)t->depth : 1;
+    uint64_t levels = t->levels > 0 ? (uint64_t)t->levels : 1;
+    uint64_t bytes = px * depth * levels * 4;    /* 保守按 4 字节/像素 */
+    return (bytes + 4095) & ~(uint64_t)4095;
+}
+static uint64_t nvn_texb_align(const void *b) { (void)b; return 4096; }
+
+static void nvn_bufb_defaults(void *b) { if (b) { memset(b, 0, sizeof(nvn_bufb_t)); ((nvn_bufb_t *)b)->magic = NVN_MAGIC_BUFB; } }
+static void nvn_bufb_setdev(void *b, void *d) { if (b) ((nvn_bufb_t *)b)->dev = d; }
+static void nvn_bufb_setsize(void *b, uint64_t n) { if (b) ((nvn_bufb_t *)b)->size = n; }
+static void nvn_bufb_setstorage(void *b, void *pool, int64_t off, uint64_t n)
+{
+    if (b) { ((nvn_bufb_t *)b)->pool = pool; ((nvn_bufb_t *)b)->off = off; ((nvn_bufb_t *)b)->size = n; }
+}
+static uint64_t nvn_bufb_getsize(const void *b) { return b ? ((const nvn_bufb_t *)b)->size : 0; }
+static void *nvn_bufb_getpool(const void *b) { return b ? ((const nvn_bufb_t *)b)->pool : NULL; }
+static int64_t nvn_bufb_getoff(const void *b) { return b ? ((const nvn_bufb_t *)b)->off : 0; }
+
 void dmNvnInit(void)
 {
     dm_nvn_register_traces();
@@ -530,6 +575,28 @@ void dmNvnInit(void)
     dmNvnRegister("nvnWindowBuilderGetNativeWindow", (nvn_func_t)nvn_winb_get_native);
     dmNvnRegister("nvnWindowBuilderGetPresentInterval", (nvn_func_t)nvn_winb_get_interval);
     dmNvnRegister("nvnWindowBuilderGetNumBuffers", (nvn_func_t)nvn_winb_get_nbuf);
+
+    /* 纹理/缓冲 builder(Get* 直接返回值;存储尺寸不能再是 0) */
+    dmNvnRegister("nvnTextureBuilderSetDefaults", (nvn_func_t)nvn_texb_defaults);
+    dmNvnRegister("nvnTextureBuilderSetDevice", (nvn_func_t)nvn_texb_setdev);
+    dmNvnRegister("nvnTextureBuilderSetFlags", (nvn_func_t)nvn_texb_setflags);
+    dmNvnRegister("nvnTextureBuilderGetFlags", (nvn_func_t)nvn_texb_getflags);
+    dmNvnRegister("nvnTextureBuilderSetTarget", (nvn_func_t)nvn_texb_settarget);
+    dmNvnRegister("nvnTextureBuilderSetWidth", (nvn_func_t)nvn_texb_setwidth);
+    dmNvnRegister("nvnTextureBuilderSetHeight", (nvn_func_t)nvn_texb_setheight);
+    dmNvnRegister("nvnTextureBuilderSetDepth", (nvn_func_t)nvn_texb_setdepth);
+    dmNvnRegister("nvnTextureBuilderSetLevels", (nvn_func_t)nvn_texb_setlevels);
+    dmNvnRegister("nvnTextureBuilderSetFormat", (nvn_func_t)nvn_texb_setformat);
+    dmNvnRegister("nvnTextureBuilderSetSamples", (nvn_func_t)nvn_texb_setsamples);
+    dmNvnRegister("nvnTextureBuilderGetStorageSize", (nvn_func_t)nvn_texb_size);
+    dmNvnRegister("nvnTextureBuilderGetStorageAlignment", (nvn_func_t)nvn_texb_align);
+    dmNvnRegister("nvnBufferBuilderSetDefaults", (nvn_func_t)nvn_bufb_defaults);
+    dmNvnRegister("nvnBufferBuilderSetDevice", (nvn_func_t)nvn_bufb_setdev);
+    dmNvnRegister("nvnBufferBuilderSetSize", (nvn_func_t)nvn_bufb_setsize);
+    dmNvnRegister("nvnBufferBuilderSetStorage", (nvn_func_t)nvn_bufb_setstorage);
+    dmNvnRegister("nvnBufferBuilderGetSize", (nvn_func_t)nvn_bufb_getsize);
+    dmNvnRegister("nvnBufferBuilderGetMemoryPool", (nvn_func_t)nvn_bufb_getpool);
+    dmNvnRegister("nvnBufferBuilderGetMemoryOffset", (nvn_func_t)nvn_bufb_getoff);
 }
 
 #ifdef __aarch64__
@@ -621,8 +688,8 @@ HLE_FORCE("nvnBootstrapLoader", "NVN 图形接口整块换成宿主(后续 Vulka
 {
     static uint32_t boot_n;
     uint64_t r = dmNvnBootstrapLoader(name);
-    if (boot_n < 8) {
-        DMLOG_I("NVN bootstrap(%{public}s) -> %{public}#llx", name ? name : "?", (unsigned long long)r);
+    if (boot_n < 48) {
+        DMLOG_I("NVN bootstrap(%{public}s) -> %{public}llx", name ? name : "?", (unsigned long long)r);
         boot_n++;
     }
     return (void *)(uintptr_t)r;
@@ -666,6 +733,7 @@ const char *dmNvnSelfTest(void)
              a ? "ok" : "null", b == 0 ? "null" : "non-null");
     return report;
 }
+
 
 
 

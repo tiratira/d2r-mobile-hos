@@ -113,6 +113,13 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                     const char *nm = dmNvnNameForAddr((uint64_t)v);
                     log_line("NVNGOT slot=%lx val=%lx name=%s", slots[i], v, nm ? nm : "?");
                 }
+                unsigned long nb[4] = {0};
+                struct iovec ln = {nb, sizeof(nb)};
+                struct iovec rn = {(void *)(addr - 8), sizeof(nb)};
+                if (syscall(SYS_process_vm_readv, getpid(), &ln, 1, &rn, 1, 0) == (ssize_t)sizeof(nb)) {
+                    log_line("NVNGOT slot=%lx ctx=[-8]=%lx [+0]=%lx [+8]=%lx [+16]=%lx",
+                             slots[i], nb[0], nb[1], nb[2], nb[3]);
+                }
             }
         }
     }
@@ -155,3 +162,4 @@ void dmCrashInstall(void)
     sigaction(SIGILL, &sa, NULL);
     DMLOG_I("crash handler installed");
 }
+
