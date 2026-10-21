@@ -563,8 +563,34 @@ extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
 extern "C" uint64_t dmVkPipelineCount(void);
 static _Atomic uint64_t g_pipelines;
 static _Atomic int g_pipe_err = -123;
+static _Atomic int g_dsl_bindings;
 extern "C" uint64_t dmVkPipelineCount(void) { return g_pipelines; }
 extern "C" int dmVkPipelineError(void) { return g_pipe_err; }
+extern "C" int dmVkDslBindings(void) { return g_dsl_bindings; }
+
+/* M3-3:从 dmsh_xlate 的 .res.json 反射里抽 binding(按段落判定类型),
+ * 生成真实 VkDescriptorSetLayout。返回绑定数;json 不存在返回 0。 */
+static int dsl_bindings(const char *json, VkDescriptorSetLayoutBinding *out, uint32_t maxn)
+{
+    const char *secs[][2] = {{"cbufs",0},{"sbufs",0},{"textures",0},{"samplers",0},{"images",0}};
+    VkDescriptorType types[5] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLER,
+                                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    int n = 0; int cur = -1;
+    for (const char *p = json; *p; p++) {
+        for (int k = 0; k < 5; k++) {
+            size_t l = strlen(secs[k][0]);
+            if (strncmp(p, secs[k][0], l) == 0 && p[-1] == '"') cur = k;
+        }
+        if (strncmp(p, "\"binding\"", 9) == 0 && cur >= 0 && n < (int)maxn) {
+            const char *q = strchr(p, ':'); if (!q) break;
+            int b = atoi(q + 1);
+            out[n].binding = (uint32_t)b; out[n].descriptorType = types[cur];
+            out[n].descriptorCount = 1; out[n].stageFlags = VK_SHADER_STAGE_ALL; n++;
+        }
+    }
+    return n;
+}
 
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path)
 {
@@ -581,9 +607,23 @@ extern "C" uint64_t dmVkCreateComputePipeline(const char *path)
     sci.codeSize = (size_t)n; sci.pCode = (const uint32_t *)buf;
     VkShaderModule mod = VK_NULL_HANDLE;
     if (vkCreateShaderModule(g_upload_dev, &sci, nullptr, &mod) != VK_SUCCESS) { free(buf); return 0; }
+    VkDescriptorSetLayoutBinding binds[64] = {};
+    int nb = 0;
+    {
+        char jp[512]; snprintf(jp, sizeof jp, "%s.res.json", path);
+        FILE *jf = fopen(jp, "rb");
+        if (jf != NULL) {
+            static char jb[65536];
+            size_t jn = fread(jb, 1, sizeof(jb) - 1, jf); fclose(jf);
+            jb[jn] = 0;
+            nb = dsl_bindings(jb, binds, 64);
+        }
+    }
     VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    if (nb > 0) { dlci.bindingCount = (uint32_t)nb; dlci.pBindings = binds; }
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
     vkCreateDescriptorSetLayout(g_upload_dev, &dlci, nullptr, &dsl);
+    g_dsl_bindings = nb;
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1; plci.pSetLayouts = &dsl;
     VkPipelineLayout pl = VK_NULL_HANDLE;
