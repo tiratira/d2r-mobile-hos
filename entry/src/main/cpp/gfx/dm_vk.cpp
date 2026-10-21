@@ -36,7 +36,15 @@ static VkPhysicalDevice g_upload_pd;
 static VkPipeline g_gpipe;
 static VkPipelineLayout g_gpipe_layout;
 static VkRenderPass g_gpipe_rp;
-static int g_draw_test;   /* 实验:M4 首绘开关(缺省关,保持已验证的清屏通路) */
+static int g_draw_test;
+static VkDescriptorSet g_gpipe_set;
+static VkDescriptorPool g_dummy_pool;
+static VkBuffer g_dummy_buf;
+static VkDeviceMemory g_dummy_buf_mem;
+static VkImage g_dummy_img;
+static VkDeviceMemory g_dummy_img_mem;
+static VkImageView g_dummy_view;
+static VkSampler g_dummy_samp;   /* 实验:M4 首绘开关(缺省关,保持已验证的清屏通路) */
 extern "C" uint64_t dmVkLoadShaderModule(const char *path);
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
 extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath);
@@ -338,6 +346,7 @@ static void *vk_loop(void *arg)
             rbi.clearValueCount = 1; rbi.pClearValues = &cv;
             vkCmdBeginRenderPass(cmdb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
             vkCmdBindPipeline(cmdb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_gpipe);
+            if (g_gpipe_set != VK_NULL_HANDLE) vkCmdBindDescriptorSets(cmdb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_gpipe_layout, 0, 1, &g_gpipe_set, 0, nullptr);
             VkViewport vpt{0, 0, (float)swci.imageExtent.width, (float)swci.imageExtent.height, 0, 1};
             VkRect2D sc{{0, 0}, {swci.imageExtent.width, swci.imageExtent.height}};
             vkCmdSetViewport(cmdb, 0, 1, &vpt);
@@ -813,6 +822,68 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
     VkResult r = vkCreateGraphicsPipelines(g_upload_dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe);
     if (r == VK_SUCCESS && pipe != VK_NULL_HANDLE) {
         g_gpipe = pipe; g_gpipe_layout = pl; g_gpipe_rp = rp;
+        /* M4:为每个 binding 写占位资源(统一缓冲=4KB buffer,纹理=1x1 白图+采样器) */
+        {
+            VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            bci.size = 4096; bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            if (vkCreateBuffer(g_upload_dev, &bci, nullptr, &g_dummy_buf) == VK_SUCCESS) {
+                VkMemoryRequirements mr{}; vkGetBufferMemoryRequirements(g_upload_dev, g_dummy_buf, &mr);
+                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size;
+                int mi = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                if (mi >= 0) { mai.memoryTypeIndex = (uint32_t)mi;
+                    if (vkAllocateMemory(g_upload_dev, &mai, nullptr, &g_dummy_buf_mem) == VK_SUCCESS) {
+                        vkBindBufferMemory(g_upload_dev, g_dummy_buf, g_dummy_buf_mem, 0);
+                        void *m = nullptr; if (vkMapMemory(g_upload_dev, g_dummy_buf_mem, 0, 4096, 0, &m) == VK_SUCCESS) { memset(m, 0, 4096); vkUnmapMemory(g_upload_dev, g_dummy_buf_mem); }
+                    } }
+            }
+            static const uint8_t white[4] = {255,255,255,255};
+            VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ici.extent = {1,1,1}; ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL; ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (vkCreateImage(g_upload_dev, &ici, nullptr, &g_dummy_img) == VK_SUCCESS) {
+                VkMemoryRequirements mr{}; vkGetImageMemoryRequirements(g_upload_dev, g_dummy_img, &mr);
+                VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; mai.allocationSize = mr.size;
+                int mi = vk_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (mi >= 0) { mai.memoryTypeIndex = (uint32_t)mi;
+                    if (vkAllocateMemory(g_upload_dev, &mai, nullptr, &g_dummy_img_mem) == VK_SUCCESS)
+                        vkBindImageMemory(g_upload_dev, g_dummy_img, g_dummy_img_mem, 0); }
+                VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vci.image = g_dummy_img; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+                vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                vkCreateImageView(g_upload_dev, &vci, nullptr, &g_dummy_view);
+            }
+            VkSamplerCreateInfo sci2{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            sci2.magFilter = VK_FILTER_NEAREST; sci2.minFilter = VK_FILTER_NEAREST;
+            vkCreateSampler(g_upload_dev, &sci2, nullptr, &g_dummy_samp);
+            VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32}, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32}};
+            VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            dpci.maxSets = 2; dpci.poolSizeCount = 3; dpci.pPoolSizes = ps;
+            if (vkCreateDescriptorPool(g_upload_dev, &dpci, nullptr, &g_dummy_pool) == VK_SUCCESS) {
+                VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                dsai.descriptorPool = g_dummy_pool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &dsl;
+                if (vkAllocateDescriptorSets(g_upload_dev, &dsai, &g_gpipe_set) == VK_SUCCESS) {
+                    VkDescriptorBufferInfo bi{g_dummy_buf, 0, 4096};
+                    VkDescriptorImageInfo ii{g_dummy_samp, g_dummy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    VkWriteDescriptorSet wr[32]{}; uint32_t nw = 0;
+                    for (int k = 0; k < nb && nw < 32; k++) {
+                        VkWriteDescriptorSet *w = &wr[nw];
+                        w->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w->dstSet = g_gpipe_set;
+                        w->dstBinding = binds[k].binding; w->descriptorCount = 1;
+                        if (binds[k].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                            binds[k].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+                            binds[k].descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+                            w->descriptorType = binds[k].descriptorType; w->pImageInfo = &ii;
+                        } else {
+                            w->descriptorType = binds[k].descriptorType; w->pBufferInfo = &bi;
+                        }
+                        nw++;
+                    }
+                    if (nw) vkUpdateDescriptorSets(g_upload_dev, nw, wr, 0, nullptr);
+                }
+            }
+        }
         vkDestroyDescriptorSetLayout(g_upload_dev, dsl, nullptr);
         vkDestroyShaderModule(g_upload_dev, vs, nullptr);
         vkDestroyShaderModule(g_upload_dev, ps, nullptr);
