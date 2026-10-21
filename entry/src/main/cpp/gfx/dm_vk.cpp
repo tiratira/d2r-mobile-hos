@@ -930,10 +930,26 @@ extern "C" int dmVkShaderStageOfFile(const char *path)
 /* ================= M4-4:pen(程序键对) → 管线缓存 ================= */
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
 extern "C" int dmVkPipelineCacheCount(void);
-typedef struct { char k0[17], k1[17]; VkPipeline pipe; } keypipe_t;
+typedef struct { char k0[17], k1[17]; VkPipeline pipe; VkPipelineLayout layout; VkRenderPass rp; } keypipe_t;
 static keypipe_t g_kp[64];
 static int g_kp_n;
 extern "C" int dmVkPipelineCacheCount(void) { return g_kp_n; }
+extern "C" uint64_t dmVkCachedPipeline(const char *k0, const char *k1);
+extern "C" uint64_t dmVkCachedPipeline(const char *k0, const char *k1)
+{
+    if (k0 == NULL || k1 == NULL) return 0;
+    for (int i = 0; i < g_kp_n; i++)
+        if (strcmp(g_kp[i].k0, k0) == 0 && strcmp(g_kp[i].k1, k1) == 0)
+            return (uint64_t)(uintptr_t)g_kp[i].pipe;
+    return 0;
+}
+extern "C" int dmVkPipelineObjCount(void);
+extern "C" int dmVkPipelineObjCount(void)
+{
+    int n = 0;
+    for (int i = 0; i < g_kp_n; i++) if (g_kp[i].pipe != VK_NULL_HANDLE) n++;
+    return n;
+}
 
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1)
 {
@@ -950,11 +966,15 @@ extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1)
     VkPipelineLayout keep_pl = g_gpipe_layout;
     int ok = (int)dmVkCreateGraphicsPipeline(p0, p1);
     if (!ok) ok = (int)dmVkCreateGraphicsPipeline(p1, p0);
-    if (keep_pipe) { g_gpipe = keep_pipe; g_gpipe_rp = keep_rp; g_gpipe_layout = keep_pl; }
-    if (!ok) return 0;
+    VkPipeline made = g_gpipe; VkRenderPass made_rp = g_gpipe_rp; VkPipelineLayout made_pl = g_gpipe_layout;
+    /* 探针管线保持不变 */
+    g_gpipe = keep_pipe; g_gpipe_rp = keep_rp; g_gpipe_layout = keep_pl;
+    if (!ok || made == VK_NULL_HANDLE) return 0;
     snprintf(g_kp[g_kp_n].k0, sizeof g_kp[0].k0, "%s", k0);
     snprintf(g_kp[g_kp_n].k1, sizeof g_kp[0].k1, "%s", k1);
-    g_kp[g_kp_n].pipe = VK_NULL_HANDLE;   /* 管线对象由探针持有,此处只登记键对 */
+    g_kp[g_kp_n].pipe = made;
+    g_kp[g_kp_n].layout = made_pl;
+    g_kp[g_kp_n].rp = made_rp;
     g_kp_n++;
     return 1;
 }
