@@ -259,6 +259,19 @@ static void thr_free(thr_t *t)   /* 持 G */
     free(t);
 }
 
+/* 线程收尾用宿主栈:musl 的 tcache/TSD 析构需要足够的栈空间,
+ * 客体线程栈可能只有十几 KiB,直接 pthread_exit 会越界。 */
+#ifdef __aarch64__
+void dm_thread_exit_to(void *host_sp) __attribute__((noreturn));
+void dm_thread_exit_final(void);
+static _Thread_local uint8_t g_thread_exit_stack[65536] __attribute__((aligned(16)));
+
+void dm_thread_exit_final(void)
+{
+    pthread_exit(NULL);
+}
+#endif
+
 static void thread_exit(thr_t *t)
 {
     /* 不打日志:退出发生在客体线程自己的栈上(有的只有十几 KiB) */
@@ -276,7 +289,11 @@ static void thread_exit(thr_t *t)
         thr_free(t);
     }
     pthread_mutex_unlock(&G);
+#ifdef __aarch64__
+    dm_thread_exit_to((void *)(g_thread_exit_stack + sizeof(g_thread_exit_stack)));
+#else
     pthread_exit(NULL);
+#endif
 }
 
 /* 主线程登记,返回其句柄(host_boot 在进客体前调) */
@@ -738,3 +755,5 @@ int svc_thread(int num, uint64_t *regs)
     }
     return 0;
 }
+
+

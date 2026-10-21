@@ -137,3 +137,15 @@ dm_thread_enter:
     br x16
 1:  bl dm_thread_returned
     brk #0
+
+// 客体线程退出:切回宿主栈再走 pthread 收尾。
+// 直接在客体线程的小栈上 pthread_exit 会让 musl 的 tcache/TSD 清理写越界
+// (真机:SIGSEGV@近 sp,bt 在 je_tcache_bin_flush_small)。
+    .globl dm_thread_exit_to
+    .p2align 2
+dm_thread_exit_to:              // x0 = 宿主栈顶,不返回
+    mov sp, x0
+    mov x29, xzr
+    mov x30, xzr
+    bl dm_thread_exit_final
+    brk #0
