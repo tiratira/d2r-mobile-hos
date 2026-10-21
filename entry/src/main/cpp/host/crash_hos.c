@@ -13,7 +13,10 @@
 
 #include <signal.h>
 #include <stdarg.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
 #include <ucontext.h>
+#include <unistd.h>
 
 #define CRASH_FP_MAX 12
 
@@ -63,6 +66,33 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
              regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23]);
     log_line("CRASH x24=%lx x25=%lx x26=%lx x27=%lx x28=%lx x29=%lx x30=%lx",
              regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30]);
+
+    /* 客体对象现场:寄存器里的 callee-saved 常是游戏对象/表指针。
+     * 用 process_vm_readv 读自身内存,读不到就跳过(不会二次 fault)。 */
+    {
+        static const int idxs[] = {19, 20, 21, 22, 23, 25, 28};
+        for (unsigned k = 0; k < sizeof(idxs) / sizeof(idxs[0]); k++) {
+            int r = idxs[k];
+            unsigned long a = regs[r];
+            if (a < 0x1000 || a > 0x7fffffffffULL) {
+                continue;
+            }
+            const dm_module_t *mm = dm_module_of(a);
+            unsigned long w[4] = {0}, e[2] = {0};
+            struct iovec l1 = {w, sizeof(w)}, r1 = {(void *)a, sizeof(w)};
+            ssize_t n1 = syscall(SYS_process_vm_readv, getpid(), &l1, 1, &r1, 1, 0);
+            struct iovec l2 = {e, sizeof(e)}, r2 = {(void *)(a + 0xE8), sizeof(e)};
+            ssize_t n2 = syscall(SYS_process_vm_readv, getpid(), &l2, 1, &r2, 1, 0);
+            if (n1 == (ssize_t)sizeof(w)) {
+                log_line("OBJ x%d=%lx %s+%lx [0]=%lx [8]=%lx [16]=%lx [24]=%lx +E8=%lx/%lx",
+                         r, a, mm ? mm->name : "-",
+                         mm ? a - (unsigned long)(uintptr_t)mm->base : 0UL,
+                         w[0], w[1], w[2], w[3],
+                         n2 == (ssize_t)sizeof(e) ? e[0] : 0UL,
+                         n2 == (ssize_t)sizeof(e) ? e[1] : 0UL);
+            }
+        }
+    }
 
     /* 帧指针链:客体代码都带 x29 帧指针(stp x29,x30)。逐帧打 [fp]=上一帧、
      * [fp+8]=返回地址;指针明显越界就停,避免信号里再触发信号。 */
