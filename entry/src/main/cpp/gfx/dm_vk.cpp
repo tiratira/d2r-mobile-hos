@@ -36,7 +36,7 @@ static VkPhysicalDevice g_upload_pd;
 static VkPipeline g_gpipe;
 static VkPipelineLayout g_gpipe_layout;
 static VkRenderPass g_gpipe_rp;
-static int g_draw_test;   /* 实验开关:为 1 时回放真实 draw(缺资源时会掉到 ~1fps,默认关) */
+static int g_draw_test;   /* 实验开关:为 1 时回放真实 draw(默认关,保持稳定清屏通路) */
 static VkDescriptorSet g_gpipe_set;
 static VkDescriptorPool g_dummy_pool;
 static VkBuffer g_dummy_buf;
@@ -47,12 +47,35 @@ static VkImageView g_dummy_view;
 static VkSampler g_dummy_samp;   /* 实验:M4 首绘开关(缺省关,保持已验证的清屏通路) */
 extern "C" uint64_t dmVkLoadShaderModule(const char *path);
 extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
+static int vk_buf_create(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *out, VkDeviceMemory *mem, bool host);
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
 extern "C" uint64_t dmVkCachedPipeline(const char *k0, const char *k1);
 extern "C" int dmNvnReplayCount(void);
 extern "C" int dmNvnReplayGet(int i, int *kind, char *k0, char *k1, unsigned *a, unsigned *b);
+extern "C" int dmNvnReplayGetVB(int i, unsigned *n, uint64_t *addr, uint64_t *sz);
 extern "C" uint64_t dmVkReplayDrawCount(void);
 static _Atomic uint64_t g_replay_draws;
+typedef struct { uint64_t addr; uint64_t size; VkBuffer buf; VkDeviceMemory mem; } vbcache_t;
+static vbcache_t g_vbc[64];
+static int g_vbc_n;
+static VkBuffer vk_vb_for(uint64_t addr, uint64_t size)
+{
+    if (g_vbc_n >= 64 || size == 0 || size > (4u << 20)) return VK_NULL_HANDLE;
+    for (int i = 0; i < g_vbc_n; i++)
+        if (g_vbc[i].addr == addr && g_vbc[i].size == size) return g_vbc[i].buf;
+    VkBuffer buf = VK_NULL_HANDLE; VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (vk_buf_create((VkDeviceSize)size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+                      | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buf, &mem, true) != 0) return VK_NULL_HANDLE;
+    void *map = nullptr;
+    if (vkMapMemory(g_upload_dev, mem, 0, (VkDeviceSize)size, 0, &map) == VK_SUCCESS) {
+        memcpy(map, (const void *)(uintptr_t)addr, (size_t)size);
+        vkUnmapMemory(g_upload_dev, mem);
+    }
+    g_vbc[g_vbc_n].addr = addr; g_vbc[g_vbc_n].size = size;
+    g_vbc[g_vbc_n].buf = buf; g_vbc[g_vbc_n].mem = mem;
+    g_vbc_n++;
+    return buf;
+}
 extern "C" uint64_t dmVkReplayDrawCount(void) { return g_replay_draws; }
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
 extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath);
@@ -375,6 +398,22 @@ static void *vk_loop(void *arg)
                     if (kind == 0) {
                         uint64_t p = dmVkCachedPipeline(rk0, rk1);
                         if (p != 0 && (VkPipeline)(uintptr_t)p != cur) { cur = (VkPipeline)(uintptr_t)p; vkCmdBindPipeline(cmdb, VK_PIPELINE_BIND_POINT_GRAPHICS, cur); }
+                    } else if (kind == 2) {
+                        unsigned nvb = 0; uint64_t ba[4] = {0}, bs[4] = {0};
+                        if (dmNvnReplayGetVB(i, &nvb, ba, bs) && nvb > 0) {
+                            VkBuffer vbs[4]; VkDeviceSize offs[4];
+                            unsigned got = 0;
+                            for (unsigned k = 0; k < nvb && got < 4; k++) {
+                                VkBuffer vb = vk_vb_for(ba[k], bs[k]);
+                                if (vb == VK_NULL_HANDLE) break;
+                                vbs[got] = vb; offs[got] = 0; got++;
+                            }
+                            if (got > 0) {
+                                VkDeviceSize strides[4] = {32, 32, 32, 32};
+                                vkCmdBindVertexBuffers(cmdb, 0, got, vbs, offs);
+                                (void)strides;
+                            }
+                        }
                     } else {
                         uint32_t cnt = rb ? rb : 3;
                         if (cnt > 1000000u) cnt = 3;
