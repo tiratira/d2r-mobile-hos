@@ -175,6 +175,7 @@ static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 static uint64_t g_draws, g_pipe_hits;
 /* 上游 nvn_obj.h: va_st{ fmt:8, offset:19, stream:5 }, vs_st{ stride, divisor } */
 static uint32_t g_vattr[16]; static int g_vattr_n;
+static uint32_t g_vfmt_hist[256];
 static uint32_t g_vstream[32]; static int g_vstream_n;
 int dmNvnVertexLayout(const uint32_t **attr, int *nattr, const uint32_t **stream, int *nstream)
 {
@@ -454,7 +455,7 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
                     struct iovec liov = { buf, n * 4 };
                     struct iovec riov = { (void *)(uintptr_t)o->c, n * 4 };
                     if (process_vm_readv(getpid(), &liov, 1, &riov, 1, 0) == (ssize_t)(n * 4)) {
-                        for (unsigned k = 0; k < n; k++) g_vattr[k] = buf[k];
+                        for (unsigned k = 0; k < n; k++) { g_vattr[k] = buf[k]; g_vfmt_hist[buf[k] & 0xFF]++; }
                         g_vattr_n = (int)n;
                     }
                 }
@@ -1154,6 +1155,15 @@ static void *nvn_stats_thread(void *arg)
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);
             {
+                static int vfmt_dumped;
+                if (!vfmt_dumped) {
+                    vfmt_dumped = 1;
+                    FILE *vf2 = fopen("/data/storage/el2/base/haps/entry/files/dm_vfmt.txt", "w");
+                    if (vf2 != NULL) {
+                        for (int i = 0; i < 256; i++) if (g_vfmt_hist[i]) fprintf(vf2, "fmt=0x%02x count=%u\n", i, g_vfmt_hist[i]);
+                        fclose(vf2);
+                    }
+                }
                 static int bind_dumped;
                 if (!bind_dumped) {
                     bind_dumped = 1;
