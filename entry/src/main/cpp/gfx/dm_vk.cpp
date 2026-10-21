@@ -225,6 +225,20 @@ static void *vk_loop(void *arg)
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
     const char *devexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    /* 着色器大量使用 DrawParameters / 其它 Vulkan 1.1+ 能力:必须显式启用,
+     * 否则 vkCreateShaderModule/vkCreateGraphicsPipelines 会失败(校验层 VUID
+     * -pCode-08740;真机上表现为 gpipe_err=-1/OOM)。 */
+    VkPhysicalDeviceVulkan11Features v11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &v11;
+    vkGetPhysicalDeviceFeatures2(pd, &f2);
+    VkPhysicalDeviceVulkan11Features v11_enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    v11_enable.shaderDrawParameters = v11.shaderDrawParameters;
+    v11_enable.multiview = v11.multiview;
+    VkPhysicalDeviceFeatures2 f2_enable{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2_enable.features = f2.features;
+    f2_enable.pNext = &v11_enable;
+
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1;
