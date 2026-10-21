@@ -138,6 +138,7 @@ typedef struct { uint32_t magic; void *dev; uint64_t size; void *mem; uint32_t f
 typedef struct { uint32_t magic; void *dev; uint64_t size; void *mem; } nvn_pool_t;
 typedef struct {
     uint32_t magic; uint32_t recording;
+    uint64_t used;
     void *dev; const void *pool; int64_t pool_off; uint64_t pool_size;
     void *ctl; uint64_t ctl_size;
     uint64_t handles, ops, clears;
@@ -221,9 +222,60 @@ static uint32_t nvn_queue_init(void *q, const void *b)
     g_nvn_queues++;
     return 1;
 }
+/* ================= M1:命令流录制 =================
+ * 宏:每个 NVN 录制入口写一条定长 op 到游戏给的命令内存(nvnCommandBufferAddCommandMemory
+ * 拿到的 pool+off+size),nvnCommandBufferEndRecording 返回该段首地址作为 handle,
+ * nvnQueueSubmitCommands 解析 op 流执行(当前先做 clear / 计数,Vulkan draw 回放 M4 接入)。
+ */
+#define DM_OP_WORDS 8
+typedef struct { uint32_t op, n; uint64_t a, b, c; float f[4]; } dm_op_t;
+enum { DM_OP_END = 0, DM_OP_CLEAR, DM_OP_BARRIER, DM_OP_DRAW, DM_OP_BIND, DM_OP_COPY, DM_OP_DISPATCH };
+static nvn_cb_t *g_cur_cb;
+static uint64_t g_dm_ops;
+static uint32_t g_op_hist[16];
+
+static void dm_op_write(nvn_cb_t *cb, uint32_t op, const void *p, size_t n)
+{
+    if (cb == NULL) return;
+    const nvn_pool_t *pl = (const nvn_pool_t *)cb->pool;
+    if (pl == NULL || pl->mem == NULL) return;
+    size_t need = sizeof(dm_op_t);
+    size_t cur = (size_t)cb->used;
+    if (cur + need > (size_t)cb->pool_size) return;
+    dm_op_t *o = (dm_op_t *)((uint8_t *)pl->mem + (size_t)cb->pool_off + cur);
+    memset(o, 0, sizeof(*o));
+    o->op = op; o->n = (uint32_t)n;
+    if (n) memcpy(o->f, p, n);
+    cb->used += need;
+    g_dm_ops++;
+    if (op < 16) g_op_hist[op]++;
+}
+#define DM_REC(name, opcode, argn) \
+    static uint64_t rec_##name(uint64_t a, uint64_t b, uint64_t c, uint64_t d) \
+    { dm_op_write(g_cur_cb, opcode, (double[]){0}, 0); (void)a; (void)b; (void)c; (void)d; return 0; }
+/* 具体 op 记录:签名统一 4 个 uint64,多余参数按 ABI 忽略 */
+static uint64_t op_setviewport(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_BIND, NULL, 0); (void)a;(void)b;(void)c; return 0; }
+static uint64_t op_draw3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_DRAW, NULL, 0); (void)a;(void)b;(void)c; return 0; }
+static uint64_t op_draw4(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { dm_op_write((nvn_cb_t *)cb, DM_OP_DRAW, NULL, 0); (void)a;(void)b;(void)c;(void)d; return 0; }
+static uint64_t op_bind2(uint64_t cb, uint64_t a, uint64_t b) { dm_op_write((nvn_cb_t *)cb, DM_OP_BIND, NULL, 0); (void)a;(void)b; return 0; }
+static uint64_t op_bind3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_BIND, NULL, 0); (void)a;(void)b;(void)c; return 0; }
+static uint64_t op_copy(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { dm_op_write((nvn_cb_t *)cb, DM_OP_COPY, NULL, 0); (void)a;(void)b;(void)c;(void)d; return 0; }
+static uint64_t op_dispatch(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_DISPATCH, NULL, 0); (void)a;(void)b;(void)c; return 0; }
+
+
+
 static void nvn_queue_submit(void *q, int n, const void *handles)
 {
+    const uint64_t *h = (const uint64_t *)handles;
     if (g_nvn_submits <= 5) DMLOG_I("NVN queue submit q=%{public}llx n=%{public}d", (unsigned long long)(uintptr_t)q, n);
+    for (int i = 0; i < n; i++) {
+        const dm_op_t *o = (const dm_op_t *)(uintptr_t)h[i];
+        for (int k = 0; k < 4096 && o != NULL && o->op != DM_OP_END; k++, o++) {
+            if (o->op == DM_OP_CLEAR) {
+                dmVkSetClearColor(o->f[0], o->f[1], o->f[2], o->f[3]);
+            }
+        }
+    }
     (void)handles;
     if (q) ((nvn_queue_t *)q)->submits++;
     g_nvn_submits++;
@@ -317,6 +369,8 @@ static void nvn_cb_begin(void *c)
 {
     if (c == NULL) return;
     ((nvn_cb_t *)c)->recording = 1;
+    ((nvn_cb_t *)c)->used = 0;
+    g_cur_cb = (nvn_cb_t *)c;
     if (g_nvn_cbs < 8) {
         DMLOG_I("NVN cb begin c=%{public}llx", (unsigned long long)(uintptr_t)c);
     }
@@ -332,13 +386,20 @@ static uint64_t nvn_cb_end(void *c)
     const nvn_pool_t *p = (const nvn_pool_t *)o->pool;
     if (p != NULL && p->mem != NULL) {
         base = (uint8_t *)p->mem + (size_t)o->pool_off;
+        dm_op_t *e = (dm_op_t *)(base + (size_t)o->used);
+        if ((size_t)o->used + sizeof(dm_op_t) <= (size_t)o->pool_size) {
+            memset(e, 0, sizeof(*e));
+            e->op = DM_OP_END;
+            o->used += sizeof(dm_op_t);
+        }
     } else {
         static uint8_t fallback[4096];
         base = fallback;
     }
     uint64_t *h = (uint64_t *)(base + ((o->handles * 8) & 0x7F8));
-    *h = 0;
+    if (base != NULL) *h = 0;
     o->handles++;
+    g_cur_cb = NULL;
     if (o->handles <= 2) {
         DMLOG_I("NVN cb end h=%{public}llx", (unsigned long long)(uintptr_t)h);
     }
@@ -348,6 +409,9 @@ static uint32_t nvn_cb_isrec(const void *c) { return c ? ((const nvn_cb_t *)c)->
 static void nvn_cb_clear_color(void *c, int idx, const float *rgba, int mask)
 {
     (void)idx; (void)mask;
+    if (rgba != NULL && c != NULL && ((nvn_cb_t *)c)->recording) {
+        dm_op_write((nvn_cb_t *)c, DM_OP_CLEAR, rgba, 16);
+    }
     if (rgba != NULL) {
         g_nvn_clear[0] = rgba[0];
         g_nvn_clear[1] = rgba[1];
@@ -652,6 +716,7 @@ static void *nvn_stats_thread(void *arg)
     return NULL;
 }
 
+
 void dmNvnInit(void)
 
 
@@ -707,6 +772,20 @@ void dmNvnInit(void)
     dmNvnRegister("nvnCommandBufferAddControlMemory", (nvn_func_t)nvn_cb_addctlmem);
     dmNvnRegister("nvnCommandBufferBeginRecording", (nvn_func_t)nvn_cb_begin);
     dmNvnRegister("nvnCommandBufferEndRecording", (nvn_func_t)nvn_cb_end);
+    dmNvnRegister("nvnCommandBufferSetViewport", (nvn_func_t)op_setviewport);
+    dmNvnRegister("nvnCommandBufferSetScissor", (nvn_func_t)op_setviewport);
+    dmNvnRegister("nvnCommandBufferDrawArrays", (nvn_func_t)op_draw3);
+    dmNvnRegister("nvnCommandBufferDrawElements", (nvn_func_t)op_draw4);
+    dmNvnRegister("nvnCommandBufferDrawElementsInstanced", (nvn_func_t)op_draw4);
+    dmNvnRegister("nvnCommandBufferDispatchCompute", (nvn_func_t)op_dispatch);
+    dmNvnRegister("nvnCommandBufferBindProgram", (nvn_func_t)op_bind2);
+    dmNvnRegister("nvnCommandBufferBindVertexBuffers", (nvn_func_t)op_bind3);
+    dmNvnRegister("nvnCommandBufferBindVertexAttribState", (nvn_func_t)op_bind3);
+    dmNvnRegister("nvnCommandBufferBindUniformBuffer", (nvn_func_t)op_bind3);
+    dmNvnRegister("nvnCommandBufferBindSeparateTextures", (nvn_func_t)op_bind3);
+    dmNvnRegister("nvnCommandBufferCallCommands", (nvn_func_t)op_draw4);
+    dmNvnRegister("nvnCommandBufferCopyBufferToTexture", (nvn_func_t)op_copy);
+
     dmNvnRegister("nvnCommandBufferIsRecording", (nvn_func_t)nvn_cb_isrec);
     dmNvnRegister("nvnCommandBufferClearColor", (nvn_func_t)nvn_cb_clear_color);
     dmNvnRegister("nvnCommandBufferClearDepthStencil", (nvn_func_t)nvn_cb_clear_ds);
