@@ -149,6 +149,8 @@ typedef struct { uint32_t magic; void *dev; void *native; int32_t ntex, interval
 typedef struct { uint32_t magic; void *dev; void *native; int32_t ntex, interval; uint64_t presents; } nvn_win_t;
 typedef struct { uint32_t magic; void *dev; uint64_t size; void *mem; uint32_t flags; } nvn_poolb_t;
 typedef struct { uint32_t magic; void *dev; uint64_t size; void *mem; } nvn_pool_t;
+/* M4 资源表:buffer 对象(<= sizeof(NVNbuffer)=48) */
+typedef struct { uint32_t magic; uint32_t pad; uint64_t size; void *pool; int64_t off; } nvn_buf_t;
 typedef struct {
     uint32_t magic; uint32_t recording;
     uint64_t used;
@@ -159,6 +161,7 @@ typedef struct {
 
 static uint32_t g_nvn_devs, g_nvn_queues, g_nvn_wins, g_nvn_cbs, g_nvn_pools;
 static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
+static uint64_t g_nvn_bufs, g_nvn_textures;
 
 /* ---- 真机实测:客体会读「NVN device 容器」base+0x448 处的一张函数表 ----
  * 设备对象在容器 base+0xA08;调用方对象在 base+0x360,它 +0xE8 正好是
@@ -478,7 +481,7 @@ static void nvn_sampler_pool_init(void *o, void *pool, int64_t off, uint64_t n)
 }
 static uint32_t nvn_texture_init(void *t, void *d) { return nvn_generic_init(t, d, 0x58544554U); }
 static uint32_t nvn_sampler_init(void *s, void *d) { return nvn_generic_init(s, d, 0x504d4153U); }
-static uint32_t nvn_buffer_init(void *b, void *d, uint64_t flags) { (void)flags; return nvn_generic_init(b, d, 0x4655424eU); }
+static uint32_t nvn_buffer_init(void *b, void *d, uint64_t flags) { (void)flags; g_nvn_bufs++; return nvn_generic_init(b, d, 0x4655424eU); }
 
 /* ---- 内存池查询 ---- */
 /* nvnMemoryPoolGetBufferAddress(const NVNmemoryPool*) -> NVNbufferAddress
@@ -656,6 +659,11 @@ static int64_t nvn_bufb_getoff(const void *b) { return b ? ((const nvn_bufb_t *)
 /* ---- 纹理对象:GetStorageSize/GetViewOffset 都是直接返回值(nvn.h) ---- */
 typedef struct { uint32_t magic; uint32_t pad; uint64_t size; uint64_t align; void *dev;
     nvn_texdesc desc; } nvn_tex_t;
+static uint64_t nvn_buffer_get_size(const void *b)
+{
+    return b ? ((const nvn_buf_t *)b)->size : 0;
+}
+
 static uint32_t nvn_texture_init2(void *t, const void *b)
 {
     if (t == NULL) return 0;
@@ -664,6 +672,7 @@ static uint32_t nvn_texture_init2(void *t, const void *b)
     o->magic = 0x58544554U;
     o->size = nvn_texb_size(b);
     o->align = 4096;
+    g_nvn_textures++;
     if (b != NULL) {
         const nvn_texb_t *tb = (const nvn_texb_t *)b;
         o->desc.target = (int)tb->target;
@@ -742,10 +751,11 @@ static void *nvn_stats_thread(void *arg)
         /* hilog 在热路径下轮转很快,计数落盘更可靠 */
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu shader=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
                     (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount(),
+                    (unsigned long long)g_nvn_bufs, (unsigned long long)g_nvn_textures,
                     (unsigned long long)dmVkShaderTestCount(),
                     (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
@@ -858,9 +868,10 @@ void dmNvnInit(void)
     dmNvnRegister("nvnTextureInitialize", (nvn_func_t)nvn_texture_init2);
     dmNvnRegister("nvnTextureGetStorageSize", (nvn_func_t)nvn_texture_get_storage_size);
     dmNvnRegister("nvnTextureGetViewOffset", (nvn_func_t)nvn_texture_get_view_offset);
-    dmNvnRegister("nvnSamplerInitialize", (nvn_func_t)nvn_sampler_init);
     dmNvnRegister("nvnBufferInitialize", (nvn_func_t)nvn_buffer_init);
-    dmNvnRegister("nvnMemoryPoolGetBufferAddress", (nvn_func_t)nvn_pool_addr);
+    dmNvnRegister("nvnBufferGetSize", (nvn_func_t)nvn_buffer_get_size);
+    dmNvnRegister("nvnSamplerInitialize", (nvn_func_t)nvn_sampler_init);
+        dmNvnRegister("nvnMemoryPoolGetBufferAddress", (nvn_func_t)nvn_pool_addr);
     dmNvnRegister("nvnMemoryPoolMap", (nvn_func_t)nvn_pool_map);
     dmNvnRegister("nvnMemoryPoolMapVirtual", (nvn_func_t)nvn_pool_map_virtual);
     dmNvnRegister("nvnMemoryPoolGetSize", (nvn_func_t)nvn_pool_get_size);
