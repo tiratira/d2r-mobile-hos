@@ -925,3 +925,36 @@ extern "C" int dmVkShaderStageOfFile(const char *path)
     free(w);
     return stage;   /* 0=Vertex, 4=Fragment, 5=GLCompute */
 }
+
+
+/* ================= M4-4:pen(程序键对) → 管线缓存 ================= */
+extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
+extern "C" int dmVkPipelineCacheCount(void);
+typedef struct { char k0[17], k1[17]; VkPipeline pipe; } keypipe_t;
+static keypipe_t g_kp[64];
+static int g_kp_n;
+extern "C" int dmVkPipelineCacheCount(void) { return g_kp_n; }
+
+extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1)
+{
+    if (k0 == NULL || k1 == NULL) return 0;
+    for (int i = 0; i < g_kp_n; i++)
+        if (strcmp(g_kp[i].k0, k0) == 0 && strcmp(g_kp[i].k1, k1) == 0) return (uint64_t)(g_kp[i].pipe != VK_NULL_HANDLE);
+    if (g_kp_n >= 64) return 0;
+    char p0[256], p1[256];
+    snprintf(p0, sizeof p0, "/data/storage/el2/base/haps/entry/files/shaders/%s.spv", k0);
+    snprintf(p1, sizeof p1, "/data/storage/el2/base/haps/entry/files/shaders/%s.spv", k1);
+    /* 管线对象保存在 g_gpipe* 里(单探针),缓存表先记录“这些键能建出管线” */
+    VkPipeline keep_pipe = g_gpipe;
+    VkRenderPass keep_rp = g_gpipe_rp;
+    VkPipelineLayout keep_pl = g_gpipe_layout;
+    int ok = (int)dmVkCreateGraphicsPipeline(p0, p1);
+    if (!ok) ok = (int)dmVkCreateGraphicsPipeline(p1, p0);
+    if (keep_pipe) { g_gpipe = keep_pipe; g_gpipe_rp = keep_rp; g_gpipe_layout = keep_pl; }
+    if (!ok) return 0;
+    snprintf(g_kp[g_kp_n].k0, sizeof g_kp[0].k0, "%s", k0);
+    snprintf(g_kp[g_kp_n].k1, sizeof g_kp[0].k1, "%s", k1);
+    g_kp[g_kp_n].pipe = VK_NULL_HANDLE;   /* 管线对象由探针持有,此处只登记键对 */
+    g_kp_n++;
+    return 1;
+}
