@@ -171,6 +171,7 @@ typedef struct {
 static uint32_t g_nvn_devs, g_nvn_queues, g_nvn_wins, g_nvn_cbs, g_nvn_pools;
 static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 static uint64_t g_draws, g_pipe_hits;
+static uint64_t g_bind_args[8][3]; static int g_bind_args_n;
 /* M4-5:把解析结果发布给渲染线程(PROG=0/DRAW=1),由 dm_vk 在 render pass 内执行 */
 typedef struct { int kind; char k0[17], k1[17]; uint32_t a, b; } dm_rp_t;
 static dm_rp_t g_rp[4096];
@@ -370,7 +371,7 @@ static uint64_t op_draw3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { g_re
 static uint64_t op_draw4(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { g_rec_draw4++; dm_op_write4((nvn_cb_t *)cb, DM_OP_DRAW, a, b, c, d); return 0; }
 static uint64_t op_bind2(uint64_t cb, uint64_t a, uint64_t b) { g_rec_bind2++; dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, a, b, 0, 0); return 0; }
 static uint64_t op_bind_prog(uint64_t cb, uint64_t prog) { g_rec_prog++; dm_op_write4((nvn_cb_t *)cb, DM_OP_PROG, cb, prog, 0, 0); return 0; }
-static uint64_t op_bind3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { g_rec_bind3++; dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, a, b, c, 0); return 0; }
+static uint64_t op_bind3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { g_rec_bind3++; dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, cb, a, b, c); return 0; }
 static uint64_t op_copy(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { dm_op_write((nvn_cb_t *)cb, DM_OP_COPY, NULL, 0); (void)a;(void)b;(void)c;(void)d; return 0; }
 static uint64_t op_dispatch(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_DISPATCH, NULL, 0); (void)a;(void)b;(void)c; return 0; }
 
@@ -399,15 +400,17 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
                 char k0[17], k1[17];
                 if (dmNvnProgramKeysOf((void *)(uintptr_t)o->b, k0, k1)) {
                     (void)dmNvnQueuePair(k0, k1);
-                } else {
-                    g_bind_lookup_miss++;
-                    if (g_bind_sample_n < 8) { g_bind_sample[g_bind_sample_n] = (void *)(uintptr_t)o->b; g_bind_sample_n++; }
                 }
             } else if (o->op == DM_OP_PROG) {
                 char k0[17], k1[17];
                 if (dmNvnProgramKeysOf((void *)(uintptr_t)o->b, k0, k1)) {
                     (void)dmNvnQueuePair(k0, k1);
                     dm_rp_add(0, k0, k1, 0, 0);
+                }
+            } else if (o->op == DM_OP_BIND) {
+                if (g_bind_args_n < 8 && o->d > 0x1000000000ull) {
+                    g_bind_args[g_bind_args_n][0] = o->b; g_bind_args[g_bind_args_n][1] = o->c; g_bind_args[g_bind_args_n][2] = o->d;
+                    g_bind_args_n++;
                 }
             } else if (o->op == DM_OP_DRAW) {
                 g_draws++;
@@ -1079,6 +1082,10 @@ static void *nvn_stats_thread(void *arg)
                         fprintf(bf, "progtab=%d bind_miss=%llu\n", g_progtab_n, (unsigned long long)g_bind_lookup_miss);
                         for (int i = 0; i < g_progtab_n && i < 8; i++)
                             fprintf(bf, "prog[%d]=%llx k0=%s k1=%s\n", i, (unsigned long long)(uintptr_t)g_progtab[i].prog, g_progtab[i].k0, g_progtab[i].k1);
+                        for (int i = 0; i < g_bind_args_n; i++)
+                            fprintf(bf, "bindargs[%d] a=%llu b=%llu c=%llx\n", i,
+                                    (unsigned long long)g_bind_args[i][0], (unsigned long long)g_bind_args[i][1],
+                                    (unsigned long long)g_bind_args[i][2]);
                         for (int i = 0; i < g_bind_sample_n; i++)
                             fprintf(bf, "bind[%d]=%llx\n", i, (unsigned long long)(uintptr_t)g_bind_sample[i]);
                         fclose(bf);
