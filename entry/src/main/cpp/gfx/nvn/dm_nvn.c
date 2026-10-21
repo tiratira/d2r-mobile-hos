@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include <sys/uio.h>
+#include <sys/stat.h>
 /*
  * dm_nvn.c — NVN 接口层(上游 dm/gfx/nvn/hle_nvn.c 的角色,HOS 最小集)。
  *
@@ -173,6 +174,7 @@ typedef struct {
 static uint32_t g_nvn_devs, g_nvn_queues, g_nvn_wins, g_nvn_cbs, g_nvn_pools;
 static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 static uint64_t g_draws, g_pipe_hits;
+static void dm_dump_frame(void);
 /* 上游 nvn_obj.h: va_st{ fmt:8, offset:19, stream:5 }, vs_st{ stride, divisor } */
 static uint32_t g_vattr[16]; static int g_vattr_n;
 static uint32_t g_pend_stream[32]; static int g_pend_stream_n;
@@ -442,6 +444,7 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
         for (int i = 0; i < wn; i++) g_rp_pub[i] = g_rp[i];
         g_rp_pub_n = wn;
         g_rp_n = 0;
+        dm_dump_frame();
     }
     if (g_nvn_submits <= 5) DMLOG_I("NVN queue submit q=%{public}llx n=%{public}d", (unsigned long long)(uintptr_t)q, n);
     for (int i = 0; i < n; i++) {
@@ -1284,6 +1287,55 @@ static void dm_dump_submit(int n, const uint64_t *h, uint64_t *outbuf, int maxw)
         fprintf(f, "\n");
     }
     fclose(f);
+}
+
+
+/* ================= PC 回放测试:导出单帧命令流(dump) =================
+ * DM_DUMP_FRAME=1 时,在提交解析完成后把发布列表(g_rp_pub)写进
+ * files/frames/f000.dump,供 PC 端 dmvk_harness 离线回放/校验。 */
+static void dm_dump_frame(void)
+{
+    static int done;
+    if (done) return;
+    if (getenv("DM_DUMP_FRAME") == NULL) return;
+    done = 1;
+    mkdir("/data/storage/el2/base/haps/entry/files/frames", 0755);
+    FILE *f = fopen("/data/storage/el2/base/haps/entry/files/frames/f000.dump", "wb");
+    if (f == NULL) return;
+    uint32_t magic = 0x464D5244u;   /* "DRMF" */
+    int n = g_rp_pub_n;
+    fwrite(&magic, 4, 1, f);
+    fwrite(&n, 4, 1, f);
+    for (int i = 0; i < n; i++) {
+        const dm_rp_t *r = &g_rp_pub[i];
+        fwrite(&r->kind, 4, 1, f);
+        fwrite(r->k0, 1, 17, f);
+        fwrite(r->k1, 1, 17, f);
+        fwrite(&r->a, 4, 1, f); fwrite(&r->b, 4, 1, f);
+        fwrite(&r->nvb, 4, 1, f);
+        if (r->nvb > 4) { fclose(f); return; }
+        fwrite(r->vba, 8, r->nvb, f);
+        fwrite(r->vbs, 8, r->nvb, f);
+        fwrite(&r->nattr, 4, 1, f);
+        if (r->nattr > 0 && r->nattr <= 16) fwrite(r->attrs, 4, r->nattr, f);
+        fwrite(&r->nstream, 4, 1, f);
+        if (r->nstream > 0 && r->nstream <= 32) fwrite(r->streams, 4, r->nstream, f);
+    }
+    fclose(f);
+    /* 顶点数据:把本帧所有 VB 区间原始字节写入 f000.bin */
+    FILE *b = fopen("/data/storage/el2/base/haps/entry/files/frames/f000.bin", "wb");
+    if (b != NULL) {
+        for (int i = 0; i < n; i++) {
+            const dm_rp_t *r = &g_rp_pub[i];
+            for (unsigned k = 0; k < r->nvb && k < 4; k++) {
+                uint64_t a = r->vba[k], sz = r->vbs[k];
+                if (a == 0 || sz == 0 || sz > (4u << 20)) continue;
+                fwrite(&a, 8, 1, b); fwrite(&sz, 8, 1, b);
+                fwrite((const void *)(uintptr_t)a, 1, (size_t)sz, b);
+            }
+        }
+        fclose(b);
+    }
 }
 
 void dmNvnInit(void)
