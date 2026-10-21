@@ -33,6 +33,7 @@ extern uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
 extern int dmVkPipelineCacheCount(void);
 extern int dmVkPipelineObjCount(void);
 extern uint64_t dmVkCachedPipeline(const char *k0, const char *k1);
+extern uint64_t dmVkReplayDrawCount(void);
 extern uint64_t dmVkGraphicsPipeCount(void);
 extern int dmVkGraphicsPipeError(void);
 extern uint64_t dmVkShaderTestCount(void);
@@ -170,6 +171,29 @@ typedef struct {
 static uint32_t g_nvn_devs, g_nvn_queues, g_nvn_wins, g_nvn_cbs, g_nvn_pools;
 static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 static uint64_t g_draws, g_pipe_hits;
+/* M4-5:把解析结果发布给渲染线程(PROG=0/DRAW=1),由 dm_vk 在 render pass 内执行 */
+typedef struct { int kind; char k0[17], k1[17]; uint32_t a, b; } dm_rp_t;
+static dm_rp_t g_rp[4096];
+static _Atomic int g_rp_n;
+int dmNvnReplayCount(void) { return g_rp_n; }
+int dmNvnReplayGet(int i, int *kind, char *k0, char *k1, unsigned *a, unsigned *b)
+{
+    if (i < 0 || i >= g_rp_n) return 0;
+    *kind = g_rp[i].kind;
+    memcpy(k0, g_rp[i].k0, 17); memcpy(k1, g_rp[i].k1, 17);
+    *a = g_rp[i].a; *b = g_rp[i].b;
+    return 1;
+}
+static void dm_rp_add(int kind, const char *k0, const char *k1, unsigned a, unsigned b)
+{
+    int n = g_rp_n;
+    if (n >= 4096) return;
+    g_rp[n].kind = kind;
+    if (k0) memcpy(g_rp[n].k0, k0, 17); else g_rp[n].k0[0] = 0;
+    if (k1) memcpy(g_rp[n].k1, k1, 17); else g_rp[n].k1[0] = 0;
+    g_rp[n].a = a; g_rp[n].b = b;
+    g_rp_n = n + 1;
+}
 typedef struct { char k0[17], k1[17]; } dm_pair_t;
 static dm_pair_t g_req[64]; static int g_req_n;
 static int dmNvnQueuePair(const char *k0, const char *k1)
@@ -364,6 +388,7 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
             dm_dump_submit(n, h, words, 8);
         }
     }
+    g_rp_n = 0;
     if (g_nvn_submits <= 5) DMLOG_I("NVN queue submit q=%{public}llx n=%{public}d", (unsigned long long)(uintptr_t)q, n);
     for (int i = 0; i < n; i++) {
         const dm_op_t *o = (const dm_op_t *)(uintptr_t)h[i];
@@ -380,9 +405,13 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
                 }
             } else if (o->op == DM_OP_PROG) {
                 char k0[17], k1[17];
-                if (dmNvnProgramKeysOf((void *)(uintptr_t)o->b, k0, k1)) (void)dmNvnQueuePair(k0, k1);
+                if (dmNvnProgramKeysOf((void *)(uintptr_t)o->b, k0, k1)) {
+                    (void)dmNvnQueuePair(k0, k1);
+                    dm_rp_add(0, k0, k1, 0, 0);
+                }
             } else if (o->op == DM_OP_DRAW) {
                 g_draws++;
+                dm_rp_add(1, NULL, NULL, (unsigned)o->a, (unsigned)o->b);
             }
         }
     }
@@ -1020,7 +1049,7 @@ static void *nvn_stats_thread(void *arg)
                 DMLOG_I("M4 shader keys loaded=%d cspipes=%d real_gpipes=%d", g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(),
                     (unsigned long long)g_draws, (unsigned long long)g_pipe_hits,
                     (unsigned long long)g_rec_bind2, (unsigned long long)g_rec_bind3,
-                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), (unsigned long long)g_rec_prog, g_real_gpipes);
+                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), (unsigned long long)g_rec_prog, (unsigned long long)dmVkReplayDrawCount(), g_real_gpipes);
             }
             DMLOG_I("M2 tex upload self-test h=%{public}llx count=%{public}llu",
                     (unsigned long long)h, (unsigned long long)dmVkUploadCount());
@@ -1029,7 +1058,7 @@ static void *nvn_stats_thread(void *arg)
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
             fprintf(f, "progs=%d keys=%d ", g_progs, g_prog_key_n);
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d rgpipe=%d pcache=%d pobj=%d draws=%llu pbh=%llu recb2=%llu recb3=%llu recdl=%llu recprog=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d rgpipe=%d pcache=%d pobj=%d draws=%llu pbh=%llu recb2=%llu recb3=%llu recdl=%llu recprog=%llu rpdraw=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
                     (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount(),
@@ -1037,7 +1066,7 @@ static void *nvn_stats_thread(void *arg)
                     (unsigned long long)dmVkShaderTestCount(), g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(),
                     (unsigned long long)g_draws, (unsigned long long)g_pipe_hits,
                     (unsigned long long)g_rec_bind2, (unsigned long long)g_rec_bind3,
-                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), (unsigned long long)g_rec_prog,
+                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), (unsigned long long)g_rec_prog, (unsigned long long)dmVkReplayDrawCount(),
                     (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);

@@ -36,7 +36,7 @@ static VkPhysicalDevice g_upload_pd;
 static VkPipeline g_gpipe;
 static VkPipelineLayout g_gpipe_layout;
 static VkRenderPass g_gpipe_rp;
-static int g_draw_test;
+static int g_draw_test;   /* 实验开关:为 1 时回放真实 draw(缺资源时会掉到 ~1fps,默认关) */
 static VkDescriptorSet g_gpipe_set;
 static VkDescriptorPool g_dummy_pool;
 static VkBuffer g_dummy_buf;
@@ -48,6 +48,12 @@ static VkSampler g_dummy_samp;   /* 实验:M4 首绘开关(缺省关,保持已�
 extern "C" uint64_t dmVkLoadShaderModule(const char *path);
 extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
+extern "C" uint64_t dmVkCachedPipeline(const char *k0, const char *k1);
+extern "C" int dmNvnReplayCount(void);
+extern "C" int dmNvnReplayGet(int i, int *kind, char *k0, char *k1, unsigned *a, unsigned *b);
+extern "C" uint64_t dmVkReplayDrawCount(void);
+static _Atomic uint64_t g_replay_draws;
+extern "C" uint64_t dmVkReplayDrawCount(void) { return g_replay_draws; }
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
 extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath);
 
@@ -358,7 +364,26 @@ static void *vk_loop(void *arg)
             VkRect2D sc{{0, 0}, {swci.imageExtent.width, swci.imageExtent.height}};
             vkCmdSetViewport(cmdb, 0, 1, &vpt);
             vkCmdSetScissor(cmdb, 0, 1, &sc);
-            vkCmdDraw(cmdb, 3, 1, 0, 0);
+            {
+                VkPipeline cur = g_gpipe;
+                int nops = dmNvnReplayCount();
+                if (nops > 256) nops = 256;
+                int issued = 0;
+                for (int i = 0; i < nops; i++) {
+                    int kind; char rk0[17], rk1[17]; unsigned ra = 0, rb = 0;
+                    if (!dmNvnReplayGet(i, &kind, rk0, rk1, &ra, &rb)) break;
+                    if (kind == 0) {
+                        uint64_t p = dmVkCachedPipeline(rk0, rk1);
+                        if (p != 0 && (VkPipeline)(uintptr_t)p != cur) { cur = (VkPipeline)(uintptr_t)p; vkCmdBindPipeline(cmdb, VK_PIPELINE_BIND_POINT_GRAPHICS, cur); }
+                    } else {
+                        uint32_t cnt = rb ? rb : 3;
+                        if (cnt > 1000000u) cnt = 3;
+                        vkCmdDraw(cmdb, cnt, 1, 0, 0);
+                        g_replay_draws++; issued++;
+                    }
+                }
+                if (issued == 0) vkCmdDraw(cmdb, 3, 1, 0, 0);
+            }
             vkCmdEndRenderPass(cmdb);
             vkEndCommandBuffer(cmdb);
             VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
