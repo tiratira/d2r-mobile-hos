@@ -33,6 +33,10 @@ static _Atomic uint64_t g_vk_frames;
 static VkDevice g_upload_dev;
 static VkQueue g_upload_queue;
 static VkPhysicalDevice g_upload_pd;
+static VkPipeline g_gpipe;
+static VkPipelineLayout g_gpipe_layout;
+static VkRenderPass g_gpipe_rp;
+static int g_draw_test;   /* 实验:M4 首绘开关(缺省关,保持已验证的清屏通路) */
 extern "C" uint64_t dmVkLoadShaderModule(const char *path);
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
 extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath);
@@ -297,6 +301,19 @@ static void *vk_loop(void *arg)
         }
         vkGetSwapchainImagesKHR(v.dev, v.swc, &nimg, imgs);
         img = imgs[idx % nimg];
+        static VkImageView s_views[8];
+        static VkFramebuffer s_fbs[8];
+        if (g_gpipe_rp && s_views[idx % nimg] == VK_NULL_HANDLE) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.image = img; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = chosen.format;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            if (vkCreateImageView(v.dev, &vci, nullptr, &s_views[idx % nimg]) == VK_SUCCESS) {
+                VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+                fci.renderPass = g_gpipe_rp; fci.attachmentCount = 1; fci.pAttachments = &s_views[idx % nimg];
+                fci.width = swci.imageExtent.width; fci.height = swci.imageExtent.height; fci.layers = 1;
+                vkCreateFramebuffer(v.dev, &fci, nullptr, &s_fbs[idx % nimg]);
+            }
+        }
 
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandPoolCreateInfo pci{};
@@ -313,6 +330,38 @@ static void *vk_loop(void *arg)
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cmdb, &bi);
+        if (g_draw_test && g_gpipe != VK_NULL_HANDLE && s_fbs[idx % nimg] != VK_NULL_HANDLE) {
+            VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            rbi.renderPass = g_gpipe_rp; rbi.framebuffer = s_fbs[idx % nimg];
+            rbi.renderArea = {{0, 0}, {swci.imageExtent.width, swci.imageExtent.height}};
+            VkClearValue cv{}; memcpy(cv.color.float32, c, sizeof c);
+            rbi.clearValueCount = 1; rbi.pClearValues = &cv;
+            vkCmdBeginRenderPass(cmdb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(cmdb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_gpipe);
+            VkViewport vpt{0, 0, (float)swci.imageExtent.width, (float)swci.imageExtent.height, 0, 1};
+            VkRect2D sc{{0, 0}, {swci.imageExtent.width, swci.imageExtent.height}};
+            vkCmdSetViewport(cmdb, 0, 1, &vpt);
+            vkCmdSetScissor(cmdb, 0, 1, &sc);
+            vkCmdDraw(cmdb, 3, 1, 0, 0);
+            vkCmdEndRenderPass(cmdb);
+            vkEndCommandBuffer(cmdb);
+            VkSubmitInfo si2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si2.waitSemaphoreCount = 1; si2.pWaitSemaphores = &v.semAcq;
+            VkPipelineStageFlags ws = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            si2.pWaitDstStageMask = &ws;
+            si2.commandBufferCount = 1; si2.pCommandBuffers = &cmdb;
+            si2.signalSemaphoreCount = 1; si2.pSignalSemaphores = &v.semPres;
+            vkQueueSubmit(v.queue, 1, &si2, VK_NULL_HANDLE);
+            VkPresentInfoKHR pi2{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+            pi2.waitSemaphoreCount = 1; pi2.pWaitSemaphores = &v.semPres;
+            pi2.swapchainCount = 1; pi2.pSwapchains = &v.swc; pi2.pImageIndices = &idx;
+            VkResult pr = vkQueuePresentKHR(v.queue, &pi2);
+            vkQueueWaitIdle(v.queue);
+            vkDestroyCommandPool(v.dev, pool, nullptr);
+            if (pr != VK_SUCCESS && pr != VK_SUBOPTIMAL_KHR) { DMLOG_E("vk: present %{public}s", vkerr(pr)); break; }
+            usleep(16000);
+            continue;
+        }
         VkImageMemoryBarrier bar{};
         bar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         bar.srcAccessMask = 0;
@@ -762,6 +811,14 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
     gpci.pDynamicState = &ds; gpci.layout = pl; gpci.renderPass = rp; gpci.subpass = 0;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkResult r = vkCreateGraphicsPipelines(g_upload_dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe);
+    if (r == VK_SUCCESS && pipe != VK_NULL_HANDLE) {
+        g_gpipe = pipe; g_gpipe_layout = pl; g_gpipe_rp = rp;
+        vkDestroyDescriptorSetLayout(g_upload_dev, dsl, nullptr);
+        vkDestroyShaderModule(g_upload_dev, vs, nullptr);
+        vkDestroyShaderModule(g_upload_dev, ps, nullptr);
+        g_gpipe_err = 0; g_gpipes++;
+        return 1;
+    }
     if (pipe) vkDestroyPipeline(g_upload_dev, pipe, nullptr);
     vkDestroyPipelineLayout(g_upload_dev, pl, nullptr);
     vkDestroyDescriptorSetLayout(g_upload_dev, dsl, nullptr);
