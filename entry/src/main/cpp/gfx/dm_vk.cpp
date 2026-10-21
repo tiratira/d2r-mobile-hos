@@ -1152,7 +1152,8 @@ extern "C" int dmVkShaderStageOfFile(const char *path)
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
 extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
 extern "C" int dmVkPipelineCacheCount(void);
-typedef struct { char k0[17], k1[17]; VkPipeline pipe; VkPipelineLayout layout; VkRenderPass rp; } keypipe_t;
+typedef struct { char k0[17], k1[17]; VkPipeline pipe; VkPipelineLayout layout; VkRenderPass rp;
+    VkDescriptorSetLayout dsl; VkDescriptorPool pool; VkDescriptorSet set; VkBuffer ubos[8]; VkDeviceMemory ubom[8]; int nubo; } keypipe_t;
 static keypipe_t g_kp[64];
 static int g_kp_n;
 extern "C" int dmVkPipelineCacheCount(void) { return g_kp_n; }
