@@ -46,6 +46,8 @@ static VkDeviceMemory g_dummy_img_mem;
 static VkImageView g_dummy_view;
 static VkSampler g_dummy_samp;   /* 实验:M4 首绘开关(缺省关,保持已验证的清屏通路) */
 extern "C" uint64_t dmVkLoadShaderModule(const char *path);
+extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
+extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
 extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath);
 
@@ -338,6 +340,11 @@ static void *vk_loop(void *arg)
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(cmdb, &bi);
+        for (int req = 0; req < 4; req++) {
+            char rk0[17], rk1[17];
+            if (!dmNvnNextRequestedPair(rk0, rk1)) break;
+            (void)dmVkPipelineForKeys(rk0, rk1);
+        }
         if (g_draw_test && g_gpipe != VK_NULL_HANDLE && s_fbs[idx % nimg] != VK_NULL_HANDLE) {
             VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
             rbi.renderPass = g_gpipe_rp; rbi.framebuffer = s_fbs[idx % nimg];
@@ -929,6 +936,7 @@ extern "C" int dmVkShaderStageOfFile(const char *path)
 
 /* ================= M4-4:pen(程序键对) → 管线缓存 ================= */
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
+extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
 extern "C" int dmVkPipelineCacheCount(void);
 typedef struct { char k0[17], k1[17]; VkPipeline pipe; VkPipelineLayout layout; VkRenderPass rp; } keypipe_t;
 static keypipe_t g_kp[64];

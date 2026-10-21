@@ -170,6 +170,29 @@ typedef struct {
 static uint32_t g_nvn_devs, g_nvn_queues, g_nvn_wins, g_nvn_cbs, g_nvn_pools;
 static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 static uint64_t g_draws, g_pipe_hits;
+typedef struct { char k0[17], k1[17]; } dm_pair_t;
+static dm_pair_t g_req[64]; static int g_req_n;
+static int dmNvnQueuePair(const char *k0, const char *k1)
+{
+    if (k0 == NULL || k1 == NULL) return 0;
+    for (int i = 0; i < g_req_n; i++)
+        if (strcmp(g_req[i].k0, k0) == 0 && strcmp(g_req[i].k1, k1) == 0) return 0;
+    if (g_req_n >= 64) return 0;
+    snprintf(g_req[g_req_n].k0, 17, "%s", k0);
+    snprintf(g_req[g_req_n].k1, 17, "%s", k1);
+    g_req_n++;
+    g_pipe_hits++;
+    return 1;
+}
+int dmNvnNextRequestedPair(char *k0, char *k1)
+{
+    static int head;
+    if (head >= g_req_n) return 0;
+    memcpy(k0, g_req[head].k0, 17); memcpy(k1, g_req[head].k1, 17);
+    head++;
+    return 1;
+}
+
 static uint64_t g_rec_bind2, g_rec_bind3, g_rec_draw3, g_rec_draw4;
 static int dmNvnProgramKeysOf(void *prog, char *k0, char *k1);
 static uint64_t g_nvn_bufs, g_nvn_textures;
@@ -261,6 +284,7 @@ static nvn_cb_t *g_cur_cb;
 static uint64_t g_addcmd_n, g_begin_n, g_end_n, g_cbinit_n;
 static void *g_addcmd_cb[4]; static void *g_addcmd_pool[4]; static long long g_addcmd_off[4]; static unsigned long long g_addcmd_size[4];
 static uint64_t g_begin_alias_n;
+static void *g_bind_sample[8]; static int g_bind_sample_n; static uint64_t g_bind_lookup_miss;
 static void *g_alias_begin[8]; static void *g_alias_match[8]; static int g_alias_n;
 static void *g_cb_ev[64]; static uint8_t g_cb_kind[64]; static int g_cb_ev_n;
 static void dm_cb_ev(void *cb, int kind) { if (g_cb_ev_n < 64) { g_cb_ev[g_cb_ev_n] = cb; g_cb_kind[g_cb_ev_n] = (uint8_t)kind; g_cb_ev_n++; } }
@@ -348,7 +372,10 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
             } else if (o->op == DM_OP_BIND && o->b != 0) {
                 char k0[17], k1[17];
                 if (dmNvnProgramKeysOf((void *)(uintptr_t)o->b, k0, k1)) {
-                    if (dmVkCachedPipeline(k0, k1) != 0) g_pipe_hits++;
+                    (void)dmNvnQueuePair(k0, k1);
+                } else {
+                    g_bind_lookup_miss++;
+                    if (g_bind_sample_n < 8) { g_bind_sample[g_bind_sample_n] = (void *)(uintptr_t)o->b; g_bind_sample_n++; }
                 }
             } else if (o->op == DM_OP_DRAW) {
                 g_draws++;
@@ -843,11 +870,16 @@ static uint32_t nvn_program_setshaders(void *prog, int n, const void *sdv)
         }
         g_prog_key_n++;
     }
-    if (keys_here >= 2 && g_progtab_n < 1024) {
-        dm_progent_t *e = &g_progtab[g_progtab_n++];
-        e->prog = prog;
+    if (keys_here >= 1) {
         char a[32] = {0}, b[32] = {0};
-        if (sscanf(line, "%31s %31s", a, b) == 2) { memcpy(e->k0, a, 17); memcpy(e->k1, b, 17); }
+        int got = sscanf(line, "%31s %31s", a, b);
+        dm_progent_t *e = NULL;
+        for (int i = 0; i < g_progtab_n; i++) if (g_progtab[i].prog == prog) { e = &g_progtab[i]; break; }
+        if (e == NULL && g_progtab_n < 1024) { e = &g_progtab[g_progtab_n++]; e->prog = prog; e->k0[0] = 0; e->k1[0] = 0; }
+        if (e != NULL) {
+            if (got >= 1) memcpy(e->k0, a, 17);
+            if (got >= 2) memcpy(e->k1, b, 17);
+        }
     }
     if (keys_here && g_prog_line_n < 512) {
         snprintf(g_prog_lines[g_prog_line_n], sizeof(g_prog_lines[0]), "%s", line);
@@ -1006,6 +1038,19 @@ static void *nvn_stats_thread(void *arg)
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);
             {
+                static int bind_dumped;
+                if (!bind_dumped) {
+                    bind_dumped = 1;
+                    FILE *bf = fopen("/data/storage/el2/base/haps/entry/files/dm_bind.txt", "w");
+                    if (bf != NULL) {
+                        fprintf(bf, "progtab=%d bind_miss=%llu\n", g_progtab_n, (unsigned long long)g_bind_lookup_miss);
+                        for (int i = 0; i < g_progtab_n && i < 8; i++)
+                            fprintf(bf, "prog[%d]=%llx k0=%s k1=%s\n", i, (unsigned long long)(uintptr_t)g_progtab[i].prog, g_progtab[i].k0, g_progtab[i].k1);
+                        for (int i = 0; i < g_bind_sample_n; i++)
+                            fprintf(bf, "bind[%d]=%llx\n", i, (unsigned long long)(uintptr_t)g_bind_sample[i]);
+                        fclose(bf);
+                    }
+                }
                 static int cb_dumped;
                 if (!cb_dumped) {
                     cb_dumped = 1;
