@@ -20,14 +20,36 @@ II:重制版》在 iPhone/Mac 上的原生移植)的架构适配到 **HarmonyOS(
 | **M2 svc HLE**:`hle_svc.c`(客体地址空间 + 内存/查询类)+ `hle_thread.c`(线程/锁/条件/地址仲裁/事件/WaitSync 全量)+ `hle_hostcall.c`(0x80 TACT zlib 解码 + 0x81-0x8b 转调原函数) | ✅ 模拟器自检 **17/17** |
 | **M2 loader(rtld)**:`loader_hos.c` + 容器 v3 — 三模块**原地装载**(镜像在签名节内,仅数据窗口 mprotect RW 后原地重定位),符号哈希/跨模块解析/swforce 接管;模拟器实测 main 700 符号/6 万余重定位,启动序 9 符号全解析 | ✅ x86 data-only 同码验证 |
 | **M2 SDK 启动序**:`host_start.c` — 照上游 `guest_main` 逐条:`_init_libc0 → nnosInitialize → _init_libc1 → nninitInitializeSdkModule → nninitStartup → _init_libc2 → 各模块 DT_INIT → SetHostArgc/Argv → nnMain`;ARM64 专起 8 MiB 客体主线程,x86 做预检 | ✅ 预检通过(9/9 符号,3 模块 1011 项 DT_INIT) |
-| **M2 服务层 HLE**:`hle_fs.c`(24 条:rom/save/temp 挂载 + 路径解析 + 句柄表 + 全部文件/目录接口)、`hle_oe.c`(15 条:运行模式/焦点/通知队列/语言/设备号)、`hle_hid.c`(13 条:手柄状态 + 按下沿锁存 + 触摸屏)、`hle_time.c`(10 条:系统时钟/日历/本地时区)、`hle_misc.c`(14 条:aoc/err/ngc/nsd/pctl)、`hle_account.c`(21 条:本地用户/昵称/联网接口失败)、`hle_sdkinit.c`(7 条服务初始化强制接管) | ✅ 模拟器服务自检全绿;导入覆盖 **1148** 符号 → 模块 1043 + 强制接管 99 + HLE 6,**0 记名桩** |
+| **M2 服务层 HLE**:`hle_fs.c`(24 条:rom/save/temp 挂载 + 路径解析 + 句柄表 + 全部文件/目录接口)、`hle_oe.c`(15 条:运行模式/焦点/通知队列/语言/设备号)、`hle_hid.c`(13 条:手柄状态 + 按下沿锁存 + 触摸屏)、`hle_time.c`(10 条:系统时钟/日历/本地时区)、`hle_misc.c`(14 条:aoc/err/ngc/nsd/pctl)、`hle_account.c`(21 条:本地用户/昵称/联网接口失败)、`hle_sdkinit.c`(7 条服务初始化强制接管)、`hle_net.c`(93 条:socket/nifm/ssl 离线化,Initialize 成功、联网调用失败) | ✅ 模拟器服务自检全绿;导入覆盖 **1148** 符号 → 模块 950 + 强制接管 192 + HLE 6,**0 记名桩** |
 | **M3 图形**:`gfx/dm_vk.cpp` — Vulkan 实例→`VK_OHOS_surface`→交换链→呈现循环;`gfx/nvn/` — NVN 引导 + **512 槽静态 thunk 表**(每入口首调记名/参数)+ EGL/GLES3 双后端 | ✅ 模拟器实测 Vulkan 实例/双后端 OK |
 | **M4 音频**:`audio/dm_audio.c` — OHAudio 48 kHz/2ch/S16LE 渲染器 + 写数据回调 + 800ms 正弦自检(异步线程,不阻塞 UI) | ✅ 模拟器实测创建/播放完成 |
 | **资源管线**:基础版直读 `extract_romfs_hos.py --base-only`(IVFC L4 逐块认证)+ v2228224 完整提取 `extract_romfs_hactool.sh`(基座区 100% 块一致交叉验证) | ✅ 25 文件 7.68 GiB + 46 文件 8.36 GiB |
 | ArkUI:主菜单 / 游戏页(XComponent + 摇杆/技能/腰带/Boss条叠加层)/ 设置 / 移植状态(启动预检、服务自检、音频自检、播放音、宿主全链路、VK/GLES 切换) | ✅ 已实现 |
-| 真实 nnMain 启动链(loader 重定位 / SDK init 序列 / fs·oe·hid HLE / NVN 回放 / OHAudio) | ✅ 预检通过;**ARM64 真机执行待验证** |
+| 真实 nnMain 启动链(loader 重定位 / SDK init 序列 / fs·oe·hid HLE / NVN 回放 / OHAudio) | ✅ **真机 Mate 80(arm64,API 26)实测跑通到 nnMain**;游戏数据导入后画面仍待 NVN 回放接入 |
 
 完整映射与实施路线见 **[docs/PORTING.md](docs/PORTING.md)**。
+
+## 真机(ARM64)运行与游戏数据导入
+
+x86_64 模拟器只能跑宿主框架层(x86 构建里客体镜像是纯数据,不执行 ARM64),
+真实 `nnMain` 必须在 ARM64 鸿蒙设备上跑:
+
+```bash
+devecocli device list                  # 找真机 serial,例如 62T0226211000381
+devecocli run --device <serial>        # 装包并启动;进「进入游戏」自动走启动链
+```
+
+游戏数据(RomFS)不进仓库,需要推到应用沙箱(8.36 GiB 完整集,约 46 个文件):
+
+```bash
+# 本机先按 docs/PORTING.md / README「重写自己游戏文件的管线」提取到本地目录
+hdc -t <serial> file send -b com.d2rmobile.hos <本地romfs目录> \
+    /data/storage/el2/base/haps/entry/files/romfs
+```
+
+之后重进游戏页,顶部会显示 `BOOT <stage>`(SDK 启动序)与导入覆盖统计;
+真机上用 `hdc shell hilog | grep D2RMobileHOS` 可看到 `BOOT/UNIMPL/CRASH`
+以及崩溃现场(寄存器 + 客体帧链)。
 
 ## 最后阶段(P2 收口)交付内容
 

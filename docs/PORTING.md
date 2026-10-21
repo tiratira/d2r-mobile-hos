@@ -55,8 +55,8 @@ Switch 版 D2R 是三个 NSO 模块(`main` / `sdk` / `subsdk0`)的 ARM64 原生
 | 3 | `dm/host/loader.c` | 镜像映射/门表/重定位 | `cpp/loader/dm_guest_loader.*` + `host/loader_hos.c`(原地重定位/符号哈希/DT_INIT) | 已完成 |
 | 4 | `dm/host/thread.c` 线程槽 | x18/TLS/TLR 替身 | `cpp/hal/dm_platform.*`:pthread_key 三槽 | 已完成 |
 | 5 | 19.2MHz 计数器应答 | `cntpct_el0` HLE | `dmPlatCounterRead()`:`CLOCK_MONOTONIC` 换算 | 已完成 |
-| 6 | `dm/host/hle*.c` | svc/线程/内存/服务 HLE | svc/线程/同步 17/17;服务层 `hle_fs/oe/hid/time/misc/account/sdkinit` 最小集(见 §4.6) | 已完成(最小集) |
-| 7 | `dm/host/main.c` 启动序 | SDK 运行时 + init_array + nnMain | `host/host_start.c`:`_init_libc0→…→nnMain`(见 §4.3) | 已完成(真机执行待验) |
+| 6 | `dm/host/hle*.c` | svc/线程/内存/服务 HLE | svc/线程/同步 17/17;服务层 `hle_fs/oe/hid/time/misc/account/sdkinit/net` 最小集(见 §4.6) | 已完成(最小集) |
+| 7 | `dm/host/main.c` 启动序 | SDK 运行时 + init_array + nnMain | `host/host_start.c`:`_init_libc0→…→nnMain`(见 §4.3) | 已完成;**真机 Mate 80 (arm64) 实测跑通到 nnMain** |
 | 8 | `dm/host/dm_*.c` 游戏特性 | 大秘境/Boss冲/易爆装备等 | 纯 C,依赖门表与镜像偏移,随 #3/#6 落地 | 待实施 |
 | 9 | `dm/gfx/nvn/`(接口层 C) | NVN 函数表与命令录制 | `cpp/gfx/nvn`:引导表 + 512 槽 thunk + 首调记名(见 §4.7) | 骨架就绪 |
 | 10 | `dm/gfx/nvn/nvn_mtl.m` | Metal 回放 | **Vulkan 回放后端**(`dm_vk.cpp` WSI 已通,命令回放待录制层) | 部分 |
@@ -212,13 +212,14 @@ _init_libc0 → nnosInitialize(hmain,0) → _init_libc1
 | `hle_time.c` | 10 | 系统时钟/日历(localtime_r)/本地时区;`time` 转调 SDK(开机时长语义) |
 | `hle_misc.c` | 14 | aoc(拥有 1 个 DLC)/err(只打日志)/ngc(profanity 掩码写 0)/nsd/pctl |
 | `hle_account.c` | 21 | 本地用户模型(Uid/UserHandle 魔数)/昵称;联网账号接口失败 |
+| `hle_net.c` | 93 | socket/nifm/ssl 离线化:Initialize 成功不建会话,联网调用按 BSD 回 -1/ENETDOWN;`nn::socket::Initialize` 必须接管,否则 SDK 自己走 hipc 连 `sm:` → diag::Abort |
 | `hle_libc.c` | 6 | getentropy、异常栈查询、`__rel_dyn/plt_*` 数据符号 |
 
 **导入覆盖报告**(`dm_import_report`,启动预检里显示):装载/重定位后扫
 三模块 dynsym,把每个未定义导入按解析去向分类。当前 3.3.94012 三模块实测:
 
 ```
-imp:1148 模块1043 接管99 HLE6 弱0 桩0
+imp:1148 模块950 接管192 HLE6 弱0 桩0
 ```
 
 即**没有任何导入落到记名桩**。真机上若出现 `UNIMPL <name>` 或桩计数增加,
@@ -228,6 +229,42 @@ imp:1148 模块1043 接管99 HLE6 弱0 桩0
 `clonefile+renamex_np(RENAME_SWAP)`,OHOS 需换两次 rename);fs 的 overlay/
 `.holes` 剔零档案、friends/swkbd/codec/charname 等属 P2;hid 还没有物理手柄
 通路(触控层经 `dmHidSet` 注入)。
+
+#### 4.6.1 真机(ARM64)落地记录(HUAWEI Mate 80,VYG-AL00,arm64-v8a/API 26)
+
+x86_64 模拟器上客体镜像是纯数据(`data-only`),无法暴露 ARM64 执行问题。
+第一次上真机时「进入游戏」立即闪退,定位到三个只在真机出现的缺陷(均已修):
+
+1. **门桩栈失衡** — `patch_nso_hos.py` 里 `STP_PRE_2930` 写的是
+   `stp x29,x30,[sp,#-32]!`(0xA9BE7BFD),而桩尾是 `ldp [sp],#16`;
+   每次门调用净漏 16 字节栈,几千次后 `ret` 跳到垃圾地址
+   (crash: `SIGSEGV@0`,`pc=0 lr=0`)。改为 0xA9BF7BFD(-16),单测断言
+   `stp/ldp/bl` 三条编码。
+2. **隐式函数声明截断** — `loader_hos.c` 调用 `resolve_import()` 时没有
+   原型,Clang 按 `int` 处理,HLE 函数地址被截成 32 位;SDK 在
+   `nnosInitialize → RngManager` 里 `br` 到 `0x7d19ed4` 崩溃。把原型加进
+   `dm.h`,并把 `-Werror=implicit-function-declaration` 加进 CMake。
+3. **挂载名丢失** — `MountRom/MountTemporaryStorage/MountSaveData` 忽略
+   游戏传来的挂载名(实测 `$` = rom、`^` = 临时区),`^:/Diablo II/GameLogs`
+   找不到挂载点被当只读,游戏初始化提前退出。改为按 guest 名登记宿主目录。
+
+配套:全进程 `crash_hos.c`(SIGSEGV/ABRT 时把启动阶段、通用寄存器、客体
+x29 帧链以 FATAL 打到 hilog)、`LOG_TAG` 修正(之前为 NULL,greppable 日志
+看不到)、客体入口 `x18=0`(Horizon 新线程初值)。
+
+真机数据(RomFS,8.36 GiB)不进仓库,用 hdc 的沙箱模式推入:
+
+```bash
+hdc -t <serial> file send -b com.d2rmobile.hos <本地romfs目录> \
+    /data/storage/el2/base/haps/entry/files/romfs
+```
+
+实测启动链:`_init_libc0 → nnosInitialize → _init_libc1 →
+nninitInitializeSdkModule → nninitStartup → _init_libc2 → DT_INIT
+(main 852 + sdk 115 + subsdk0 44 项) → SetHostArgc/Argv → nnMain`,
+随后 game 创建 6 个线程并挂载 `$`/`^` 文件系统。**下一次缺口**:NVN
+函数表目前是记名 thunk(不录命令),`nnMain` 返回后画面仍黑;接入
+NVN 命令录制 → Vulkan 回放后才有游戏画面。
 
 ### 4.7 NVN 接口层与 OHAudio(audio/dm_audio.c,已交付)
 
