@@ -142,6 +142,27 @@ Maleoon 驱动对这些不支持的声明直接以 OOM 报错。按「对应浮�
   (每个都触发了清洗;Float64/ImageBuffer/ImageMSArray/group 能力出现于全部 6704 个);
 - 真机验证:`tex=1 shader=1 pipe=1 pipe_err=0`。
 
+## 5.2 M4 进展(真机证据,2026-10-21)
+
+命令录制/解析链路已打通,数据都是真机 `dm_stats.txt` 里的实测值:
+
+| 项目 | 实测 |
+|---|---|
+| 录制 draw/bind | `recdl≈25 万` / `recb2≈?` / `recb3≈114 万` / `recprog≈25.9 万` |
+| 提交解析 draw | `draws≈25.5 万` |
+| 程序键派生 | `keys=512, 508 与 shader_map.tsv 一致` |
+| 设备上的着色器资产 | 465 组 `<key>.spv + .res.json`(4.2 MB) |
+| 模块/compute/图形管线 | `kload=64 / cspipe=3 / rgpipe=12`,按需缓存到 `pcache=pobj=22` |
+
+关键 bug 与修复(均已真机验证):
+1. **SPIR-V 未使用能力**导致 Maleoon 驱动对 `vkCreateComputePipelines` 返回 OOM →
+   新增 `tools/spv_scrub.py`,6704 个着色器全部清洗;
+2. `nvnCommandBufferEndRecording` 句柄偏移导致第二帧起解析错位 → 固定返回流首地址;
+3. 引擎 8366 个 command buffer 里只有 3 个经 `AddCommandMemory` 拿到命令内存
+   (`begin_alias=8327`),op 被静默丢弃 → CB 增加宿主自有 op 流缓冲;
+4. `BindProgram` 与其它 bind 共用 opcode,程序指针不可见 → 独立 `DM_OP_PROG`;
+5. SHA-256 末尾填充/输出下标两个 bug → 程序键 508/512 正确。
+
 ## 6. 下一步（M1 起）
 
 1. 把 SPIR-V 资产打包进 app：350 MB 原样推设备 files 目录，或 deflate 后作为资源
