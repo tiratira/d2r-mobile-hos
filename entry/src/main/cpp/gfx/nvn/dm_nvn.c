@@ -168,6 +168,7 @@ typedef struct {
 static uint32_t g_nvn_devs, g_nvn_queues, g_nvn_wins, g_nvn_cbs, g_nvn_pools;
 static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 static uint64_t g_draws, g_pipe_hits;
+static uint64_t g_rec_bind2, g_rec_bind3, g_rec_draw3, g_rec_draw4;
 static int dmNvnProgramKeysOf(void *prog, char *k0, char *k1);
 static uint64_t g_nvn_bufs, g_nvn_textures;
 
@@ -294,10 +295,10 @@ static void dm_op_write4(nvn_cb_t *cb, uint32_t op, uint64_t a, uint64_t b, uint
     { dm_op_write(g_cur_cb, opcode, (double[]){0}, 0); (void)a; (void)b; (void)c; (void)d; return 0; }
 /* 具体 op 记录:签名统一 4 个 uint64,多余参数按 ABI 忽略 */
 static uint64_t op_setviewport(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_BIND, NULL, 0); (void)a;(void)b;(void)c; return 0; }
-static uint64_t op_draw3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_DRAW, NULL, 0); (void)a;(void)b;(void)c; return 0; }
-static uint64_t op_draw4(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { dm_op_write((nvn_cb_t *)cb, DM_OP_DRAW, NULL, 0); (void)a;(void)b;(void)c;(void)d; return 0; }
-static uint64_t op_bind2(uint64_t cb, uint64_t a, uint64_t b) { dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, a, b, 0, 0); return 0; }
-static uint64_t op_bind3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_BIND, NULL, 0); (void)a;(void)b;(void)c; return 0; }
+static uint64_t op_draw3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { g_rec_draw3++; dm_op_write4((nvn_cb_t *)cb, DM_OP_DRAW, a, b, c, 0); return 0; }
+static uint64_t op_draw4(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { g_rec_draw4++; dm_op_write4((nvn_cb_t *)cb, DM_OP_DRAW, a, b, c, d); return 0; }
+static uint64_t op_bind2(uint64_t cb, uint64_t a, uint64_t b) { g_rec_bind2++; dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, a, b, 0, 0); return 0; }
+static uint64_t op_bind3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { g_rec_bind3++; dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, a, b, c, 0); return 0; }
 static uint64_t op_copy(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { dm_op_write((nvn_cb_t *)cb, DM_OP_COPY, NULL, 0); (void)a;(void)b;(void)c;(void)d; return 0; }
 static uint64_t op_dispatch(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_DISPATCH, NULL, 0); (void)a;(void)b;(void)c; return 0; }
 
@@ -939,7 +940,9 @@ static void *nvn_stats_thread(void *arg)
                     fclose(pf2);
                 }
                 DMLOG_I("M4 shader keys loaded=%d cspipes=%d real_gpipes=%d", g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(),
-                    (unsigned long long)g_draws, (unsigned long long)g_pipe_hits, g_real_gpipes);
+                    (unsigned long long)g_draws, (unsigned long long)g_pipe_hits,
+                    (unsigned long long)g_rec_bind2, (unsigned long long)g_rec_bind3,
+                    (unsigned long long)(g_rec_draw3 + g_rec_draw4), g_real_gpipes);
             }
             DMLOG_I("M2 tex upload self-test h=%{public}llx count=%{public}llu",
                     (unsigned long long)h, (unsigned long long)dmVkUploadCount());
@@ -948,13 +951,15 @@ static void *nvn_stats_thread(void *arg)
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
             fprintf(f, "progs=%d keys=%d ", g_progs, g_prog_key_n);
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d rgpipe=%d pcache=%d pobj=%d draws=%llu pbh=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d rgpipe=%d pcache=%d pobj=%d draws=%llu pbh=%llu recb2=%llu recb3=%llu recdl=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
                     (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount(),
                     (unsigned long long)g_nvn_bufs, (unsigned long long)g_nvn_textures,
                     (unsigned long long)dmVkShaderTestCount(), g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(),
                     (unsigned long long)g_draws, (unsigned long long)g_pipe_hits,
+                    (unsigned long long)g_rec_bind2, (unsigned long long)g_rec_bind3,
+                    (unsigned long long)(g_rec_draw3 + g_rec_draw4),
                     (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);
