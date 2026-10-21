@@ -36,7 +36,8 @@ static VkPhysicalDevice g_upload_pd;
 static VkPipeline g_gpipe;
 static VkPipelineLayout g_gpipe_layout;
 static VkRenderPass g_gpipe_rp;
-static int g_draw_test;   /* 实验开关:开时回放真实 draw(当前会 hung,默认关) */
+static int g_draw_test = 1;   /* 回放 draw(不绑顶点缓冲,稳定) */
+static int g_bind_test;   /* 顶点缓冲绑定(管线缺顶点输入时会 hang,默认关) */
 static VkDescriptorSet g_gpipe_set;
 static VkDescriptorPool g_dummy_pool;
 static VkBuffer g_dummy_buf;
@@ -401,7 +402,7 @@ static void *vk_loop(void *arg)
                     if (kind == 0) {
                         uint64_t p = dmVkCachedPipeline(rk0, rk1);
                         if (p != 0 && (VkPipeline)(uintptr_t)p != cur) { cur = (VkPipeline)(uintptr_t)p; vkCmdBindPipeline(cmdb, VK_PIPELINE_BIND_POINT_GRAPHICS, cur); }
-                    } else if (kind == 2) {
+                    } else if (kind == 2 && g_bind_test) {
                         unsigned nvb = 0; uint64_t ba[4] = {0}, bs[4] = {0};
                         if (dmNvnReplayGetVB(i, &nvb, ba, bs) && nvb > 0) {
                             VkBuffer vbs[4]; VkDeviceSize offs[4];
