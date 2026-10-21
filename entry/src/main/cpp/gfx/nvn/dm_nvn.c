@@ -1,4 +1,5 @@
 #define _GNU_SOURCE 1
+#include <sys/uio.h>
 /*
  * dm_nvn.c — NVN 接口层(上游 dm/gfx/nvn/hle_nvn.c 的角色,HOS 最小集)。
  *
@@ -173,7 +174,7 @@ static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 static uint64_t g_draws, g_pipe_hits;
 static uint64_t g_bind_args[8][3]; static int g_bind_args_n;
 /* M4-5:把解析结果发布给渲染线程(PROG=0/DRAW=1),由 dm_vk 在 render pass 内执行 */
-typedef struct { int kind; char k0[17], k1[17]; uint32_t a, b; } dm_rp_t;
+typedef struct { int kind; char k0[17], k1[17]; uint32_t a, b; unsigned nvb; uint64_t vba[4], vbs[4]; } dm_rp_t;
 static dm_rp_t g_rp[4096];
 static _Atomic int g_rp_n;
 int dmNvnReplayCount(void) { return g_rp_n; }
@@ -185,6 +186,8 @@ int dmNvnReplayGet(int i, int *kind, char *k0, char *k1, unsigned *a, unsigned *
     *a = g_rp[i].a; *b = g_rp[i].b;
     return 1;
 }
+static void dm_rp_add_vb(unsigned n, const uint64_t *addr, const uint64_t *sz);
+static int dm_rp_vb_index = -1;
 static void dm_rp_add(int kind, const char *k0, const char *k1, unsigned a, unsigned b)
 {
     int n = g_rp_n;
@@ -193,7 +196,24 @@ static void dm_rp_add(int kind, const char *k0, const char *k1, unsigned a, unsi
     if (k0) memcpy(g_rp[n].k0, k0, 17); else g_rp[n].k0[0] = 0;
     if (k1) memcpy(g_rp[n].k1, k1, 17); else g_rp[n].k1[0] = 0;
     g_rp[n].a = a; g_rp[n].b = b;
+    g_rp[n].nvb = 0;
     g_rp_n = n + 1;
+    dm_rp_vb_index = (kind == 2) ? n : dm_rp_vb_index;
+}
+static void dm_rp_add_vb(unsigned n, const uint64_t *addr, const uint64_t *sz)
+{
+    int i = dm_rp_vb_index;
+    if (i < 0 || i >= g_rp_n) return;
+    if (n > 4) n = 4;
+    g_rp[i].nvb = n;
+    for (unsigned k = 0; k < n; k++) { g_rp[i].vba[k] = addr[k]; g_rp[i].vbs[k] = sz[k]; }
+}
+int dmNvnReplayGetVB(int i, unsigned *n, uint64_t *addr, uint64_t *sz)
+{
+    if (i < 0 || i >= g_rp_n) return 0;
+    *n = g_rp[i].nvb;
+    for (unsigned k = 0; k < 4; k++) { addr[k] = g_rp[i].vba[k]; sz[k] = g_rp[i].vbs[k]; }
+    return 1;
 }
 typedef struct { char k0[17], k1[17]; } dm_pair_t;
 static dm_pair_t g_req[64]; static int g_req_n;
@@ -408,6 +428,24 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
                     dm_rp_add(0, k0, k1, 0, 0);
                 }
             } else if (o->op == DM_OP_BIND) {
+                if (o->d > 0x1000000000ull) {
+                    unsigned cnt = (unsigned)o->c;
+                    if (cnt > 0 && cnt <= 4) {
+                        uint64_t addr[4] = {0}, sz[4] = {0};
+                        int ok = 1;
+                        for (unsigned k = 0; k < cnt; k++) {
+                            uint64_t pair[2] = {0, 0};
+                            struct iovec liov[2] = {{&pair[0], 8}, {&pair[1], 8}};
+                            struct iovec riov = {(void *)(uintptr_t)(o->d + k * 16), 16};
+                            if (process_vm_readv(getpid(), liov, 2, &riov, 1, 0) != 16) { ok = 0; break; }
+                            addr[k] = pair[0]; sz[k] = pair[1];
+                        }
+                        if (ok) {
+                            dm_rp_add(2, NULL, NULL, (unsigned)o->b, cnt);
+                            dm_rp_add_vb(cnt, addr, sz);
+                        }
+                    }
+                }
                 if (g_bind_args_n < 8 && o->d > 0x1000000000ull) {
                     g_bind_args[g_bind_args_n][0] = o->b; g_bind_args[g_bind_args_n][1] = o->c; g_bind_args[g_bind_args_n][2] = o->d;
                     g_bind_args_n++;
