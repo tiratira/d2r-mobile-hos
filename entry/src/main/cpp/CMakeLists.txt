@@ -26,6 +26,7 @@ add_library(dmhost SHARED
     host/hle_misc.c
     host/hle_account.c
     host/hle_net.c
+    host/hle_vi.c
     host/loader_hos.c
     host/front_hos.c
     host/host_boot.c

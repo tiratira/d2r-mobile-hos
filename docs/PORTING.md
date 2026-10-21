@@ -213,6 +213,7 @@ _init_libc0 → nnosInitialize(hmain,0) → _init_libc1
 | `hle_misc.c` | 14 | aoc(拥有 1 个 DLC)/err(只打日志)/ngc(profanity 掩码写 0)/nsd/pctl |
 | `hle_account.c` | 21 | 本地用户模型(Uid/UserHandle 魔数)/昵称;联网账号接口失败 |
 | `hle_net.c` | 93 | socket/nifm/ssl 离线化:Initialize 成功不建会话,联网调用按 BSD 回 -1/ENETDOWN;`nn::socket::Initialize` 必须接管,否则 SDK 自己走 hipc 连 `sm:` → diag::Abort |
+| `hle_vi.c` | 4 | nn::vi 显示层:Initialize/OpenDefaultDisplay/CreateLayer/GetNativeWindow → 宿主静态对象,不走 vi 服务 |
 | `hle_libc.c` | 6 | getentropy、异常栈查询、`__rel_dyn/plt_*` 数据符号 |
 
 **导入覆盖报告**(`dm_import_report`,启动预检里显示):装载/重定位后扫
