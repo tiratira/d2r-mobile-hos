@@ -38,7 +38,13 @@ static void OnSurfaceCreatedCB(OH_NativeXComponent *component, void *window)
     g_window = reinterpret_cast<OHNativeWindow *>(window);
     dmInputInit();
     dmPlatInit();
-    g_renderer.Start(g_window);
+    /* 优先 Vulkan:EGL 在部分真机拿不到匹配 config,且事后从 UI 线程
+     * Stop EGL 再 Start Vulkan 会和 EGL 渲染线程并发销毁上下文(实测崩在
+     * libEGL/libGLES)。这里直接在 surface 回调里起 Vulkan,EGL 仅兜底。 */
+    if (dmVkStart(g_window) != 0) {
+        DMLOG_E("vk start failed, fallback to EGL");
+        g_renderer.Start(g_window);
+    }
 }
 
 static void OnSurfaceChangedCB(OH_NativeXComponent *component, void *window)
@@ -264,7 +270,9 @@ static napi_value UseVulkan(napi_env env, napi_callback_info info)
     (void)info;
     napi_value result;
     int rc = -1;
-    if (g_window != nullptr) {
+    if (dmVkRunning()) {
+        rc = 0;               /* 已在 surface 回调里起好,不要重复 Stop/Start */
+    } else if (g_window != nullptr) {
         g_renderer.Stop();
         rc = dmVkStart(g_window);
     }
