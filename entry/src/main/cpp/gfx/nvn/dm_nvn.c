@@ -24,6 +24,7 @@ extern uint64_t dmVkUploadCount(void);
 extern uint64_t dmVkLoadShaderModule(const char *path);
 extern uint64_t dmVkCreateComputePipeline(const char *path);
 extern uint64_t dmVkPipelineCount(void);
+extern int dmVkPipelineError(void);
 extern uint64_t dmVkShaderTestCount(void);
 
 #define NVN_TABLE_MAX 512
@@ -732,22 +733,18 @@ static void *nvn_stats_thread(void *arg)
                 px[i * 4 + 2] = 0x40; px[i * 4 + 3] = 0xff;
             }
             uint64_t h = dmVkUploadTexture(px, 64, 64, 37 /* VK_FORMAT_R8G8B8A8_UNORM */, 4);
-            uint64_t sm = dmVkLoadShaderModule("/data/storage/el2/base/haps/entry/files/test.spv");
-            uint64_t pp = dmVkCreateComputePipeline("/data/storage/el2/base/haps/entry/files/test_cs.spv");
-            DMLOG_I("M3 compute pipeline test=%{public}llu", (unsigned long long)pp);
-            DMLOG_I("M3 shader module test=%{public}llu", (unsigned long long)sm);
             DMLOG_I("M2 tex upload self-test h=%{public}llx count=%{public}llu",
                     (unsigned long long)h, (unsigned long long)dmVkUploadCount());
         }
         /* hilog 在热路径下轮转很快,计数落盘更可靠 */
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu shader=%llu pipe=%llu\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu shader=%llu pipe=%llu pipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
                     (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount(),
                     (unsigned long long)dmVkShaderTestCount(),
-                    (unsigned long long)dmVkPipelineCount());
+                    (unsigned long long)dmVkPipelineCount(), dmVkPipelineError());
             fclose(f);
         }
     }

@@ -33,6 +33,8 @@ static _Atomic uint64_t g_vk_frames;
 static VkDevice g_upload_dev;
 static VkQueue g_upload_queue;
 static VkPhysicalDevice g_upload_pd;
+extern "C" uint64_t dmVkLoadShaderModule(const char *path);
+extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
 
 extern "C" void dmVkSetClearColor(float r, float g, float b, float a)
 {
@@ -183,6 +185,10 @@ static void *vk_loop(void *arg)
     }
     vkGetDeviceQueue(v.dev, v.qfam, 0, &v.queue);
     g_upload_dev = v.dev; g_upload_queue = v.queue; g_upload_pd = pd;
+    DMLOG_I("M3 shader module test=%{public}llu",
+            (unsigned long long)dmVkLoadShaderModule("/data/storage/el2/base/haps/entry/files/test.spv"));
+    DMLOG_I("M3 compute pipeline test=%{public}llu",
+            (unsigned long long)dmVkCreateComputePipeline("/data/storage/el2/base/haps/entry/files/test_cs.spv"));
 
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, v.surf, &caps);
@@ -545,7 +551,9 @@ extern "C" uint64_t dmVkLoadShaderModule(const char *path)
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
 extern "C" uint64_t dmVkPipelineCount(void);
 static _Atomic uint64_t g_pipelines;
+static _Atomic int g_pipe_err = -123;
 extern "C" uint64_t dmVkPipelineCount(void) { return g_pipelines; }
+extern "C" int dmVkPipelineError(void) { return g_pipe_err; }
 
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path)
 {
@@ -587,7 +595,8 @@ extern "C" uint64_t dmVkCreateComputePipeline(const char *path)
     vkDestroyDescriptorSetLayout(g_upload_dev, dsl, nullptr);
     vkDestroyShaderModule(g_upload_dev, mod, nullptr);
     free(buf);
-    if (r != VK_SUCCESS) { DMLOG_E("M3 compute pipeline r=%d stage=%d", (int)r, (int)cpci.stage.stage); return 0; }
+    if (r != VK_SUCCESS) { g_pipe_err = (int)r; return 0; }
+    g_pipe_err = 0;
     g_pipelines++;
     return 1;
 }
