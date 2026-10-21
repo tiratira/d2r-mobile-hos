@@ -966,11 +966,25 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
                 int found = -1;
                 for (uint32_t b = 0; b < nvb; b++) if (vbs[b].binding == stream) { found = (int)b; break; }
                 if (found < 0 && nvb < 8) { vbs[nvb].binding = stream; vbs[nvb].stride = stride; vbs[nvb].inputRate = VK_VERTEX_INPUT_RATE_VERTEX; nvb++; }
-                int comps = (k < vin_n) ? (int)vin[k].comp : 4;
-                int ctype = (k < vin_n) ? (int)vin[k].ctype : 1;
-                VkFormat f;
-                if (ctype == 1) f = comps == 1 ? VK_FORMAT_R32_SFLOAT : comps == 2 ? VK_FORMAT_R32G32_SFLOAT : comps == 3 ? VK_FORMAT_R32G32B32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
-                else f = comps == 1 ? VK_FORMAT_R32_SINT : comps == 2 ? VK_FORMAT_R32G32_SINT : comps == 3 ? VK_FORMAT_R32G32B32_SINT : VK_FORMAT_R32G32B32A32_SINT;
+                /* NVN 格式字节 → VkFormat(按 nvn.h 枚举;nvn_fmt_mtl.c 同索引可查) */
+                uint32_t nfmt = lva[k] & 0xFF;
+                VkFormat f = VK_FORMAT_UNDEFINED;
+                switch (nfmt) {
+                    case 0x25: f = VK_FORMAT_R8G8B8A8_UNORM; break;      /* RGBA8 */
+                    case 0x26: f = VK_FORMAT_R8G8B8A8_SNORM; break;      /* RGBA8SN */
+                    case 0x27: f = VK_FORMAT_R8G8B8A8_UINT; break;       /* RGBA8UI */
+                    case 0x28: f = VK_FORMAT_R8G8B8A8_SINT; break;       /* RGBA8I */
+                    case 0x2E: f = VK_FORMAT_R32G32B32A32_SFLOAT; break; /* RGBA32F */
+                    case 0x5F: f = VK_FORMAT_R16G16B16_USCALED; break;   /* RGB16_UI2F */
+                    default: break;
+                }
+                if (f == VK_FORMAT_UNDEFINED) {
+                    int comps = (k < vin_n) ? (int)vin[k].comp : 4;
+                    int ctype = (k < vin_n) ? (int)vin[k].ctype : 1;
+                    if (comps < 1 || comps > 4) comps = 4;
+                    if (ctype == 1) f = comps == 1 ? VK_FORMAT_R32_SFLOAT : comps == 2 ? VK_FORMAT_R32G32_SFLOAT : comps == 3 ? VK_FORMAT_R32G32B32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+                    else f = comps == 1 ? VK_FORMAT_R32_SINT : comps == 2 ? VK_FORMAT_R32G32_SINT : comps == 3 ? VK_FORMAT_R32G32B32_SINT : VK_FORMAT_R32G32B32A32_SINT;
+                }
                 vas[nva].location = (k < vin_n) ? vin[k].loc : (uint32_t)k;
                 vas[nva].binding = stream; vas[nva].offset = off; vas[nva].format = f; nva++;
             }
