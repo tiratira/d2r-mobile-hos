@@ -161,6 +161,7 @@ typedef struct { uint32_t magic; uint32_t pad; uint64_t size; void *pool; int64_
 typedef struct {
     uint32_t magic; uint32_t recording;
     uint64_t used;
+    uint8_t *own; size_t own_sz;
     void *dev; const void *pool; int64_t pool_off; uint64_t pool_size;
     void *ctl; uint64_t ctl_size;
     uint64_t handles, ops, clears;
@@ -259,6 +260,8 @@ enum { DM_OP_END = 0, DM_OP_CLEAR, DM_OP_BARRIER, DM_OP_DRAW, DM_OP_BIND, DM_OP_
 static nvn_cb_t *g_cur_cb;
 static uint64_t g_addcmd_n, g_begin_n, g_end_n, g_cbinit_n;
 static void *g_addcmd_cb[4]; static void *g_addcmd_pool[4]; static long long g_addcmd_off[4]; static unsigned long long g_addcmd_size[4];
+static uint64_t g_begin_alias_n;
+static void *g_alias_begin[8]; static void *g_alias_match[8]; static int g_alias_n;
 static void *g_cb_ev[64]; static uint8_t g_cb_kind[64]; static int g_cb_ev_n;
 static void dm_cb_ev(void *cb, int kind) { if (g_cb_ev_n < 64) { g_cb_ev[g_cb_ev_n] = cb; g_cb_kind[g_cb_ev_n] = (uint8_t)kind; g_cb_ev_n++; } }
 static void *g_last_base; static uint64_t g_last_used; static void *g_last_pool;
@@ -266,15 +269,29 @@ static uint64_t g_dm_ops;
 static uint32_t g_op_hist[16];
 
 static void dm_op_write4(nvn_cb_t *cb, uint32_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
+static uint8_t *dm_cb_stream(nvn_cb_t *cb, size_t need)
+{
+    if (cb == NULL) return NULL;
+    const nvn_pool_t *pl = (const nvn_pool_t *)cb->pool;
+    if (pl != NULL && pl->mem != NULL) return (uint8_t *)pl->mem + (size_t)cb->pool_off;
+    /* 没有命令内存(引擎大量 CB 如此):用宿主自有缓冲,保证 op 流可回放 */
+    if (cb->own == NULL || cb->own_sz < need) {
+        size_t nsz = need > 65536 ? need : 65536;
+        uint8_t *nb = (uint8_t *)realloc(cb->own, nsz);
+        if (nb == NULL) return NULL;
+        cb->own = nb; cb->own_sz = nsz;
+    }
+    return cb->own;
+}
 static void dm_op_write(nvn_cb_t *cb, uint32_t op, const void *p, size_t n)
 {
     if (cb == NULL) return;
-    const nvn_pool_t *pl = (const nvn_pool_t *)cb->pool;
-    if (pl == NULL || pl->mem == NULL) return;
+    uint8_t *base = dm_cb_stream(cb, (size_t)cb->used + sizeof(dm_op_t) + 8);
+    if (base == NULL) return;
     size_t need = sizeof(dm_op_t);
     size_t cur = (size_t)cb->used;
-    if (cur + need > (size_t)cb->pool_size) return;
-    dm_op_t *o = (dm_op_t *)((uint8_t *)pl->mem + (size_t)cb->pool_off + cur);
+    if (cur + need > (size_t)(cb->pool ? cb->pool_size : cb->own_sz)) return;
+    dm_op_t *o = (dm_op_t *)(base + cur);
     memset(o, 0, sizeof(*o));
     o->op = op; o->n = (uint32_t)n;
     if (n) memcpy(o->f, p, n);
@@ -285,11 +302,11 @@ static void dm_op_write(nvn_cb_t *cb, uint32_t op, const void *p, size_t n)
 static void dm_op_write4(nvn_cb_t *cb, uint32_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
 {
     if (cb == NULL) return;
-    const nvn_pool_t *pl = (const nvn_pool_t *)cb->pool;
-    if (pl == NULL || pl->mem == NULL) return;
+    uint8_t *base4 = dm_cb_stream(cb, (size_t)cb->used + sizeof(dm_op_t) + 8);
+    if (base4 == NULL) return;
     size_t cur = (size_t)cb->used;
-    if (cur + sizeof(dm_op_t) > (size_t)cb->pool_size) return;
-    dm_op_t *o = (dm_op_t *)((uint8_t *)pl->mem + (size_t)cb->pool_off + cur);
+    if (cur + sizeof(dm_op_t) > (size_t)(cb->pool ? cb->pool_size : cb->own_sz)) return;
+    dm_op_t *o = (dm_op_t *)(base4 + cur);
     memset(o, 0, sizeof(*o));
     o->op = op; o->a = a; o->b = b; o->c = c; o->d = d;
     cb->used += sizeof(dm_op_t);
@@ -434,6 +451,14 @@ static void nvn_cb_begin(void *c)
 {
     g_begin_n++; dm_cb_ev(c, 2);
     if (c == NULL) return;
+    {
+        int matched = 0;
+        for (int i = 0; i < 4; i++) if (g_addcmd_cb[i] == c) matched = 1;
+        if (!matched && g_addcmd_n > 0) {
+            g_begin_alias_n++;
+            if (g_alias_n < 8) { g_alias_begin[g_alias_n] = c; g_alias_match[g_alias_n] = g_addcmd_cb[0]; g_alias_n++; }
+        }
+    }
     ((nvn_cb_t *)c)->recording = 1;
     ((nvn_cb_t *)c)->used = 0;
     g_cur_cb = (nvn_cb_t *)c;
@@ -449,22 +474,18 @@ static uint64_t nvn_cb_end(void *c)
     o->recording = 0;
     /* NVNcommandHandle 是「命令内存里的地址」,不是自增计数;引擎会拿着它当
      * 指针/地址用。把一条 8 字节命令头写进游戏给的命令内存,返回其地址。 */
-    uint8_t *base = NULL;
-    const nvn_pool_t *p = (const nvn_pool_t *)o->pool;
-    if (p != NULL && p->mem != NULL) {
-        base = (uint8_t *)p->mem + (size_t)o->pool_off;
+    uint8_t *base = dm_cb_stream(o, (size_t)o->used + sizeof(dm_op_t) + 8);
+    if (base != NULL) {
         dm_op_t *e = (dm_op_t *)(base + (size_t)o->used);
-        if ((size_t)o->used + sizeof(dm_op_t) <= (size_t)o->pool_size) {
+        size_t cap = (size_t)(o->pool ? o->pool_size : o->own_sz);
+        if ((size_t)o->used + sizeof(dm_op_t) <= cap) {
             memset(e, 0, sizeof(*e));
             e->op = DM_OP_END;
             o->used += sizeof(dm_op_t);
         }
-    } else {
-        static uint8_t fallback[4096];
-        base = fallback;
     }
     /* 句柄 = 本段命令流首地址(固定),Submit 从这里顺序解析 op */
-    g_last_base = base; g_last_used = (uint64_t)o->used; g_last_pool = (void *)p;
+    g_last_base = base; g_last_used = (uint64_t)o->used; g_last_pool = o->pool;
     o->handles++;
     g_cur_cb = NULL;
     if (o->handles <= 2) {
@@ -1000,6 +1021,11 @@ static void *nvn_stats_thread(void *arg)
                                     (unsigned long long)(uintptr_t)g_addcmd_cb[i],
                                     (unsigned long long)(uintptr_t)g_addcmd_pool[i],
                                     g_addcmd_off[i], g_addcmd_size[i]);
+                        fprintf(cf, "begin_alias=%llu\n", (unsigned long long)g_begin_alias_n);
+                        for (int i = 0; i < g_alias_n; i++)
+                            fprintf(cf, "alias begin=%llx ref=%llx delta=%lld\n", (unsigned long long)(uintptr_t)g_alias_begin[i],
+                                    (unsigned long long)(uintptr_t)g_alias_match[i],
+                                    (long long)((intptr_t)g_alias_begin[i] - (intptr_t)g_alias_match[i]));
                         for (int i = 0; i < g_cb_ev_n; i++)
                             fprintf(cf, "ev kind=%u cb=%llx\n", g_cb_kind[i], (unsigned long long)(uintptr_t)g_cb_ev[i]);
                         fclose(cf);
