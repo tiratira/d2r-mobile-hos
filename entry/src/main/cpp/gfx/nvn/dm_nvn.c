@@ -31,6 +31,7 @@ extern uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPat
 extern uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
 extern int dmVkPipelineCacheCount(void);
 extern int dmVkPipelineObjCount(void);
+extern uint64_t dmVkCachedPipeline(const char *k0, const char *k1);
 extern uint64_t dmVkGraphicsPipeCount(void);
 extern int dmVkGraphicsPipeError(void);
 extern uint64_t dmVkShaderTestCount(void);
@@ -166,6 +167,8 @@ typedef struct {
 
 static uint32_t g_nvn_devs, g_nvn_queues, g_nvn_wins, g_nvn_cbs, g_nvn_pools;
 static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
+static uint64_t g_draws, g_pipe_hits;
+static int dmNvnProgramKeysOf(void *prog, char *k0, char *k1);
 static uint64_t g_nvn_bufs, g_nvn_textures;
 
 /* ---- 真机实测:客体会读「NVN device 容器」base+0x448 处的一张函数表 ----
@@ -249,12 +252,13 @@ static uint32_t nvn_queue_init(void *q, const void *b)
  * nvnQueueSubmitCommands 解析 op 流执行(当前先做 clear / 计数,Vulkan draw 回放 M4 接入)。
  */
 #define DM_OP_WORDS 8
-typedef struct { uint32_t op, n; uint64_t a, b, c; float f[4]; } dm_op_t;
+typedef struct { uint32_t op, n; uint64_t a, b, c, d; float f[4]; } dm_op_t;
 enum { DM_OP_END = 0, DM_OP_CLEAR, DM_OP_BARRIER, DM_OP_DRAW, DM_OP_BIND, DM_OP_COPY, DM_OP_DISPATCH };
 static nvn_cb_t *g_cur_cb;
 static uint64_t g_dm_ops;
 static uint32_t g_op_hist[16];
 
+static void dm_op_write4(nvn_cb_t *cb, uint32_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d);
 static void dm_op_write(nvn_cb_t *cb, uint32_t op, const void *p, size_t n)
 {
     if (cb == NULL) return;
@@ -271,6 +275,20 @@ static void dm_op_write(nvn_cb_t *cb, uint32_t op, const void *p, size_t n)
     g_dm_ops++;
     if (op < 16) g_op_hist[op]++;
 }
+static void dm_op_write4(nvn_cb_t *cb, uint32_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d)
+{
+    if (cb == NULL) return;
+    const nvn_pool_t *pl = (const nvn_pool_t *)cb->pool;
+    if (pl == NULL || pl->mem == NULL) return;
+    size_t cur = (size_t)cb->used;
+    if (cur + sizeof(dm_op_t) > (size_t)cb->pool_size) return;
+    dm_op_t *o = (dm_op_t *)((uint8_t *)pl->mem + (size_t)cb->pool_off + cur);
+    memset(o, 0, sizeof(*o));
+    o->op = op; o->a = a; o->b = b; o->c = c; o->d = d;
+    cb->used += sizeof(dm_op_t);
+    g_dm_ops++;
+    if (op < 16) g_op_hist[op]++;
+}
 #define DM_REC(name, opcode, argn) \
     static uint64_t rec_##name(uint64_t a, uint64_t b, uint64_t c, uint64_t d) \
     { dm_op_write(g_cur_cb, opcode, (double[]){0}, 0); (void)a; (void)b; (void)c; (void)d; return 0; }
@@ -278,7 +296,7 @@ static void dm_op_write(nvn_cb_t *cb, uint32_t op, const void *p, size_t n)
 static uint64_t op_setviewport(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_BIND, NULL, 0); (void)a;(void)b;(void)c; return 0; }
 static uint64_t op_draw3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_DRAW, NULL, 0); (void)a;(void)b;(void)c; return 0; }
 static uint64_t op_draw4(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { dm_op_write((nvn_cb_t *)cb, DM_OP_DRAW, NULL, 0); (void)a;(void)b;(void)c;(void)d; return 0; }
-static uint64_t op_bind2(uint64_t cb, uint64_t a, uint64_t b) { dm_op_write((nvn_cb_t *)cb, DM_OP_BIND, NULL, 0); (void)a;(void)b; return 0; }
+static uint64_t op_bind2(uint64_t cb, uint64_t a, uint64_t b) { dm_op_write4((nvn_cb_t *)cb, DM_OP_BIND, a, b, 0, 0); return 0; }
 static uint64_t op_bind3(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_BIND, NULL, 0); (void)a;(void)b;(void)c; return 0; }
 static uint64_t op_copy(uint64_t cb, uint64_t a, uint64_t b, uint64_t c, uint64_t d) { dm_op_write((nvn_cb_t *)cb, DM_OP_COPY, NULL, 0); (void)a;(void)b;(void)c;(void)d; return 0; }
 static uint64_t op_dispatch(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { dm_op_write((nvn_cb_t *)cb, DM_OP_DISPATCH, NULL, 0); (void)a;(void)b;(void)c; return 0; }
@@ -294,6 +312,13 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
         for (int k = 0; k < 4096 && o != NULL && o->op != DM_OP_END; k++, o++) {
             if (o->op == DM_OP_CLEAR) {
                 dmVkSetClearColor(o->f[0], o->f[1], o->f[2], o->f[3]);
+            } else if (o->op == DM_OP_BIND && o->b != 0) {
+                char k0[17], k1[17];
+                if (dmNvnProgramKeysOf((void *)(uintptr_t)o->b, k0, k1)) {
+                    if (dmVkCachedPipeline(k0, k1) != 0) g_pipe_hits++;
+                }
+            } else if (o->op == DM_OP_DRAW) {
+                g_draws++;
             }
         }
     }
@@ -417,14 +442,13 @@ static uint64_t nvn_cb_end(void *c)
         static uint8_t fallback[4096];
         base = fallback;
     }
-    uint64_t *h = (uint64_t *)(base + ((o->handles * 8) & 0x7F8));
-    if (base != NULL) *h = 0;
+    /* 句柄 = 本段命令流首地址(固定),Submit 从这里顺序解析 op */
     o->handles++;
     g_cur_cb = NULL;
     if (o->handles <= 2) {
-        DMLOG_I("NVN cb end h=%{public}llx", (unsigned long long)(uintptr_t)h);
+        DMLOG_I("NVN cb end h=%{public}llx", (unsigned long long)(uintptr_t)base);
     }
-    return (uint64_t)(uintptr_t)h;
+    return (uint64_t)(uintptr_t)base;
 }
 static uint32_t nvn_cb_isrec(const void *c) { return c ? ((const nvn_cb_t *)c)->recording : 0; }
 static void nvn_cb_clear_color(void *c, int idx, const float *rgba, int mask)
@@ -742,6 +766,15 @@ static int nvn_texb_getrawclass(const void *b) { (void)b; return 0; }
 typedef struct { uint64_t data; const void *control; } nvn_shader_data_t;
 static char g_prog_keys[512][17];
 static int g_prog_key_n;
+typedef struct { void *prog; char k0[17], k1[17]; } dm_progent_t;
+static dm_progent_t g_progtab[1024];
+static int g_progtab_n;
+static int dmNvnProgramKeysOf(void *prog, char *k0, char *k1)
+{
+    for (int i = 0; i < g_progtab_n; i++)
+        if (g_progtab[i].prog == prog) { memcpy(k0, g_progtab[i].k0, 17); memcpy(k1, g_progtab[i].k1, 17); return 1; }
+    return 0;
+}
 static char g_prog_lines[512][64];
 static int g_prog_line_n;
 static int g_progs;
@@ -750,7 +783,6 @@ static int g_keys_loaded, g_cspipes, g_real_gpipes;
 static void sha256_hex16(const void *in, size_t len, char out[17]);
 static uint32_t nvn_program_setshaders(void *prog, int n, const void *sdv)
 {
-    (void)prog;
     if (n < 0 || n > 6 || sdv == NULL) return 0;
     const nvn_shader_data_t *sd = (const nvn_shader_data_t *)sdv;
     char line[64] = {0};
@@ -767,6 +799,12 @@ static uint32_t nvn_program_setshaders(void *prog, int n, const void *sdv)
             keys_here++;
         }
         g_prog_key_n++;
+    }
+    if (keys_here >= 2 && g_progtab_n < 1024) {
+        dm_progent_t *e = &g_progtab[g_progtab_n++];
+        e->prog = prog;
+        char a[32] = {0}, b[32] = {0};
+        if (sscanf(line, "%31s %31s", a, b) == 2) { memcpy(e->k0, a, 17); memcpy(e->k1, b, 17); }
     }
     if (keys_here && g_prog_line_n < 512) {
         snprintf(g_prog_lines[g_prog_line_n], sizeof(g_prog_lines[0]), "%s", line);
@@ -900,7 +938,8 @@ static void *nvn_stats_thread(void *arg)
                     }
                     fclose(pf2);
                 }
-                DMLOG_I("M4 shader keys loaded=%d cspipes=%d real_gpipes=%d", g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(), g_real_gpipes);
+                DMLOG_I("M4 shader keys loaded=%d cspipes=%d real_gpipes=%d", g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(),
+                    (unsigned long long)g_draws, (unsigned long long)g_pipe_hits, g_real_gpipes);
             }
             DMLOG_I("M2 tex upload self-test h=%{public}llx count=%{public}llu",
                     (unsigned long long)h, (unsigned long long)dmVkUploadCount());
@@ -909,12 +948,13 @@ static void *nvn_stats_thread(void *arg)
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
             fprintf(f, "progs=%d keys=%d ", g_progs, g_prog_key_n);
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d rgpipe=%d pcache=%d pobj=%d pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d rgpipe=%d pcache=%d pobj=%d draws=%llu pbh=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
                     (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount(),
                     (unsigned long long)g_nvn_bufs, (unsigned long long)g_nvn_textures,
                     (unsigned long long)dmVkShaderTestCount(), g_keys_loaded, g_cspipes, g_real_gpipes, dmVkPipelineCacheCount(), dmVkPipelineObjCount(),
+                    (unsigned long long)g_draws, (unsigned long long)g_pipe_hits,
                     (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);
