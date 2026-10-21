@@ -36,7 +36,7 @@ static VkPhysicalDevice g_upload_pd;
 static VkPipeline g_gpipe;
 static VkPipelineLayout g_gpipe_layout;
 static VkRenderPass g_gpipe_rp;
-static int g_draw_test = 1;   /* 实验开关 */
+static int g_draw_test;   /* 实验开关:开时回放真实 draw(当前会 hung,默认关) */
 static VkDescriptorSet g_gpipe_set;
 static VkDescriptorPool g_dummy_pool;
 static VkBuffer g_dummy_buf;
