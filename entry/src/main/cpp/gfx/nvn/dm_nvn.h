@@ -5,6 +5,7 @@
 #define DM_NVN_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /*
  * 上游:游戏 main 模块只导入一个 NVN 入口 nvnBootstrapLoader,宿主以
@@ -31,6 +32,10 @@ void dmNvnInit(void);
 
 /* 已解析的宿主函数地址 -> NVN 名字(崩溃现场 GOT 槽反查用)。 */
 const char *dmNvnNameForAddr(uint64_t addr);
+
+/* 纹理存储 → 线性(M2 资源层;回放上传用) */
+int dmNvnTextureLinearize(const void *tex, unsigned level, unsigned layer,
+                          const void *src_storage, void *dst, size_t dst_pitch);
 
 /* 已登记入口数 / 被调用过的入口数(观测骨架是否被走到)。 */
 uint32_t dmNvnEntryCount(void);

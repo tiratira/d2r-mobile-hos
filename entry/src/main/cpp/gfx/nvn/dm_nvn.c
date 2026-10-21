@@ -9,6 +9,9 @@
  * gfx/dm_vk 的清屏动画。
  */
 #include "gfx/nvn/dm_nvn.h"
+#include "gfx/tex/nvn_tex.h"
+#include "gfx/tex/nvn_deswizzle.h"
+#include "gfx/tex/nvn_bcdec.h"
 #include "host/dm.h"
 
 #include <pthread.h>
@@ -641,7 +644,8 @@ static int64_t nvn_bufb_getoff(const void *b) { return b ? ((const nvn_bufb_t *)
 
 
 /* ---- 纹理对象:GetStorageSize/GetViewOffset 都是直接返回值(nvn.h) ---- */
-typedef struct { uint32_t magic; uint32_t pad; uint64_t size; uint64_t align; void *dev; } nvn_tex_t;
+typedef struct { uint32_t magic; uint32_t pad; uint64_t size; uint64_t align; void *dev;
+    nvn_texdesc desc; } nvn_tex_t;
 static uint32_t nvn_texture_init2(void *t, const void *b)
 {
     if (t == NULL) return 0;
@@ -650,6 +654,16 @@ static uint32_t nvn_texture_init2(void *t, const void *b)
     o->magic = 0x58544554U;
     o->size = nvn_texb_size(b);
     o->align = 4096;
+    if (b != NULL) {
+        const nvn_texb_t *tb = (const nvn_texb_t *)b;
+        o->desc.target = (int)tb->target;
+        o->desc.format = (int)tb->format;
+        o->desc.samples = tb->samples ? tb->samples : 1;
+        o->desc.width = tb->width > 0 ? (uint32_t)tb->width : 1;
+        o->desc.height = tb->height > 0 ? (uint32_t)tb->height : 1;
+        o->desc.depth = tb->depth > 0 ? (uint32_t)tb->depth : 1;
+        o->desc.levels = tb->levels > 0 ? (uint32_t)tb->levels : 1;
+    }
     return 1;
 }
 static int nvn_texture_get_storage_size(const void *t)
@@ -716,6 +730,22 @@ static void *nvn_stats_thread(void *arg)
     return NULL;
 }
 
+
+
+/* M2 资源层:把一张已初始化纹理的存储按 Tegra 块线性解到线性缓冲(回放上传前用)。
+ * dst_pitch 传 0 时按本级块宽自动计算;返回 0 成功,-1 不支持。 */
+int dmNvnTextureLinearize(const void *tex, unsigned level, unsigned layer,
+                          const void *src_storage, void *dst, size_t dst_pitch)
+{
+    const nvn_tex_t *t = (const nvn_tex_t *)tex;
+    if (t == NULL || src_storage == NULL || dst == NULL) return -1;
+    if (dst_pitch == 0) {
+        uint32_t rb = 0, rows = 0, slices = 0, bpb = 0; uint64_t base = 0; unsigned th = 0, td = 0;
+        if (nvn_deswizzle_geom(&t->desc, level, layer, &rb, &rows, &slices, &base, &th, &td, &bpb) != 0) return -1;
+        dst_pitch = rb;
+    }
+    return nvn_deswizzle(&t->desc, level, layer, src_storage, dst, dst_pitch);
+}
 
 void dmNvnInit(void)
 

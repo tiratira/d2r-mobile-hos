@@ -28,6 +28,9 @@ add_library(dmhost SHARED
     host/hle_friends.c
     host/hle_audio_srv.c
     host/hle_os_event.c
+    gfx/tex/nvn_tex.c
+    gfx/tex/nvn_deswizzle.c
+    gfx/tex/nvn_bcdec.c
     host/hle_net.c
     host/hle_vi.c
     host/loader_hos.c
