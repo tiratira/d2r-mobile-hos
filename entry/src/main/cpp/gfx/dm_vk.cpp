@@ -500,3 +500,40 @@ extern "C" uint64_t dmVkUploadTexture(const void *pixels, uint32_t w, uint32_t h
     }
     return r;
 }
+
+
+/* ================= M3-1:SPIR-V 着色器模块加载 =================
+ * 校验阶段:从文件读入离线翻译的 <key>.spv,创建 VkShaderModule 再销毁,
+ * 证明「6704 份 SPIR-V 资产 → Vulkan」这条链在真机上可用。 */
+extern "C" uint64_t dmVkLoadShaderModule(const char *path);
+extern "C" uint64_t dmVkShaderTestCount(void);
+static _Atomic uint64_t g_shader_tests;
+extern "C" uint64_t dmVkShaderTestCount(void) { return g_shader_tests; }
+
+extern "C" uint64_t dmVkLoadShaderModule(const char *path)
+{
+    if (g_upload_dev == VK_NULL_HANDLE || path == NULL) return 0;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return 0;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n < 20 || n > (1 << 24)) { fclose(f); return 0; }
+    void *buf = malloc((size_t)n);
+    if (buf == NULL) { fclose(f); return 0; }
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n) { free(buf); fclose(f); return 0; }
+    fclose(f);
+    uint32_t magic = 0;
+    memcpy(&magic, buf, 4);
+    if (magic != 0x07230203u) { free(buf); return 0; }
+    VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    sci.codeSize = (size_t)n;
+    sci.pCode = (const uint32_t *)buf;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(g_upload_dev, &sci, nullptr, &mod);
+    free(buf);
+    if (r != VK_SUCCESS || mod == VK_NULL_HANDLE) return 0;
+    vkDestroyShaderModule(g_upload_dev, mod, nullptr);
+    g_shader_tests++;
+    return 1;
+}
