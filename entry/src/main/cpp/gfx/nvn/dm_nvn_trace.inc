@@ -764,3 +764,5 @@ static void dm_nvn_register_traces(void) {
     dmNvnRegister("nvnWindowSetNumActiveTextures", (nvn_func_t)nvn_trace_nvnWindowSetNumActiveTextures);
     dmNvnRegister("nvnWindowSetPresentInterval", (nvn_func_t)nvn_trace_nvnWindowSetPresentInterval);
 }
+
+

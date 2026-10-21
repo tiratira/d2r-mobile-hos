@@ -32,6 +32,9 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 extern void dmVkSetClearColor(float r, float g, float b, float a);
 static float g_nvn_clear[4] = {0.10f, 0.04f, 0.03f, 1.0f};
 
+/* 占位返回用的非空缓冲:让未实现的 NVN 入口返回非 0,避免引擎把空指针当对象/函数表用 */
+uint8_t dm_nvn_dummy[0x100];
+
 /* 未知 NVN 入口的统一占位函数:返回 0(NVN 句柄/结果),不跳空 */
 static uint64_t nvn_unimpl_fn(void)
 {
@@ -143,6 +146,7 @@ static void nvn_dev_finalize(void *d) { if (d) ((nvn_dev_t *)d)->magic = 0; }
 static void nvn_dev_get_integer(const void *d, int info, int *out)
 {
     (void)d; (void)info;
+    /* 实验:引擎用它查询显存/尺寸类信息,0 可能导致后续 0 字节 arena */
     if (out) *out = 0;
 }
 static void nvn_dev_set_label(const void *d, const char *s) { (void)d; (void)s; }
@@ -172,6 +176,7 @@ static uint32_t nvn_queue_init(void *q, const void *b)
 }
 static void nvn_queue_submit(void *q, int n, const void *handles)
 {
+    DMLOG_I("NVN queue submit q=%{public}llx n=%{public}d", (unsigned long long)(uintptr_t)q, n);
     (void)handles;
     if (q) ((nvn_queue_t *)q)->submits++;
     g_nvn_submits++;
@@ -225,6 +230,7 @@ static void nvn_poolb_setmem(void *b, void *m) { if (b) ((nvn_poolb_t *)b)->mem 
 static void nvn_poolb_setflags(void *b, int f) { if (b) ((nvn_poolb_t *)b)->flags = (uint32_t)f; }
 static uint32_t nvn_pool_init(void *p, const void *b)
 {
+    DMLOG_I("NVN pool init p=%{public}llx", (unsigned long long)(uintptr_t)p);
     if (p == NULL) return 0;
     memset(p, 0, sizeof(nvn_pool_t));
     ((nvn_pool_t *)p)->magic = NVN_MAGIC_POOL;
@@ -251,13 +257,14 @@ static void nvn_cb_finalize(void *c) { if (c) ((nvn_cb_t *)c)->magic = 0; }
 static void nvn_cb_setmemcb(void *c, void *fn, void *data) { (void)c; (void)fn; (void)data; }
 static void nvn_cb_addcmdmem(void *c, const void *pool, int64_t off, uint64_t n)
 {
+    DMLOG_I("NVN cb addcmd pool=%{public}llx off=%{public}lld n=%{public}llu", (unsigned long long)(uintptr_t)pool, (long long)off, (unsigned long long)n);
     if (c) { ((nvn_cb_t *)c)->pool = pool; ((nvn_cb_t *)c)->pool_off = off; ((nvn_cb_t *)c)->pool_size = n; }
 }
 static void nvn_cb_addctlmem(void *c, void *m, uint64_t n)
 {
     if (c) { ((nvn_cb_t *)c)->ctl = m; ((nvn_cb_t *)c)->ctl_size = n; }
 }
-static void nvn_cb_begin(void *c) { if (c) ((nvn_cb_t *)c)->recording = 1; }
+static void nvn_cb_begin(void *c) { if (c) { ((nvn_cb_t *)c)->recording = 1; DMLOG_I("NVN cb begin c=%{public}llx", (unsigned long long)(uintptr_t)c); } }
 static uint64_t nvn_cb_end(void *c)
 {
     if (c == NULL) return 0;
@@ -323,17 +330,28 @@ static uint32_t nvn_texture_init(void *t, void *d) { return nvn_generic_init(t, 
 static uint32_t nvn_sampler_init(void *s, void *d) { return nvn_generic_init(s, d, 0x504d4153U); }
 static uint32_t nvn_buffer_init(void *b, void *d, uint64_t flags) { (void)flags; return nvn_generic_init(b, d, 0x4655424eU); }
 
-/* ---- 内存池查询:返回池内偏移的宿主指针(命令录制里当作 GPU 地址占位) ---- */
-static uint64_t nvn_pool_addr(const void *pool, int64_t off)
+/* ---- 内存池查询 ---- */
+/* nvnMemoryPoolGetBufferAddress(const NVNmemoryPool*) -> NVNbufferAddress
+ * (没有 offset 参数!之前按 (pool, off) 实现,把引擎传的指针当成偏移,
+ * 返回了越界地址;真机日志里 off=409355664032 就是铁证。) */
+static uint64_t nvn_pool_addr(const void *pool)
 {
     const nvn_pool_t *p = (const nvn_pool_t *)pool;
     if (p == NULL) return 0;
-    return (uint64_t)(uintptr_t)((uint8_t *)p->mem + (size_t)off);
+    return (uint64_t)(uintptr_t)p->mem;
 }
 static uint64_t nvn_pool_map(void *pool) { const nvn_pool_t *p = pool; return p ? (uint64_t)(uintptr_t)p->mem : 0; }
-static uint64_t nvn_pool_map_virtual(void *pool, int64_t off, uint64_t n) { (void)n; return nvn_pool_addr(pool, off); }
+/* nvnMemoryPoolMapVirtual(pool, count, const NVNmappingRequest*) -> NVNboolean */
+static uint32_t nvn_pool_map_virtual(void *pool, int count, const void *req)
+{
+    (void)pool; (void)count; (void)req;
+    return 1;
+}
 static uint64_t nvn_pool_get_size(const void *pool) { const nvn_pool_t *p = pool; return p ? p->size : 0; }
-static void nvn_pool_get_flags(const void *pool, int *out) { (void)pool; if (out) *out = 0; }
+static uint32_t nvn_pool_get_flags(const void *pool) { (void)pool; return 0; }   /* NVNmemoryPoolFlags(枚举,直接返回) */
+static uint64_t nvn_poolb_get_mem(const void *b) { const nvn_poolb_t *q = b; return q ? (uint64_t)(uintptr_t)q->mem : 0; }
+static uint64_t nvn_poolb_get_size(const void *b) { const nvn_poolb_t *q = b; return q ? q->size : 0; }
+static uint32_t nvn_poolb_get_flags(const void *b) { const nvn_poolb_t *q = b; return q ? q->flags : 0; }
 static void nvn_pool_flush(void *pool, int64_t off, uint64_t n) { (void)pool; (void)off; (void)n; }
 static void nvn_pool_invalidate(void *pool, int64_t off, uint64_t n) { (void)pool; (void)off; (void)n; }
 static void nvn_pool_finalize(void *pool) { if (pool) ((nvn_pool_t *)pool)->magic = 0; }
@@ -341,6 +359,7 @@ static void nvn_pool_finalize(void *pool) { if (pool) ((nvn_pool_t *)pool)->magi
 /* ---- 队列/窗口 builder 的查询 ---- */
 static uint64_t nvn_qb_get_qmemsz(const void *b)
 {
+    DMLOG_I("NVN qb get qmemsz b=%{public}llx", (unsigned long long)(uintptr_t)b);
     const nvn_queueb_t *q = b;
     if (q == NULL) return 0;
     return q->cmdsz + q->compsz + q->ctlsz + q->flush;
@@ -362,8 +381,13 @@ static uint32_t nvn_queue_acquire(void *q, const void *tex) { (void)q; (void)tex
 static uint32_t nvn_window_acquire(void *w, const void *tex) { (void)w; (void)tex; return 1; }
 static void nvn_window_finalize(void *w) { if (w) ((nvn_win_t *)w)->magic = 0; }
 static void nvn_window_set_interval(void *w, int n) { if (w) ((nvn_win_t *)w)->interval = n; }
-static void nvn_window_get_interval(const void *w, int *out) { if (w && out) *out = ((const nvn_win_t *)w)->interval; }
-static void nvn_window_get_native(const void *w, void **out) { if (w && out) *out = ((const nvn_win_t *)w)->native; }
+/* nvnWindowGetPresentInterval(window) -> int, nvnWindowGetNativeWindow(window) -> NVNnativeWindow */
+static int nvn_window_get_interval(const void *w) { return w ? ((const nvn_win_t *)w)->interval : 0; }
+static void *nvn_window_get_native(const void *w) { return w ? ((const nvn_win_t *)w)->native : NULL; }
+/* window builder 的对应 getter */
+static int nvn_winb_get_interval(const void *b) { return b ? ((const nvn_winb_t *)b)->interval : 0; }
+static void *nvn_winb_get_native(const void *b) { return b ? ((const nvn_winb_t *)b)->native : NULL; }
+static int nvn_winb_get_nbuf(const void *b) { return b ? ((const nvn_winb_t *)b)->ntex : 0; }
 
 void dmNvnInit(void)
 {
@@ -404,6 +428,9 @@ void dmNvnInit(void)
     dmNvnRegister("nvnMemoryPoolBuilderSetSize", (nvn_func_t)nvn_poolb_setsize);
     dmNvnRegister("nvnMemoryPoolBuilderSetStorage", (nvn_func_t)nvn_poolb_setmem);
     dmNvnRegister("nvnMemoryPoolBuilderSetFlags", (nvn_func_t)nvn_poolb_setflags);
+    dmNvnRegister("nvnMemoryPoolBuilderGetMemory", (nvn_func_t)nvn_poolb_get_mem);
+    dmNvnRegister("nvnMemoryPoolBuilderGetSize", (nvn_func_t)nvn_poolb_get_size);
+    dmNvnRegister("nvnMemoryPoolBuilderGetFlags", (nvn_func_t)nvn_poolb_get_flags);
     dmNvnRegister("nvnMemoryPoolInitialize", (nvn_func_t)nvn_pool_init);
 
     dmNvnRegister("nvnCommandBufferInitialize", (nvn_func_t)nvn_cb_init);
@@ -457,6 +484,9 @@ void dmNvnInit(void)
     dmNvnRegister("nvnWindowSetPresentInterval", (nvn_func_t)nvn_window_set_interval);
     dmNvnRegister("nvnWindowGetPresentInterval", (nvn_func_t)nvn_window_get_interval);
     dmNvnRegister("nvnWindowGetNativeWindow", (nvn_func_t)nvn_window_get_native);
+    dmNvnRegister("nvnWindowBuilderGetNativeWindow", (nvn_func_t)nvn_winb_get_native);
+    dmNvnRegister("nvnWindowBuilderGetPresentInterval", (nvn_func_t)nvn_winb_get_interval);
+    dmNvnRegister("nvnWindowBuilderGetNumBuffers", (nvn_func_t)nvn_winb_get_nbuf);
 }
 
 #ifdef __aarch64__
@@ -588,6 +618,13 @@ const char *dmNvnSelfTest(void)
              a ? "ok" : "null", b == 0 ? "null" : "non-null");
     return report;
 }
+
+
+
+
+
+
+
 
 
 
