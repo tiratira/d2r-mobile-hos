@@ -37,7 +37,7 @@ static VkPipeline g_gpipe;
 static VkPipelineLayout g_gpipe_layout;
 static VkRenderPass g_gpipe_rp;
 static int g_draw_test = 1;   /* 回放 draw(不绑顶点缓冲,稳定) */
-static int g_bind_test;   /* 顶点缓冲绑定:带顶点输入后仍会崩,默认关,待查 */
+static int g_bind_test;   /* 顶点缓冲绑定:夹紧后仍崩,默认关(需真实顶点布局) */
 static VkDescriptorSet g_gpipe_set;
 static VkDescriptorPool g_dummy_pool;
 static VkBuffer g_dummy_buf;
@@ -393,6 +393,7 @@ static void *vk_loop(void *arg)
             vkCmdSetScissor(cmdb, 0, 1, &sc);
             {
                 VkPipeline cur = g_gpipe;
+                uint64_t vb_min_bytes = 0;
                 int nops = dmNvnReplayCount();
                 if (nops > 256) nops = 256;
                 int issued = 0;
@@ -413,14 +414,20 @@ static void *vk_loop(void *arg)
                                 vbs[got] = vb; offs[got] = 0; got++;
                             }
                             if (got > 0) {
-                                VkDeviceSize strides[4] = {32, 32, 32, 32};
                                 vkCmdBindVertexBuffers(cmdb, 0, got, vbs, offs);
-                                (void)strides;
+                                vb_min_bytes = bs[0];
+                                for (unsigned k = 1; k < got; k++) if (bs[k] < vb_min_bytes) vb_min_bytes = bs[k];
                             }
                         }
                     } else {
                         uint32_t cnt = rb ? rb : 3;
                         if (cnt > 1000000u) cnt = 3;
+                        /* 顶点获取安全夹紧:buffer 至少要容纳 cnt*stride(stride 取 32) */
+                        if (vb_min_bytes > 0) {
+                            uint64_t maxv = vb_min_bytes / 32;
+                            if (maxv == 0) { continue; }
+                            if (cnt > maxv) cnt = (uint32_t)maxv;
+                        }
                         vkCmdDraw(cmdb, cnt, 1, 0, 0);
                         g_replay_draws++; issued++;
                     }
