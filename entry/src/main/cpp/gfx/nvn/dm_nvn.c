@@ -1,3 +1,4 @@
+#define _GNU_SOURCE 1
 /*
  * dm_nvn.c — NVN 接口层(上游 dm/gfx/nvn/hle_nvn.c 的角色,HOS 最小集)。
  *
@@ -256,6 +257,7 @@ static uint32_t nvn_queue_init(void *q, const void *b)
 typedef struct { uint32_t op, n; uint64_t a, b, c, d; float f[4]; } dm_op_t;
 enum { DM_OP_END = 0, DM_OP_CLEAR, DM_OP_BARRIER, DM_OP_DRAW, DM_OP_BIND, DM_OP_COPY, DM_OP_DISPATCH };
 static nvn_cb_t *g_cur_cb;
+static void *g_last_base; static uint64_t g_last_used; static void *g_last_pool;
 static uint64_t g_dm_ops;
 static uint32_t g_op_hist[16];
 
@@ -304,9 +306,18 @@ static uint64_t op_dispatch(uint64_t cb, uint64_t a, uint64_t b, uint64_t c) { d
 
 
 
+static void dm_dump_submit(int n, const uint64_t *h, uint64_t *outbuf, int maxw);
 static void nvn_queue_submit(void *q, int n, const void *handles)
 {
     const uint64_t *h = (const uint64_t *)handles;
+    {
+        static int dumped;
+        if (!dumped && h != NULL && n > 0) {
+            dumped = 1;
+            uint64_t words[8 * 4];
+            dm_dump_submit(n, h, words, 8);
+        }
+    }
     if (g_nvn_submits <= 5) DMLOG_I("NVN queue submit q=%{public}llx n=%{public}d", (unsigned long long)(uintptr_t)q, n);
     for (int i = 0; i < n; i++) {
         const dm_op_t *o = (const dm_op_t *)(uintptr_t)h[i];
@@ -444,6 +455,7 @@ static uint64_t nvn_cb_end(void *c)
         base = fallback;
     }
     /* 句柄 = 本段命令流首地址(固定),Submit 从这里顺序解析 op */
+    g_last_base = base; g_last_used = (uint64_t)o->used; g_last_pool = (void *)p;
     o->handles++;
     g_cur_cb = NULL;
     if (o->handles <= 2) {
@@ -996,6 +1008,36 @@ int dmNvnTextureLinearize(const void *tex, unsigned level, unsigned layer,
     return nvn_deswizzle(&t->desc, level, layer, src_storage, dst, dst_pitch);
 }
 
+
+
+/* 诊断:安全读取 handle 指向的前 maxw 个字(process_vm_readv,避免坏指针崩溃),
+ * 与录制端的 base/used/pool 一并落盘。 */
+#include <sys/uio.h>
+static void dm_dump_submit(int n, const uint64_t *h, uint64_t *outbuf, int maxw)
+{
+    FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_parse.txt", "w");
+    if (f == NULL) return;
+    int lim = n > 4 ? 4 : n;
+    fprintf(f, "n=%d last_base=%llx last_used=%llu last_pool=%llx\n",
+            n, (unsigned long long)(uintptr_t)g_last_base, (unsigned long long)g_last_used,
+            (unsigned long long)(uintptr_t)g_last_pool);
+    for (int i = 0; i < lim; i++) {
+        uint64_t a = h[i];
+        fprintf(f, "h%d=%llx", i, (unsigned long long)a);
+        for (int k = 0; k < maxw; k++) {
+            uint64_t v = 0;
+            struct iovec liov = { &v, 8 }, riov = { (void *)(uintptr_t)(a + k * 8), 8 };
+            if (process_vm_readv(getpid(), &liov, 1, &riov, 1, 0) == 8) {
+                outbuf[i * maxw + k] = v;
+                fprintf(f, " %016llx", (unsigned long long)v);
+            } else {
+                fprintf(f, " ??");
+            }
+        }
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
 
 void dmNvnInit(void)
 
