@@ -36,7 +36,7 @@ static VkPhysicalDevice g_upload_pd;
 static VkPipeline g_gpipe;
 static VkPipelineLayout g_gpipe_layout;
 static VkRenderPass g_gpipe_rp;
-static int g_draw_test;   /* 实验开关:为 1 时回放真实 draw(默认关,保持稳定清屏通路) */
+static int g_draw_test = 1;   /* 实验开关 */
 static VkDescriptorSet g_gpipe_set;
 static VkDescriptorPool g_dummy_pool;
 static VkBuffer g_dummy_buf;
@@ -55,6 +55,8 @@ extern "C" int dmNvnReplayGet(int i, int *kind, char *k0, char *k1, unsigned *a,
 extern "C" int dmNvnReplayGetVB(int i, unsigned *n, uint64_t *addr, uint64_t *sz);
 extern "C" uint64_t dmVkReplayDrawCount(void);
 static _Atomic uint64_t g_replay_draws;
+static _Atomic int g_rp_cond;
+extern "C" int dmVkReplayCond(void) { return g_rp_cond; }
 typedef struct { uint64_t addr; uint64_t size; VkBuffer buf; VkDeviceMemory mem; } vbcache_t;
 static vbcache_t g_vbc[64];
 static int g_vbc_n;
@@ -374,6 +376,7 @@ static void *vk_loop(void *arg)
             if (!dmNvnNextRequestedPair(rk0, rk1)) break;
             (void)dmVkPipelineForKeys(rk0, rk1);
         }
+        g_rp_cond = (g_gpipe != VK_NULL_HANDLE ? 1 : 0) | (g_gpipe_rp != VK_NULL_HANDLE ? 2 : 0) | (g_draw_test ? 4 : 0) | (s_fbs[idx % nimg] != VK_NULL_HANDLE ? 8 : 0) | ((dmNvnReplayCount() > 0) ? 16 : 0);
         if (g_draw_test && g_gpipe != VK_NULL_HANDLE && s_fbs[idx % nimg] != VK_NULL_HANDLE) {
             VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
             rbi.renderPass = g_gpipe_rp; rbi.framebuffer = s_fbs[idx % nimg];
