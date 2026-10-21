@@ -28,6 +28,10 @@ static uint32_t g_count;
 static uint32_t g_called;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* Vulkan 呈现后端(dm_vk.cpp):把最近一次 NVN ClearColor 交给回放器画下一帧 */
+extern void dmVkSetClearColor(float r, float g, float b, float a);
+static float g_nvn_clear[4] = {0.10f, 0.04f, 0.03f, 1.0f};
+
 /* 未知 NVN 入口的统一占位函数:返回 0(NVN 句柄/结果),不跳空 */
 static uint64_t nvn_unimpl_fn(void)
 {
@@ -175,6 +179,7 @@ static uint32_t nvn_win_present(void *w, const void *tex)
     (void)tex;
     if (w) ((nvn_win_t *)w)->presents++;
     g_nvn_presents++;
+    dmVkSetClearColor(g_nvn_clear[0], g_nvn_clear[1], g_nvn_clear[2], g_nvn_clear[3]);
     if (g_nvn_presents <= 5 || (g_nvn_presents % 300) == 0) {
         DMLOG_I("NVN present #%{public}llu", (unsigned long long)g_nvn_presents);
     }
@@ -229,7 +234,13 @@ static uint64_t nvn_cb_end(void *c)
 static uint32_t nvn_cb_isrec(const void *c) { return c ? ((const nvn_cb_t *)c)->recording : 0; }
 static void nvn_cb_clear_color(void *c, int idx, const float *rgba, int mask)
 {
-    (void)idx; (void)rgba; (void)mask;
+    (void)idx; (void)mask;
+    if (rgba != NULL) {
+        g_nvn_clear[0] = rgba[0];
+        g_nvn_clear[1] = rgba[1];
+        g_nvn_clear[2] = rgba[2];
+        g_nvn_clear[3] = rgba[3];
+    }
     if (c) { ((nvn_cb_t *)c)->clears++; ((nvn_cb_t *)c)->ops++; }
     g_nvn_clears++; g_nvn_ops++;
     if (g_nvn_clears <= 3) DMLOG_I("NVN ClearColor idx=%{public}d mask=%{public}#x", idx, mask);

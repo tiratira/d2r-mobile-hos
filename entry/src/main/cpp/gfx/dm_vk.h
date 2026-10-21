@@ -20,6 +20,9 @@ int dmVkStart(OHNativeWindow *window);
 void dmVkStop(void);
 int dmVkRunning(void);
 
+/* NVN 回放用:设置下一帧清屏色(> = 用游戏 ClearColor,否则保持演示动画)。 */
+void dmVkSetClearColor(float r, float g, float b, float a);
+
 #ifdef __cplusplus
 }
 #endif

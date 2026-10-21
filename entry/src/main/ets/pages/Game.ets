@@ -55,6 +55,9 @@ struct Game {
           if (filesDir !== '') {
             DmNative.setFilesDir(filesDir);
           }
+          // 真机/模拟器统一走 Vulkan 呈现通路(EGL 在部分机型拿不到匹配的
+          // surface config,会黑屏);NVN 回放器就接到这套交换链上。
+          DmNative.useVulkan();
           this.startGuest();
         })
 

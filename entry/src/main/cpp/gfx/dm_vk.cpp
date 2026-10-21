@@ -24,6 +24,15 @@
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_thread;
 static volatile int g_running = 0;
+static float g_clear[4] = {-1.0f, -1.0f, -1.0f, -1.0f};   /* <0 = 演示动画 */
+
+extern "C" void dmVkSetClearColor(float r, float g, float b, float a)
+{
+    g_clear[0] = r;
+    g_clear[1] = g;
+    g_clear[2] = b;
+    g_clear[3] = a;
+}
 
 static const char *vkerr(VkResult r)
 {
@@ -212,6 +221,11 @@ static void *vk_loop(void *arg)
             0.03f,
             1.0f
         };
+        if (g_clear[0] >= 0.0f) {
+            memcpy(c, g_clear, sizeof c);
+            memset(g_clear, 0, sizeof g_clear);
+            g_clear[0] = -1.0f;
+        }
         VkImage img;
         vkGetSwapchainImagesKHR(v.dev, v.swc, nullptr, nullptr);
         uint32_t nimg = 0;
