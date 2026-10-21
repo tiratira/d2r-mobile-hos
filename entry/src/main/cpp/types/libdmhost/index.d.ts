@@ -24,6 +24,8 @@ export const playTone: () => string;
 export const gfxProbe: () => string;
 /** 游戏页表面切到 Vulkan 呈现循环(返回 0 成功;需已进入游戏页) */
 export const useVulkan: () => number;
+/** 用 XComponent 的 surfaceId 建 OHNativeWindow 并起 Vulkan(回调未送达时兜底) */
+export const setSurfaceId: (surfaceId: string) => number;
 /** 游戏页表面切回 EGL/GLES 演示循环(返回 0 成功) */
 export const useGles: () => number;
 /** phase: 0=down 1=move 2=up 3=cancel;x/y 为像素坐标 */

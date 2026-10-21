@@ -62,6 +62,11 @@ export class DmNative {
     return dmhost.useVulkan();
   }
 
+  /** 用 XComponent 的 surfaceId 直接建 OHNativeWindow(回调不可用时的兜底)。 */
+  static setSurfaceId(surfaceId: string): number {
+    return dmhost.setSurfaceId(surfaceId);
+  }
+
   static useGles(): number {
     return dmhost.useGles();
   }

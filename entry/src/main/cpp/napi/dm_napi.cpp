@@ -7,8 +7,10 @@
  */
 #include "napi/native_api.h"
 #include <ace/xcomponent/native_interface_xcomponent.h>
+#include <native_window/external_window.h>
 #include <hilog/log.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "hal/dm_platform.h"
@@ -87,7 +89,7 @@ static void RegisterCallbacks(napi_env env, napi_value exports)
     napi_value obj = nullptr;
     if (napi_get_named_property(env, exports, OH_NATIVE_XCOMPONENT_OBJ, &obj) != napi_ok
         || obj == nullptr) {
-        DMLOG_E("no native xcomponent object in exports");
+        DMLOG_E("init w/o xcomponent object (import path), callbacks not registered");
         return;
     }
     OH_NativeXComponent *component = nullptr;
@@ -265,6 +267,33 @@ static napi_value GfxProbe(napi_env env, napi_callback_info info)
     return result;
 }
 
+static napi_value SetSurfaceId(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    char sidbuf[32] = {0};
+    size_t sidlen = 0;
+    if (argc > 0) {
+        napi_get_value_string_utf8(env, argv[0], sidbuf, sizeof(sidbuf), &sidlen);
+    }
+    uint64_t sid = strtoull(sidbuf, nullptr, 10);
+    DMLOG_I("setSurfaceId called");
+    OHNativeWindow *w = nullptr;
+    int rc = OH_NativeWindow_CreateNativeWindowFromSurfaceId(sid, &w);
+    if (rc != 0 || w == nullptr) {
+        DMLOG_E("create native window from surface id failed");
+    } else {
+        g_window = w;
+        int vk = dmVkStart(w);
+        DMLOG_I("native window ok, vk start requested");
+        rc = vk;
+    }
+    napi_value result;
+    napi_create_int32(env, rc, &result);
+    return result;
+}
+
 static napi_value UseVulkan(napi_env env, napi_callback_info info)
 {
     (void)info;
@@ -347,6 +376,7 @@ static napi_value CastSkill(napi_env env, napi_callback_info info)
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports)
 {
+    DMLOG_I("napi Init called");
     napi_property_descriptor desc[] = {
         {"getHostInfo", nullptr, GetHostInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"hostAbi", nullptr, HostAbi, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -361,6 +391,7 @@ static napi_value Init(napi_env env, napi_value exports)
         {"playTone", nullptr, PlayTone, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"gfxProbe", nullptr, GfxProbe, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"useVulkan", nullptr, UseVulkan, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setSurfaceId", nullptr, SetSurfaceId, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"useGles", nullptr, UseGles, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"touchInject", nullptr, TouchInject, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setStick", nullptr, SetStick, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -389,3 +420,4 @@ extern "C" __attribute__((constructor)) void RegisterDmhostModule(void)
 {
     napi_module_register(&dmhostModule);
 }
+

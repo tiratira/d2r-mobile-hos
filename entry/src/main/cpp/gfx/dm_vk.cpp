@@ -227,11 +227,16 @@ static void *vk_loop(void *arg)
             g_clear[0] = -1.0f;
         }
         VkImage img;
-        vkGetSwapchainImagesKHR(v.dev, v.swc, nullptr, nullptr);
         uint32_t nimg = 0;
+        /* 必须先给 count 指针;传 nullptr 的调用在 OHOS swapchain 实现里会
+         * 直接解引用空指针(libvulkan_swapchain GetSwapchainImagesKHR+88)。 */
         vkGetSwapchainImagesKHR(v.dev, v.swc, &nimg, nullptr);
         VkImage imgs[8];
         if (nimg > 8) nimg = 8;
+        if (nimg == 0) {
+            DMLOG_E("vk: no swapchain images");
+            break;
+        }
         vkGetSwapchainImagesKHR(v.dev, v.swc, &nimg, imgs);
         img = imgs[idx % nimg];
 

@@ -21,6 +21,7 @@ struct Game {
   @State bootInfo: string = '';
   @State bootStage: string = '未启动';
   private stageTimer: number = -1;
+  private xcController: XComponentController = new XComponentController();
 
   aboutToAppear(): void {
     this.abi = DmNative.hostAbi();
@@ -47,7 +48,8 @@ struct Game {
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
       // native 画面(暗黑风演示渐变,等待 NVN->Vulkan 回放器接管)
-      XComponent({ id: 'game_surface', type: XComponentType.SURFACE, libraryname: 'dmhost' })
+      XComponent({ id: 'game_surface', type: XComponentType.SURFACE, libraryname: 'dmhost',
+        controller: this.xcController })
         .width('100%')
         .height('100%')
         .onLoad(() => {
@@ -55,10 +57,19 @@ struct Game {
           if (filesDir !== '') {
             DmNative.setFilesDir(filesDir);
           }
-          // 真机/模拟器统一走 Vulkan 呈现通路(EGL 在部分机型拿不到匹配的
-          // surface config,会黑屏);NVN 回放器就接到这套交换链上。
-          DmNative.useVulkan();
-          this.startGuest();
+          // 原生 surface 回调在本机没有送达宿主,改为用 controller 拿
+          // surfaceId 直接建 OHNativeWindow 再起 Vulkan(回调可用时幂等)。
+          try {
+            const sid: string = this.xcController.getXComponentSurfaceId();
+            if (sid !== undefined && sid !== null && sid.length > 0) {
+              DmNative.setSurfaceId(sid);
+            }
+          } catch (e) {
+            // surfaceId 尚不可用,等 surface 回调兜底
+          }
+          setTimeout(() => {
+            this.startGuest();
+          }, 3000);
         })
 
       // 运行形态说明:模拟器(x86_64)不执行 ARM64 游戏,避免把演示渐变误认成游戏画面

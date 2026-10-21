@@ -80,6 +80,7 @@ target_link_libraries(dmhost PUBLIC
     libEGL.so
     libGLESv3.so
     libhilog_ndk.z.so
+    libnative_window.so
     libvulkan.so
     libz.so
     libohaudio.so
