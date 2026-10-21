@@ -1,3 +1,4 @@
+#include "gfx/nvn/nvn_dirty.h"
 /*
  * hle_fs.c — nn::fs 服务层 HLE(上游 dm/host/hle_fs.c 的 HOS 最小集)。
  *
@@ -444,6 +445,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)",
     if (f == NULL || buf == NULL) {
         return RES_FAIL;
     }
+    nvn_dirty_prepare_write(buf, sz);
     size_t got = 0;
     while (got < sz) {
         ssize_t r = pread(f->fd, (uint8_t *)buf + got, sz - got, (off_t)(off + (int64_t)got));

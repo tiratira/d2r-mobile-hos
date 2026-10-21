@@ -1,3 +1,4 @@
+#include "gfx/nvn/nvn_dirty.h"
 /*
  * crash_hos.c — 宿主/客体崩溃现场记录(HOS 调试用)。
  *
@@ -13,6 +14,8 @@
 #include "gfx/nvn/dm_nvn.h"
 
 #include <signal.h>
+#include <fcntl.h>
+#include <dlfcn.h>
 #include <stdarg.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
@@ -35,6 +38,8 @@ static void log_line(const char *fmt, ...)
 
 static void crash_handler(int sig, siginfo_t *si, void *ctx)
 {
+    if (sig == SIGSEGV && si && si->si_code == SEGV_ACCERR && nvn_dirty_handle_fault(si->si_addr)) return;
+
     unsigned long fault = (unsigned long)(si ? si->si_addr : 0);
     unsigned long pc = 0, sp = 0, lr = 0, x29 = 0;
     unsigned long regs[31] = {0};
@@ -57,6 +62,17 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
     (void)far;
 #endif
 
+    int diagnostic_fd = open("/data/storage/el2/base/haps/entry/files/dm_crash.txt", O_WRONLY|O_CREAT|O_TRUNC, 0600);
+    if (diagnostic_fd >= 0) {
+        char line[512];
+        Dl_info di = {0}; dladdr((void *)pc, &di);
+        int n = snprintf(line, sizeof line, "signal=%d address=%lx pc=%lx lr=%lx sp=%lx module=%s offset=%lx\n", sig, fault, pc, lr, sp, di.dli_fname ? di.dli_fname : "?", pc-(uintptr_t)di.dli_fbase);
+        write(diagnostic_fd, line, (size_t)n);
+        dladdr((void *)lr, &di);
+        n = snprintf(line, sizeof line, "lr module=%s offset=%lx\n", di.dli_fname ? di.dli_fname : "?", lr-(uintptr_t)di.dli_fbase); write(diagnostic_fd,line,(size_t)n);
+        for (int i=0;i<31;i++) { n=snprintf(line,sizeof line,"x%d=%lx ",i,regs[i]);write(diagnostic_fd,line,(size_t)n); }
+        close(diagnostic_fd);
+    }
     log_line("CRASH sig=%d stage=%s addr=%lx far=%lx pc=%lx lr=%lx sp=%lx fp=%lx",
              sig, dmHostBootStage(), fault, far, pc, lr, sp, x29);
     log_line("CRASH x0=%lx x1=%lx x2=%lx x3=%lx x4=%lx x5=%lx x6=%lx x7=%lx",
@@ -162,4 +178,5 @@ void dmCrashInstall(void)
     sigaction(SIGILL, &sa, NULL);
     DMLOG_I("crash handler installed");
 }
+
 

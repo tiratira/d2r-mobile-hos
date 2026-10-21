@@ -76,6 +76,10 @@ export class DmNative {
     dmhost.touchInject(id, x, y, phase);
   }
 
+  static setPadButton(bit: number, pressed: number): void {
+    dmhost.setPadButton(bit, pressed);
+  }
+
   static setStick(dx: number, dy: number): void {
     dmhost.setStick(dx, dy);
   }

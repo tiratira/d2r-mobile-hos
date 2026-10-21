@@ -204,9 +204,34 @@ uint64_t svc_dispatch(uint32_t num, uint64_t *regs, uint64_t orig_addr)
         regs[1] = (uint64_t)(uintptr_t)g_heap;
         return 0;
     }
-    case 0x02:   /* SetMemoryPermission */
+    case 0x02: {   /* SetMemoryPermission(addr, size, perm):游戏运行时改代码页权限打热补丁(实测写 main+0xa14ddc 函数序言) */
+        uint64_t addr = regs[0], size = regs[1];
+        uint32_t perm = (uint32_t)regs[2];
+        if (size == 0) {
+            regs[0] = 0;
+            return 0;
+        }
+        int prot = 0;
+        if (perm & 1) prot |= PROT_READ;
+        if (perm & 2) prot |= PROT_WRITE;
+        if (perm & 4) prot |= PROT_EXEC;
+        size_t ps2 = dm_pagesize();
+        uint64_t lo = addr & ~(uint64_t)(ps2 - 1);
+        uint64_t hi = (addr + size + ps2 - 1) & ~(uint64_t)(ps2 - 1);
+        if (mprotect((void *)(uintptr_t)lo, (size_t)(hi - lo), prot) != 0) {
+            /* 空桩时代游戏已带病运行;失败仍回成功只留日志,避免新回归 */
+            LOG("SetMemoryPermission mprotect(%{public}llx+%{public}llx→%{public}x) errno=%{public}d",
+                (unsigned long long)addr, (unsigned long long)size, perm, errno);
+            regs[0] = 0;
+            return 0;
+        }
+        if (prot & PROT_EXEC) {
+            /* 补丁发生在可写阶段,切回可执行后必须清 icache,否则宿主核可能执行旧指令 */
+            __builtin___clear_cache((char *)(uintptr_t)lo, (char *)(uintptr_t)hi);
+        }
         regs[0] = 0;
         return 0;
+    }
     case 0x03:   /* SetMemoryAttribute */
         regs[0] = 0;
         return 0;

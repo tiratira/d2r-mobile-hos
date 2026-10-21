@@ -40,6 +40,9 @@ add_library(dmhost SHARED
     host/crash_hos.c
     gfx/dm_gfx_backend.c
     gfx/dm_vk.cpp
+    gfx/nvn/dm_nvn_runtime.c
+    gfx/nvn/nvn_dirty.c
+    gfx/dm_vk_replay.cpp
     gfx/nvn/dm_nvn.c
     render/dm_renderer.cpp
     audio/dm_audio.c

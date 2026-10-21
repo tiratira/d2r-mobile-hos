@@ -355,6 +355,8 @@ static napi_value SetStick(napi_env env, napi_callback_info info)
     return nullptr;
 }
 
+static napi_value SetPadButton(napi_env env,napi_callback_info info){size_t argc=2;napi_value argv[2]{};napi_get_cb_info(env,info,&argc,argv,nullptr,nullptr);if(argc==2){int32_t bit=0,pressed=0;napi_get_value_int32(env,argv[0],&bit);napi_get_value_int32(env,argv[1],&pressed);dmInputSetButton(bit,pressed);}return nullptr;}
+
 static napi_value CastSkill(napi_env env, napi_callback_info info)
 {
     size_t argc = 4;
@@ -394,6 +396,7 @@ static napi_value Init(napi_env env, napi_value exports)
         {"setSurfaceId", nullptr, SetSurfaceId, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"useGles", nullptr, UseGles, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"touchInject", nullptr, TouchInject, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setPadButton", nullptr, SetPadButton, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setStick", nullptr, SetStick, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"castSkill", nullptr, CastSkill, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

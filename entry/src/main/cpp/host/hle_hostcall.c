@@ -61,12 +61,13 @@ static uint64_t tact_decode_zlib(uint64_t *regs)
     uint32_t flags = (uint32_t)regs[4];
 
     if (regs[6]) {   /* override 非空:先调 override->vt[2](...,1),返回假即成功返回 0 */
-        uint64_t vt2 = 0;
-        memcpy(&vt2, (void *)(uintptr_t)(regs[6] + 16), 8);   /* vt[2] */
+        uint64_t vtable = 0, vt2 = 0;
+        memcpy(&vtable, (void *)(uintptr_t)regs[6], 8);
+        if (vtable) memcpy(&vt2, (void *)(uintptr_t)(vtable + 16), 8);
         if (vt2) {
             guest_fn8 fn = (guest_fn8)(uintptr_t)vt2;
             uint64_t ok = fn(regs[6], regs[0], regs[1], regs[2], regs[3], 1, 0, 0);
-            if (!ok) {
+            if (!(ok & 0xff)) {
                 return 0;
             }
         }

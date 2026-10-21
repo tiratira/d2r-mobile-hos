@@ -34,3 +34,5 @@ export const touchInject: (id: number, x: number, y: number, phase: number) => v
 export const setStick: (dx: number, dy: number) => void;
 /** 技能施放:slot 0/1,aim 为归一化瞄准向量,hold=按住连续施放 */
 export const castSkill: (slot: number, aimDx: number, aimDy: number, hold: number) => void;
+
+export const setPadButton: (bit: number, pressed: number) => void;

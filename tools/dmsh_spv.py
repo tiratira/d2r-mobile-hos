@@ -1,36 +1,25 @@
 #!/usr/bin/env python3
-# B 路线离线出包：Switch 原版着色器 → SPIR-V（dmsh_xlate，Ryujinx 翻译器）→ spirv-cross MSL → metallib + 回放反射 JSON。
-# 运行时不翻译（iOS 无 JIT）：产物进着色器缓存目录，文件名 = Switch 控制段键（dm_ctl_sha16，与 shader_map.tsv 第 4 列同）+「_b」。
-# 查询作答来源：仓内的作答表 nvn/shader_facts.tsv（dmsh_facts.py）——贴图类型、顶点属性 / 片元输出分量类型、计算线程组大小与共享内存；出包不需要 PC 版文件。
-# 用法：dmsh_build.py <Switch 包目录> <输出缓存目录> [键…]（不给键 = 全部）；产物实际写进 <输出缓存目录>/b-<链版本>/（IOSOUT 同），链版本见 dmsh_chain.py   环境：XLATE=翻译工具路径，DMSH_CAS=内容寻址缓存目录（缺省为输出缓存目录/cas），J=并发
-# 程序本体内嵌的图形着色器（映射表 main.rodata@偏移 行）从 MAIN（Switch main NSO，缺省 3.3.94012 Update/ExeFS/main）解出；解 NSO 要 lz4，用 dm 的 venv python 跑
-# 产物：<键>_b.metallib、<键>_b.json（回放反射，含驱动段 c0 / c2 的运行时读取偏移 drv_reads）、<键>_b.metal（MSL）
-# 环境 IOSOUT=目录：同一份 MSL 经 dm/ios/tools/ios_metal.compile 同时出 iphoneos metallib + 反射（chain_metal 记 iOS 编译口径）
-# 末尾汇总：成功 / 失败数与原因分布；驱动段读取的偏移分布（落在回放层能填的范围外的单列）
-# Route B offline build: original Switch shaders → SPIR-V (dmsh_xlate, the Ryujinx translator) → spirv-cross MSL → metallib + replay reflection JSON.
-# No translation at runtime (iOS has no JIT): build output goes into the shader cache directory, file name = Switch control segment key (dm_ctl_sha16, same as column 4 of shader_map.tsv) + "_b".
-# Source of query answers: the in-repo answer table nvn/shader_facts.tsv (dmsh_facts.py) - texture types, vertex attribute / fragment output component types, compute thread group size and shared memory; the build needs no PC version files.
-# Usage: dmsh_build.py <Switch package dir> <output cache dir> [key...] (no keys = all); build output is actually written to <output cache dir>/b-<chain version>/ (same for IOSOUT), for the chain version see dmsh_chain.py   Environment: XLATE=path to the translation tool, DMSH_CAS=content-addressed cache dir (default <output cache dir>/cas), J=concurrency
-# Graphics shaders embedded in the executable itself (mapping table rows main.rodata@offset) are extracted from MAIN (Switch main NSO, default 3.3.94012 Update/ExeFS/main); extracting the NSO needs lz4, run with dm's venv python
-# Build output: <key>_b.metallib, <key>_b.json (replay reflection, including drv_reads, the runtime read offsets into driver segments c0 / c2), <key>_b.metal (MSL)
-# Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
-# Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
+# Offline Switch shader translation for HarmonyOS Vulkan.
+# Usage: python tools/dmsh_spv.py <dmsh-pack-dir> <raw-output> [shader-key ...]
+# Requires the adjacent d2r-mobile-src checkout, XLATE executable and MAIN NSO.
+# Run prepare_vulkan_shaders.py on the resulting SPIR-V before deployment.
 import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
-DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
+DM_ROOT = os.environ.get('DM_ROOT') or os.path.abspath(os.path.join(os.path.dirname(__file__), '../../dm-work'))   # 工作区根目录（游戏文件、产物、运行现场都在它下面） | Workspace root (game files, build outputs and run artifacts are all under it)
 HOME = os.path.expanduser('~')
+UPSTREAM_TOOLS = os.environ.get('DMSH_TOOLS') or os.path.abspath(os.path.join(os.path.dirname(__file__), '../../d2r-mobile-src/dm/gfx/tools'))
 dm_dir, out = sys.argv[1:3]; want = set(sys.argv[3:]); cache_root = out
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import dmsh_chain, dmsh_fetch, dmsh_facts   # 翻译链版本：先核工具与锁文件，产物进 b-<V>/ | translation chain version: verify the tools against the lock file first; build output goes into b-<V>/
+sys.path.insert(0, UPSTREAM_TOOLS); import dmsh_chain, dmsh_fetch, dmsh_facts   # 翻译链版本：先核工具与锁文件，产物进 b-<V>/ | translation chain version: verify the tools against the lock file first; build output goes into b-<V>/
 CHAIN = dmsh_chain.version()
 XLATE = os.environ.get('XLATE', f'{DM_ROOT}/build/gfx/dmsh_xlate/dmsh_xlate')
 FACTS = dmsh_facts.load()
 if not FACTS: sys.exit('【红】没有作答表 nvn/shader_facts.tsv（随仓库；维护者用 dmsh_facts.py --freeze 重出）')
 IOSOUT = os.environ.get('IOSOUT')   # 设了就同时出 iOS 版（iphoneos metallib + 反射）到该目录 | if set, also build the iOS version (iphoneos metallib + reflection) into that directory
 if IOSOUT:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal
+    sys.path.insert(0, os.path.join(UPSTREAM_TOOLS, '../../ios/tools')); import ios_metal
     IOSOUT = os.path.join(IOSOUT, 'b-' + CHAIN); os.makedirs(IOSOUT, exist_ok=True)
 MAIN = os.environ.get('MAIN', f'{DM_ROOT}/data/switch/3.3.94012/Update/ExeFS/main')
-MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../nvn/shader_map.tsv')
-BF_WANT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../nvn/bf_want.tsv')
+MAP = os.path.join(UPSTREAM_TOOLS, '../nvn/shader_map.tsv')
+BF_WANT_FILE = os.path.join(UPSTREAM_TOOLS, '../nvn/bf_want.tsv')
 BF_WANT = {line.strip() for line in open(BF_WANT_FILE) if line.strip() and not line.lstrip().startswith('#')} if os.path.exists(BF_WANT_FILE) else set()
 XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-texture-buffer-native', '--msl-pad-fragment-output']
 CAS = os.environ.get('DMSH_CAS', os.path.join(cache_root, 'cas'))
@@ -425,7 +414,7 @@ for key in keys:
     name, k = loc[key]
     if name.startswith('main.rodata@'):
         if 'main' not in packs:
-            sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../verify'))
+            sys.path.insert(0, os.path.join(UPSTREAM_TOOLS, '../../verify'))
             try: import nsoimg
             except ImportError as e: sys.exit(f'【红】解 main NSO 要 lz4（{e}）：用 $DM_ROOT/build/cache/dm/venv/bin/python 跑')
             packs['main'] = nsoimg.load(MAIN)
@@ -450,12 +439,22 @@ for r in xr:
     for ln in r.stderr.splitlines():
         m = re.match(r'【红】(\w+)：(.*)', ln)
         if m: xerr[m.group(1)] = m.group(2)[:160]
+retry = [k for k in misses if k in xerr or not os.path.exists(os.path.join(w, k + '.spv'))]
+if retry:
+    for k in retry: jobs[k]['debug'] = True
+    with cf.ThreadPoolExecutor(NJ) as ex:
+        retried = list(ex.map(xl, [retry[i::NJ] for i in range(NJ) if retry[i::NJ]]))
+    for k in retry:
+        if os.path.exists(os.path.join(w, k + '.spv')): xerr.pop(k, None)
+    print('AST optimizer fallback:', len(retry), 'retried')
+
 def fin(key):
     spv = os.path.join(w, key + '.spv'); rs = os.path.join(w, key + '.res.json')
     if key in xerr or not os.path.exists(spv): return key, '翻译失败', xerr.get(key, '无 spv'), None
     os.makedirs(out, exist_ok=True)
     shutil.copyfile(spv, os.path.join(out, key + '.spv'))
     if os.path.exists(rs): shutil.copyfile(rs, os.path.join(out, key + '.res.json'))
+    open(os.path.join(out, key + '.c1'), 'wb').write(c1s.get(key, b''))
     return key, 'ok', '', {'drv_reads': [], 'drv_unfillable': [], 'bindings': [], 'notes': []}
 with cf.ThreadPoolExecutor(NJ) as ex: res = list(ex.map(fin, keys))
 shutil.rmtree(w, ignore_errors=True)
@@ -479,3 +478,12 @@ for e, n in collections.Counter(f"{b['kind']} {b['msl_name'][:28]}" for x in nor
 nt = collections.Counter(nn.split('（')[0] for x in ok for nn in x['notes'])
 for e, n in nt.most_common(8): print(f'  查询无 PC 作答 {n:5d}  {e}')
 json.dump([{'key': r[0], 'st': r[1], 'err': r[2]} for r in res], open(os.path.join(out, '_b_build.json'), 'w'), ensure_ascii=False)
+
+# Runtime constant bank bundle: u32 count, then {16 ASCII hex key, u32 size, bytes}.
+constants = [(os.path.basename(f)[:-3], open(os.path.join(out, f), 'rb').read())
+             for f in sorted(os.listdir(out)) if re.fullmatch(r'[0-9a-f]{16}\.c1', f)]
+constants = [(k, b) for k, b in constants if b]
+with open(os.path.join(out, 'constants.bin'), 'wb') as f:
+    f.write(struct.pack('<I', len(constants)))
+    for k, b in constants: f.write(k.encode('ascii') + struct.pack('<I', len(b)) + b)
+if st.get('翻译失败'): sys.exit(1)

@@ -14,7 +14,7 @@
     .p2align 4
 dm_nvn_thunks:
     .set k, 0
-    .rept 512                   // 与 dm_nvn.c 的 NVN_TABLE_MAX 一致
+    .rept 1024                   // 与 dm_nvn.c 的 NVN_TABLE_MAX 一致
     movz x9, #k
     b dm_nvn_unimpl_entry
     .set k, k + 1

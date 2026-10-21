@@ -1,4 +1,5 @@
 #include "dm_input.h"
+#include "host/dm.h"
 
 #include <pthread.h>
 #include <string.h>
@@ -14,6 +15,7 @@ static int g_skill_head, g_skill_tail;
 static pthread_mutex_t g_skill_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static float g_stick_dx, g_stick_dy;
+static uint64_t g_pad_buttons;
 static pthread_mutex_t g_stick_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t now_us(void)
@@ -69,6 +71,7 @@ void dmInputSetStick(float dx, float dy)
     pthread_mutex_lock(&g_stick_mu);
     g_stick_dx = dx;
     g_stick_dy = dy;
+    dmHidSet(g_pad_buttons,(int32_t)(dx*32767),(int32_t)(-dy*32767),0,0);
     pthread_mutex_unlock(&g_stick_mu);
 }
 
@@ -106,3 +109,5 @@ int dmInputPollSkills(DmSkillEvent *out, int max)
     pthread_mutex_unlock(&g_skill_mu);
     return n;
 }
+
+void dmInputSetButton(int bit,int pressed){if(bit<0||bit>31)return;pthread_mutex_lock(&g_stick_mu);if(pressed)g_pad_buttons|=1ull<<bit;else g_pad_buttons&=~(1ull<<bit);dmHidSet(g_pad_buttons,(int32_t)(g_stick_dx*32767),(int32_t)(-g_stick_dy*32767),0,0);pthread_mutex_unlock(&g_stick_mu);}
