@@ -729,6 +729,96 @@ static int64_t nvn_texb_getoff(const void *b) { (void)b; return 0; }
 static int nvn_texb_getrawclass(const void *b) { (void)b; return 0; }
 
 
+/* ================= M4-3a:程序 → 着色器键(sha256 控制段前 16 位) =================
+ * nvn.h: nvnProgramSetShaders(NVNprogram*, int n, const NVNshaderData *sd),
+ * NVNshaderData = { const void *data; size_t size; }。键与 shader_map.tsv 第 4 列、
+ * 以及离线 SPIR-V 的文件名一致,回放层据此找 <key>.spv/.res.json。 */
+typedef struct { const void *data; size_t size; } nvn_shader_data_t;
+static char g_prog_keys[512][17];
+static int g_prog_key_n;
+static int g_progs;
+
+static void sha256_hex16(const void *in, size_t len, char out[17]);
+static uint32_t nvn_program_setshaders(void *prog, int n, const void *sdv)
+{
+    (void)prog;
+    if (n < 0 || n > 6 || sdv == NULL) return 0;
+    const nvn_shader_data_t *sd = (const nvn_shader_data_t *)sdv;
+    for (int i = 0; i < n && g_prog_key_n < 512; i++) {
+        const uint8_t *d = (const uint8_t *)sd[i].data;
+        if (d == NULL || sd[i].size < 0x880 + 0x38 || sd[i].size > (16u << 20) || ((uintptr_t)d & 3)) continue;
+        /* 控制段起点:着色器记录里的魔数 0x34127698(小端 98 76 12 34) */
+        size_t off = 0, lim = sd[i].size > 0x1000 ? 0x1000 : sd[i].size - 0x880;
+        int found = 0;
+        for (; off <= lim; off++) {
+            if (d[off] == 0x98 && d[off+1] == 0x76 && d[off+2] == 0x12 && d[off+3] == 0x34) { found = 1; break; }
+        }
+        if (!found) continue;
+        sha256_hex16(d + off, 0x880, g_prog_keys[g_prog_key_n]);
+        g_prog_key_n++;
+    }
+    g_progs++;
+    return 1;
+}
+
+/* ---- 紧凑 SHA-256(公开算法实现) ---- */
+static const uint32_t K256[64] = {
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+#define ROR32(x,n) (((x) >> (n)) | ((x) << (32-(n))))
+static void sha256_hex16(const void *in, size_t len, char out[17])
+{
+    const uint8_t *p = (const uint8_t *)in;
+    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    uint8_t blk[64];
+    size_t total = len;
+    for (size_t off = 0; off < len; off += 64) {
+        size_t n = len - off < 64 ? len - off : 64;
+        memcpy(blk, p + off, n);
+        if (n < 64) {
+            blk[n] = 0x80; memset(blk + n + 1, 0, 63 - n);
+            if (n >= 56) { /* 需要额外块:这里 len 固定 0x880,不会走到 */ }
+            uint64_t bits = (uint64_t)total * 8;
+            for (int k = 0; k < 8; k++) blk[63 - k] = (uint8_t)(bits >> (8 * k));
+        }
+        uint32_t w[64];
+        for (int i = 0; i < 16; i++) w[i] = ((uint32_t)blk[i*4] << 24) | ((uint32_t)blk[i*4+1] << 16) | ((uint32_t)blk[i*4+2] << 8) | blk[i*4+3];
+        for (int i = 16; i < 64; i++) {
+            uint32_t s0 = ROR32(w[i-15],7) ^ ROR32(w[i-15],18) ^ (w[i-15] >> 3);
+            uint32_t s1 = ROR32(w[i-2],17) ^ ROR32(w[i-2],19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int i = 0; i < 64; i++) {
+            uint32_t S1 = ROR32(e,6) ^ ROR32(e,11) ^ ROR32(e,25);
+            uint32_t ch = (e & f) ^ (~e & g);
+            uint32_t t1 = hh + S1 + ch + K256[i] + w[i];
+            uint32_t S0 = ROR32(a,2) ^ ROR32(a,13) ^ ROR32(a,22);
+            uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t t2 = S0 + mj;
+            hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
+        if (n < 64) break;
+    }
+    static const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < 8; i++) {
+        for (int k = 0; k < 4; k++) {
+            uint8_t byte = (uint8_t)(h[i] >> (24 - 8*k));
+            out[i*4 + k*2] = hexd[byte >> 4];
+            out[i*4 + k*2 + 1] = hexd[byte & 15];
+        }
+    }
+    out[16] = 0;
+}
+
+
 /* 状态看门狗:热路径 trace 会刷爆 hilog,这里每 5 s 打一次累计计数,
  * 便于判断 present/submit 是否真的在发生。 */
 static void *nvn_stats_thread(void *arg)
@@ -751,6 +841,7 @@ static void *nvn_stats_thread(void *arg)
         /* hilog 在热路径下轮转很快,计数落盘更可靠 */
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
+            fprintf(f, "progs=%d keys=%d ", g_progs, g_prog_key_n);
             fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
@@ -760,6 +851,10 @@ static void *nvn_stats_thread(void *arg)
                     (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);
+            if (g_prog_key_n > 0) {
+                FILE *kf = fopen("/data/storage/el2/base/haps/entry/files/dm_keys.txt", "w");
+                if (kf != NULL) { for (int i = 0; i < g_prog_key_n; i++) fprintf(kf, "%s\n", g_prog_keys[i]); fclose(kf); }
+            }
         }
     }
     return NULL;
@@ -782,7 +877,9 @@ int dmNvnTextureLinearize(const void *tex, unsigned level, unsigned layer,
     return nvn_deswizzle(&t->desc, level, layer, src_storage, dst, dst_pitch);
 }
 
+
 void dmNvnInit(void)
+
 
 
 
@@ -870,6 +967,7 @@ void dmNvnInit(void)
     dmNvnRegister("nvnTextureGetViewOffset", (nvn_func_t)nvn_texture_get_view_offset);
     dmNvnRegister("nvnBufferInitialize", (nvn_func_t)nvn_buffer_init);
     dmNvnRegister("nvnBufferGetSize", (nvn_func_t)nvn_buffer_get_size);
+    dmNvnRegister("nvnProgramSetShaders", (nvn_func_t)nvn_program_setshaders);
     dmNvnRegister("nvnSamplerInitialize", (nvn_func_t)nvn_sampler_init);
         dmNvnRegister("nvnMemoryPoolGetBufferAddress", (nvn_func_t)nvn_pool_addr);
     dmNvnRegister("nvnMemoryPoolMap", (nvn_func_t)nvn_pool_map);
