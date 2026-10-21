@@ -537,3 +537,57 @@ extern "C" uint64_t dmVkLoadShaderModule(const char *path)
     g_shader_tests++;
     return 1;
 }
+
+
+/* ================= M3-2:真实 SPIR-V → VkPipeline =================
+ * 取离线翻译的 compute 着色器:VkShaderModule + 空 descriptor/pipeline layout
+ * + VkComputePipeline(证明「SPIR-V 资产 → 管线」链路)。返回 1 成功。 */
+extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
+extern "C" uint64_t dmVkPipelineCount(void);
+static _Atomic uint64_t g_pipelines;
+extern "C" uint64_t dmVkPipelineCount(void) { return g_pipelines; }
+
+extern "C" uint64_t dmVkCreateComputePipeline(const char *path)
+{
+    if (g_upload_dev == VK_NULL_HANDLE || path == NULL) return 0;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return 0;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 20 || n > (1 << 24)) { fclose(f); return 0; }
+    void *buf = malloc((size_t)n);
+    if (buf == NULL) { fclose(f); return 0; }
+    size_t got = fread(buf, 1, (size_t)n, f); fclose(f);
+    if (got != (size_t)n) { free(buf); return 0; }
+    VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    sci.codeSize = (size_t)n; sci.pCode = (const uint32_t *)buf;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(g_upload_dev, &sci, nullptr, &mod) != VK_SUCCESS) { free(buf); return 0; }
+    VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    vkCreateDescriptorSetLayout(g_upload_dev, &dlci, nullptr, &dsl);
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1; plci.pSetLayouts = &dsl;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(g_upload_dev, &plci, nullptr, &pl) != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(g_upload_dev, dsl, nullptr);
+        vkDestroyShaderModule(g_upload_dev, mod, nullptr);
+        free(buf);
+        return 0;
+    }
+    VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = mod;
+    cpci.stage.pName = "main";
+    cpci.layout = pl;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkResult r = vkCreateComputePipelines(g_upload_dev, VK_NULL_HANDLE, 1, &cpci, nullptr, &pipe);
+    if (pipe) vkDestroyPipeline(g_upload_dev, pipe, nullptr);
+    vkDestroyPipelineLayout(g_upload_dev, pl, nullptr);
+    vkDestroyDescriptorSetLayout(g_upload_dev, dsl, nullptr);
+    vkDestroyShaderModule(g_upload_dev, mod, nullptr);
+    free(buf);
+    if (r != VK_SUCCESS) { DMLOG_E("M3 compute pipeline r=%d stage=%d", (int)r, (int)cpci.stage.stage); return 0; }
+    g_pipelines++;
+    return 1;
+}
