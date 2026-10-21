@@ -30,6 +30,8 @@ static pthread_t g_thread;
 static volatile int g_running = 0;
 static float g_clear[4] = {-1.0f, -1.0f, -1.0f, -1.0f};   /* <0 = 演示动画 */
 static _Atomic uint64_t g_vk_frames;
+static VkDescriptorSetLayout g_last_dsl;
+static int g_last_nbind; static uint32_t g_last_binding[16], g_last_slot[16]; static VkDescriptorType g_last_type[16];
 static VkDevice g_upload_dev;
 static VkQueue g_upload_queue;
 static VkPhysicalDevice g_upload_pd;
@@ -53,6 +55,8 @@ extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
 extern "C" int dmNvnVertexLayout(const uint32_t **attr, int *nattr, const uint32_t **stream, int *nstream);
 static int vk_buf_create(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *out, VkDeviceMemory *mem, bool host);
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
+extern "C" uint64_t dmVkBindPipelineWithSet(VkCommandBuffer cb, const char *k0, const char *k1);
+extern "C" int dmNvnReplayGetUBO(int i, unsigned *stage, unsigned *slot, uint64_t *addr, uint64_t *size);
 extern "C" uint64_t dmVkPipelineForKeysLayout(const char *k0, const char *k1,
     const uint32_t *attrs, int nattr, const uint32_t *streams, int nstream);
 extern "C" uint64_t dmVkCachedPipeline(const char *k0, const char *k1);
@@ -420,8 +424,9 @@ static void *vk_loop(void *arg)
                     int kind; char rk0[17], rk1[17]; unsigned ra = 0, rb = 0;
                     if (!dmNvnReplayGet(i, &kind, rk0, rk1, &ra, &rb)) break;
                     if (kind == 0) {
-                        uint64_t p = dmVkCachedPipeline(rk0, rk1);
-                        if (p != 0 && (VkPipeline)(uintptr_t)p != cur) { cur = (VkPipeline)(uintptr_t)p; vkCmdBindPipeline(cmdb, VK_PIPELINE_BIND_POINT_GRAPHICS, cur); }
+                        if (dmVkBindPipelineWithSet(cmdb, rk0, rk1)) { cur = VK_NULL_HANDLE; }
+                        else { uint64_t p = dmVkCachedPipeline(rk0, rk1);
+                               if (p != 0 && (VkPipeline)(uintptr_t)p != cur) { cur = (VkPipeline)(uintptr_t)p; vkCmdBindPipeline(cmdb, VK_PIPELINE_BIND_POINT_GRAPHICS, cur); } }
                     } else if (kind == 2 && g_bind_test) {
                         unsigned nvb = 0; uint64_t ba[4] = {0}, bs[4] = {0};
                         if (dmNvnReplayGetVB(i, &nvb, ba, bs) && nvb > 0) {
@@ -728,7 +733,7 @@ extern "C" int dmVkDslBindings(void) { return g_dsl_bindings; }
 
 /* M3-3:从 dmsh_xlate 的 .res.json 反射里抽 binding(按段落判定类型),
  * 生成真实 VkDescriptorSetLayout。返回绑定数;json 不存在返回 0。 */
-static int dsl_bindings(const char *json, VkDescriptorSetLayoutBinding *out, uint32_t maxn)
+static int dsl_bindings(const char *json, VkDescriptorSetLayoutBinding *out, uint32_t *slots, VkDescriptorType *types_out, uint32_t maxn)
 {
     const char *secs[][2] = {{"cbufs",0},{"sbufs",0},{"textures",0},{"samplers",0},{"images",0}};
     VkDescriptorType types[5] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -744,7 +749,10 @@ static int dsl_bindings(const char *json, VkDescriptorSetLayoutBinding *out, uin
             const char *q = strchr(p, ':'); if (!q) break;
             int b = atoi(q + 1);
             out[n].binding = (uint32_t)b; out[n].descriptorType = types[cur];
-            out[n].descriptorCount = 1; out[n].stageFlags = VK_SHADER_STAGE_ALL; n++;
+            out[n].descriptorCount = 1; out[n].stageFlags = VK_SHADER_STAGE_ALL;
+            if (slots) { const char *q2 = strstr(q, "\"slot\""); slots[n] = q2 ? (uint32_t)atoi(strchr(q2, ':') + 1) : 0xFFFFFFFFu; }
+            if (types_out) types_out[n] = out[n].descriptorType;
+            n++;
         }
     }
     return n;
@@ -774,7 +782,7 @@ extern "C" uint64_t dmVkCreateComputePipeline(const char *path)
             static char jb[65536];
             size_t jn = fread(jb, 1, sizeof(jb) - 1, jf); fclose(jf);
             jb[jn] = 0;
-            nb = dsl_bindings(jb, binds, 64);
+            nb = dsl_bindings(jb, binds, NULL, NULL, 64);
         }
     }
     VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -922,12 +930,15 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
             FILE *jf = fopen(jp, "rb");
             if (!jf) continue;
             size_t jn = fread(jb, 1, sizeof(jb) - 1, jf); fclose(jf); jb[jn] = 0;
-            VkDescriptorSetLayoutBinding tmp[64] = {};
-            int tn = dsl_bindings(jb, tmp, 64);
+            VkDescriptorSetLayoutBinding tmp[64] = {}; uint32_t tslot[64]; VkDescriptorType ttype[64];
+            int tn = dsl_bindings(jb, tmp, tslot, ttype, 64);
             for (int i = 0; i < tn && nb < 128; i++) {
                 int dup = 0;
                 for (int k = 0; k < nb; k++) if (binds[k].binding == tmp[i].binding) { dup = 1; break; }
-                if (!dup) binds[nb++] = tmp[i];
+                if (!dup) {
+                    if (nb < 16) { g_last_binding[nb] = tmp[i].binding; g_last_slot[nb] = tslot[i]; g_last_type[nb] = ttype[i]; }
+                    binds[nb] = tmp[i]; nb++;
+                }
             }
         }
     }
@@ -1043,6 +1054,7 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
     VkResult r = vkCreateGraphicsPipelines(g_upload_dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe);
     if (r == VK_SUCCESS && pipe != VK_NULL_HANDLE) {
         g_gpipe = pipe; g_gpipe_layout = pl; g_gpipe_rp = rp;
+        g_last_dsl = dsl; g_last_nbind = nb > 16 ? 16 : nb;
         /* M4:为每个 binding 写占位资源(统一缓冲=4KB buffer,纹理=1x1 白图+采样器) */
         {
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -1153,7 +1165,9 @@ extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
 extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
 extern "C" int dmVkPipelineCacheCount(void);
 typedef struct { char k0[17], k1[17]; VkPipeline pipe; VkPipelineLayout layout; VkRenderPass rp;
-    VkDescriptorSetLayout dsl; VkDescriptorPool pool; VkDescriptorSet set; VkBuffer ubos[8]; VkDeviceMemory ubom[8]; int nubo; } keypipe_t;
+    VkDescriptorSetLayout dsl; VkDescriptorPool pool; VkDescriptorSet set;
+    int nbind; uint32_t binding[16]; uint32_t slot[16]; VkDescriptorType type[16];
+    uint64_t ub_addr[16]; uint64_t ub_size[16]; VkBuffer ub_buf[16]; VkDeviceMemory ub_mem[16]; } keypipe_t;
 static keypipe_t g_kp[64];
 static int g_kp_n;
 extern "C" int dmVkPipelineCacheCount(void) { return g_kp_n; }
@@ -1207,6 +1221,90 @@ extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1)
     g_kp[g_kp_n].pipe = made;
     g_kp[g_kp_n].layout = made_pl;
     g_kp[g_kp_n].rp = made_rp;
+    g_kp[g_kp_n].dsl = g_last_dsl;
+    g_kp[g_kp_n].pool = VK_NULL_HANDLE; g_kp[g_kp_n].set = VK_NULL_HANDLE;
+    g_kp[g_kp_n].nbind = g_last_nbind;
+    for (int b = 0; b < g_last_nbind; b++) {
+        g_kp[g_kp_n].binding[b] = g_last_binding[b];
+        g_kp[g_kp_n].slot[b] = g_last_slot[b];
+        g_kp[g_kp_n].type[b] = g_last_type[b];
+        g_kp[g_kp_n].ub_addr[b] = 0; g_kp[g_kp_n].ub_size[b] = 0;
+        g_kp[g_kp_n].ub_buf[b] = VK_NULL_HANDLE; g_kp[g_kp_n].ub_mem[b] = VK_NULL_HANDLE;
+    }
     g_kp_n++;
+    return 1;
+}
+
+
+/* ================= M5:按 res.json binding↔slot 绑 UBO/纹理,再绑管线 ================= */
+
+static keypipe_t *kp_find(const char *k0, const char *k1)
+{
+    for (int i = 0; i < g_kp_n; i++)
+        if (strcmp(g_kp[i].k0, k0) == 0 && strcmp(g_kp[i].k1, k1) == 0) return &g_kp[i];
+    return NULL;
+}
+static int kp_ubo_for_slot(keypipe_t *e, int b, uint64_t addr, uint64_t size)
+{
+    if (addr == 0 || size == 0 || size > (1u << 20)) return 0;
+    if (e->ub_buf[b] != VK_NULL_HANDLE && e->ub_addr[b] == addr && e->ub_size[b] == size) return 1;
+    if (e->ub_buf[b] == VK_NULL_HANDLE) {
+        if (vk_buf_create((VkDeviceSize)size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &e->ub_buf[b], &e->ub_mem[b], true) != 0) {
+            e->ub_buf[b] = VK_NULL_HANDLE; return 0;
+        }
+    }
+    void *m = nullptr;
+    if (vkMapMemory(g_upload_dev, e->ub_mem[b], 0, (VkDeviceSize)size, 0, &m) != VK_SUCCESS) return 0;
+    memcpy(m, (const void *)(uintptr_t)addr, (size_t)size);
+    vkUnmapMemory(g_upload_dev, e->ub_mem[b]);
+    e->ub_addr[b] = addr; e->ub_size[b] = size;
+    return 1;
+}
+extern "C" uint64_t dmVkBindPipelineWithSet(VkCommandBuffer cb, const char *k0, const char *k1)
+{
+    keypipe_t *e = kp_find(k0, k1);
+    if (e == NULL || e->pipe == VK_NULL_HANDLE) return 0;
+    if (e->set == VK_NULL_HANDLE && e->dsl != VK_NULL_HANDLE && g_upload_dev != VK_NULL_HANDLE) {
+        VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32},
+                                       {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},
+                                       {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32}};
+        VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpci.maxSets = 1; dpci.poolSizeCount = 3; dpci.pPoolSizes = ps;
+        if (vkCreateDescriptorPool(g_upload_dev, &dpci, nullptr, &e->pool) == VK_SUCCESS) {
+            VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            dsai.descriptorPool = e->pool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &e->dsl;
+            if (vkAllocateDescriptorSets(g_upload_dev, &dsai, &e->set) != VK_SUCCESS) e->set = VK_NULL_HANDLE;
+        }
+        if (e->set != VK_NULL_HANDLE) {
+            VkWriteDescriptorSet wr[16]; VkDescriptorBufferInfo bi[16]; VkDescriptorImageInfo ii[16];
+            int nw = 0;
+            for (int b = 0; b < e->nbind; b++) {
+                VkWriteDescriptorSet *w = &wr[nw];
+                w->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w->dstSet = e->set; w->dstBinding = e->binding[b]; w->descriptorCount = 1;
+                w->descriptorType = e->type[b];
+                if (e->type[b] == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || e->type[b] == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    uint64_t a = 0, sz = 0;
+                    for (int u = 0; ; u++) {
+                        unsigned st = 0, sl = 0; uint64_t ua = 0, us = 0;
+                        if (!dmNvnReplayGetUBO(u, &st, &sl, &ua, &us)) break;
+                        if (sl == e->slot[b]) { a = ua; sz = us; break; }
+                    }
+                    (void)kp_ubo_for_slot(e, b, a, sz);
+                    bi[nw].buffer = e->ub_buf[b] != VK_NULL_HANDLE ? e->ub_buf[b] : g_dummy_buf;
+                    bi[nw].offset = 0; bi[nw].range = e->ub_size[b] ? e->ub_size[b] : VK_WHOLE_SIZE;
+                    w->pBufferInfo = &bi[nw];
+                } else {
+                    ii[nw].sampler = g_dummy_samp; ii[nw].imageView = g_dummy_view;
+                    ii[nw].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    w->pImageInfo = &ii[nw];
+                }
+                nw++;
+            }
+            if (nw > 0) vkUpdateDescriptorSets(g_upload_dev, nw, wr, 0, nullptr);
+        }
+    }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, e->pipe);
+    if (e->set != VK_NULL_HANDLE) vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, e->layout, 0, 1, &e->set, 0, nullptr);
     return 1;
 }
