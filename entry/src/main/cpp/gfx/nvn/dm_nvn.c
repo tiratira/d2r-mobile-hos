@@ -1161,6 +1161,9 @@ static void *nvn_stats_thread(void *arg)
                     FILE *vf2 = fopen("/data/storage/el2/base/haps/entry/files/dm_vfmt.txt", "w");
                     if (vf2 != NULL) {
                         for (int i = 0; i < 256; i++) if (g_vfmt_hist[i]) fprintf(vf2, "fmt=0x%02x count=%u\n", i, g_vfmt_hist[i]);
+                        for (int i = 0; i < g_vattr_n; i++)
+                            fprintf(vf2, "raw[%d]=%08x fmt=0x%02x off=%u stream=%u\n", i, g_vattr[i],
+                                    g_vattr[i] & 0xFF, (g_vattr[i] >> 8) & 0x7FFFF, (g_vattr[i] >> 27) & 0x1F);
                         fclose(vf2);
                     }
                 }
