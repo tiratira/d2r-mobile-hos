@@ -13,6 +13,9 @@ VK_EXT_fragment_shader_interlock,真机上表现为 vkCreateGraphicsPipelines
 """
 import struct, os, sys, glob
 
+CAPS = {5013, 5014, 5372, 5378, 4448, 4449}          # *InterlockEXT 能力(5378 实测出现)
+DECS = set(range(5069, 5073)) | {5250, 5251, 5379, 5380, 5381, 5382}  # 排序装饰
+
 def strip(path):
     d = open(path, "rb").read()
     if len(d) < 20 or d[:4] != b"\x03\x02\x23\x07":
@@ -25,10 +28,14 @@ def strip(path):
         ins.append((i, wc, op)); i += wc
     drop, cnt = set(), 0
     for j, wc, op in ins:
-        if op == 10:  # OpExtension
+        if op == 10:  # OpExtension(任意 interlock 扩展)
             s = d[(j + 1) * 4:].split(b"\0")[0].decode(errors="ignore")
-            if s == "SPV_EXT_fragment_shader_interlock":
+            if "interlock" in s.lower():
                 drop.add(j); cnt += 1
+        if op == 17 and wc >= 2 and w[j + 1] in CAPS:   # OpCapability
+            drop.add(j); cnt += 1
+        if op == 71 and wc >= 3 and w[j + 2] in DECS:   # OpDecorate 排序语义
+            drop.add(j); cnt += 1
     if not drop:
         return None, 0
     i, keep = 5, []
