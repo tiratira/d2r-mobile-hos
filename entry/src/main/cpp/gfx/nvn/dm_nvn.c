@@ -96,6 +96,36 @@ typedef struct {
 static uint32_t g_nvn_devs, g_nvn_queues, g_nvn_wins, g_nvn_cbs, g_nvn_pools;
 static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 
+/* ---- 真机实测:客体会读「NVN device 容器」base+0x448 处的一张函数表 ----
+ * 设备对象在容器 base+0xA08;调用方对象在 base+0x360,它 +0xE8 正好是
+ * base+0x448。表结构: [表+16]=条目数组;条目 24 字节, [条目+16]=函数指针。
+ * 宿主先用一张全 stub 表填上,让引擎的这对分发调用不再跳空,再看下一步。 */
+#define NVN_DISP_N 256
+typedef struct { uint64_t a, b, fn; } nvn_disp_ent_t;   /* 24 bytes */
+static nvn_disp_ent_t g_disp_ents[NVN_DISP_N];
+static struct { uint64_t pad0, pad1; void *entries; } g_disp_table;
+
+static uint64_t nvn_disp_stub(void)
+{
+    static uint8_t dummy[0x100];
+    return (uint64_t)(uintptr_t)dummy;
+}
+
+static void nvn_fill_dispatch(void *dev)
+{
+    if (g_disp_table.entries == NULL) {
+        for (int i = 0; i < NVN_DISP_N; i++) {
+            g_disp_ents[i].a = 0;
+            g_disp_ents[i].b = 0;
+            g_disp_ents[i].fn = (uint64_t)(uintptr_t)&nvn_disp_stub;
+        }
+        g_disp_table.entries = g_disp_ents;
+    }
+    uint8_t *slot = (uint8_t *)dev - 0x5C0;   /* dev 在容器 +0xA08,表在 +0x448 */
+    *(void **)slot = &g_disp_table;
+    DMLOG_I("NVN device dispatch table filled at dev-0x5c0");
+}
+
 static void nvn_devb_defaults(void *b) { if (b) { memset(b, 0, sizeof(nvn_devb_t)); ((nvn_devb_t *)b)->magic = NVN_MAGIC_DEV; } }
 static void nvn_devb_setflags(void *b, int f) { if (b) ((nvn_devb_t *)b)->flags = (uint32_t)f; }
 static void nvn_devb_getflags(void *b, int *out) { if (b && out) *out = (int)((nvn_devb_t *)b)->flags; }
@@ -558,4 +588,6 @@ const char *dmNvnSelfTest(void)
              a ? "ok" : "null", b == 0 ? "null" : "non-null");
     return report;
 }
+
+
 
