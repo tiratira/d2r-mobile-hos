@@ -99,7 +99,39 @@
 4. **纹理格式种类多**：Tegra swizzle + BC 解码 + sRGB/深度格式容易出细节错误；
 5. **法律边界**：着色器包与游戏数据只从用户自己的游戏文件离线生成，不入库、不随包分发。
 
-## 5. 建议的下一步（可直接开始）
+## 5. M0 进展（已完成）
+
+本机已经跑通**着色器 SPIR-V 离线生成**（Vulkan 路线不需要 MSL/metallib）：
+
+1. 素材：`E:\d2r-romfs-v2228224\data`（已提取的 RomFS，含 `build_manifest.psv`）；
+   用 `dm/tools/dmx.py list 'data:data/hd/shaders/*.bin'` 列出并提取 162 个 shader pack
+   （114 MB）到 `dm-work/build/cache/dm/dmsh/`。
+2. 翻译器：安装 .NET SDK 10（`D:\Tools\dotnet10`，10.0.402），
+   `dotnet publish dm/gfx/tools/dmsh_xlate` 成功；`--source-sha` = a7c403f8030ebcd9。
+3. 只出 SPIR-V：新增 `dmsh_spv.py`（`dmsh_build.py` 的裁剪版：跳过 spirv-cross/MSL/metallib
+   与缓存链，直接保留 `dmsh_xlate` 的 `<key>.spv` + `<key>.res.json`）。
+   命令（UTF-8 模式，Windows 必需）：
+   ```
+   $env:PYTHONUTF8='1'; $env:XLATE='...\dmsh_xlate.exe'
+   $env:MAIN='...\dm-work\data\switch\3.3.94012\Update\ExeFS\main'
+   python dmsh_spv.py dm-work/build/cache/dm/dmsh dm-work/build/hos_shaders/spv
+   ```
+   结果：**6704 个 SPIR-V 变体，全部成功，共 350 MB**（`XLATE_DEBUG=0`；开 debug 时
+   6927 个 / 585 MB）+ 6704 份 `<key>.res.json` 反射（13 MB）。
+4. 运行时键：`<key>` = Switch 着色器控制段 sha256 前 16 位（`nvnProgramSetShaders`
+   时游戏给的控制段可直接算出），与 `shader_map.tsv` 第 4 列一致；阶段（vs/ps/cs）
+   也在该表。`res.json` 给出存储缓冲/c0 偏移等，可在 Vulkan 侧生成 descriptor 绑定。
+
+**M0 验收：通过**（6704/6704）。
+
+## 6. 下一步（M1 起）
+
+1. 把 SPIR-V 资产打包进 app：350 MB 原样推设备 files 目录，或 deflate 后作为资源
+   （运行时解压到内存再 `vkCreateShaderModule`）；
+2. M1：移植记录层（对象模型 + 命令流），M2 资源层，M3 管线/描述符，M4 回放 + present，
+   M5 稳定/性能。
+
+## 7. 建议的下一步（可直接开始）
 
 1. 安装 .NET SDK 10，构建 `dmsh_xlate` 并跑通 `--source-sha`；
 2. 给 app 增加 romfs 清单 + shader pack 拉取，把 162 个 pack 取到构建缓存；
