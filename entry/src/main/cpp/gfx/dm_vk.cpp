@@ -1027,6 +1027,22 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
                 vi.vertexAttributeDescriptionCount = nva; vi.pVertexAttributeDescriptions = vas;
             }
         }
+        /* 录制布局为空时(常见:管线在绑定前创建),按 SPIR-V 输入合成属性,
+         * 保证 Location 齐全,避免驱动返回 OOM(VUID-Input-07904)。 */
+        if (vi.vertexAttributeDescriptionCount == 0 && vin_n > 0) {
+            for (int k = 0; k < vin_n && k < 16; k++) {
+                via[k].location = vin[k].loc; via[k].binding = 0;
+                via[k].offset = (uint32_t)(k * 4);
+                int comps = (int)vin[k].comp; if (comps < 1 || comps > 4) comps = 4;
+                if (vin[k].ctype == 1)
+                    via[k].format = comps == 1 ? VK_FORMAT_R32_SFLOAT : comps == 2 ? VK_FORMAT_R32G32_SFLOAT : comps == 3 ? VK_FORMAT_R32G32B32_SFLOAT : VK_FORMAT_R32G32B32A32_SFLOAT;
+                else
+                    via[k].format = comps == 1 ? VK_FORMAT_R32_SINT : comps == 2 ? VK_FORMAT_R32G32_SINT : comps == 3 ? VK_FORMAT_R32G32B32_SINT : VK_FORMAT_R32G32B32A32_SINT;
+            }
+            vib.stride = (uint32_t)(vin_n * 4);
+            vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vib;
+            vi.vertexAttributeDescriptionCount = (uint32_t)vin_n; vi.pVertexAttributeDescriptions = via;
+        }
     }
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1215,7 +1231,24 @@ extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1)
     VkPipeline made = g_gpipe; VkRenderPass made_rp = g_gpipe_rp; VkPipelineLayout made_pl = g_gpipe_layout;
     /* 探针管线保持不变 */
     g_gpipe = keep_pipe; g_gpipe_rp = keep_rp; g_gpipe_layout = keep_pl;
-    if (!ok || made == VK_NULL_HANDLE) return 0;
+    if (!ok || made == VK_NULL_HANDLE) {
+        static int nfail;
+        if (nfail < 24) {
+            FILE *pf = fopen("/data/storage/el2/base/haps/entry/files/dm_pfail.txt", nfail ? "a" : "w");
+            if (pf != NULL) {
+                fprintf(pf, "FAIL %s %s err=%d layout attr=%d stream=%d ov=%d\n",
+                        k0, k1, (int)g_gpipe_err, g_ov_nattr, g_ov_nstream, g_ov_attr != NULL);
+                for (int q = 0; q < g_ov_nattr && q < 16; q++)
+                    fprintf(pf, "  attr[%d] fmt=0x%02x off=%u st=%u\n", q, g_ov_attr[q] & 0xFF,
+                            (g_ov_attr[q] >> 8) & 0x7FFFF, (g_ov_attr[q] >> 27) & 0x1F);
+                for (int q = 0; q + 1 < g_ov_nstream && q < 16; q += 2)
+                    fprintf(pf, "  stream[%d] stride=%u divisor=%u\n", q / 2, g_ov_stream[q], g_ov_stream[q + 1]);
+                fclose(pf);
+            }
+            nfail++;
+        }
+        return 0;
+    }
     snprintf(g_kp[g_kp_n].k0, sizeof g_kp[0].k0, "%s", k0);
     snprintf(g_kp[g_kp_n].k1, sizeof g_kp[0].k1, "%s", k1);
     g_kp[g_kp_n].pipe = made;
