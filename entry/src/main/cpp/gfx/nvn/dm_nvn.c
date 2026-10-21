@@ -158,10 +158,10 @@ static void nvn_qb_defaults(void *b)
     if (b) { memset(b, 0, sizeof(nvn_queueb_t)); ((nvn_queueb_t *)b)->magic = NVN_MAGIC_QUEUE; ((nvn_queueb_t *)b)->prio = 0; }
 }
 static void nvn_qb_setdev(void *b, void *d) { if (b) { ((nvn_queueb_t *)b)->dev = d; DMLOG_I("NVN qb setdev b=%{public}llx d=%{public}llx", (unsigned long long)(uintptr_t)b, (unsigned long long)(uintptr_t)d); } }
-static void nvn_qb_setcmdsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->cmdsz = n; }
+static void nvn_qb_setcmdsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->cmdsz = n; DMLOG_I("NVN qb cmdsz=%{public}llu", (unsigned long long)n); }
 static void nvn_qb_setcompsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->compsz = n; }
 static void nvn_qb_setctlsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->ctlsz = n; }
-static void nvn_qb_setqmem(void *b, void *m, uint64_t n) { if (b) { ((nvn_queueb_t *)b)->qmem = (uint64_t)(uintptr_t)m; ((nvn_queueb_t *)b)->qmemsz = n; } }
+static void nvn_qb_setqmem(void *b, void *m, uint64_t n) { if (b) { ((nvn_queueb_t *)b)->qmem = (uint64_t)(uintptr_t)m; ((nvn_queueb_t *)b)->qmemsz = n; } DMLOG_I("NVN qb qmem=%{public}llx size=%{public}llu", (unsigned long long)(uintptr_t)m, (unsigned long long)n); }
 static void nvn_qb_setflush(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->flush = n; }
 static void nvn_qb_setprio(void *b, int n) { if (b) ((nvn_queueb_t *)b)->prio = n; }
 static uint32_t nvn_queue_init(void *q, const void *b)
@@ -225,8 +225,8 @@ static uint32_t nvn_win_present(void *w, const void *tex)
 
 static void nvn_poolb_defaults(void *b) { if (b) { memset(b, 0, sizeof(nvn_poolb_t)); ((nvn_poolb_t *)b)->magic = NVN_MAGIC_POOL; } }
 static void nvn_poolb_setdev(void *b, void *d) { if (b) ((nvn_poolb_t *)b)->dev = d; }
-static void nvn_poolb_setsize(void *b, uint64_t n) { if (b) ((nvn_poolb_t *)b)->size = n; }
-static void nvn_poolb_setmem(void *b, void *m) { if (b) ((nvn_poolb_t *)b)->mem = m; }
+static void nvn_poolb_setsize(void *b, uint64_t n) { if (b) ((nvn_poolb_t *)b)->size = n; DMLOG_I("NVN poolb size=%{public}llu", (unsigned long long)n); }
+static void nvn_poolb_setmem(void *b, void *m, uint64_t n) { if (b) { ((nvn_poolb_t *)b)->mem = m; ((nvn_poolb_t *)b)->size = n; } DMLOG_I("NVN poolb storage mem=%{public}llx size=%{public}llu", (unsigned long long)(uintptr_t)m, (unsigned long long)n); }
 static void nvn_poolb_setflags(void *b, int f) { if (b) ((nvn_poolb_t *)b)->flags = (uint32_t)f; }
 static uint32_t nvn_pool_init(void *p, const void *b)
 {
@@ -618,6 +618,8 @@ const char *dmNvnSelfTest(void)
              a ? "ok" : "null", b == 0 ? "null" : "non-null");
     return report;
 }
+
+
 
 
 
