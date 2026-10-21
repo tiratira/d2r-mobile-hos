@@ -733,7 +733,8 @@ static int nvn_texb_getrawclass(const void *b) { (void)b; return 0; }
  * nvn.h: nvnProgramSetShaders(NVNprogram*, int n, const NVNshaderData *sd),
  * NVNshaderData = { const void *data; size_t size; }。键与 shader_map.tsv 第 4 列、
  * 以及离线 SPIR-V 的文件名一致,回放层据此找 <key>.spv/.res.json。 */
-typedef struct { const void *data; size_t size; } nvn_shader_data_t;
+/* nvn.h: NVNshaderData = { NVNbufferAddress data; const void* control; } */
+typedef struct { uint64_t data; const void *control; } nvn_shader_data_t;
 static char g_prog_keys[512][17];
 static int g_prog_key_n;
 static int g_progs;
@@ -745,16 +746,9 @@ static uint32_t nvn_program_setshaders(void *prog, int n, const void *sdv)
     if (n < 0 || n > 6 || sdv == NULL) return 0;
     const nvn_shader_data_t *sd = (const nvn_shader_data_t *)sdv;
     for (int i = 0; i < n && g_prog_key_n < 512; i++) {
-        const uint8_t *d = (const uint8_t *)sd[i].data;
-        if (d == NULL || sd[i].size < 0x880 + 0x38 || sd[i].size > (16u << 20) || ((uintptr_t)d & 3)) continue;
-        /* 控制段起点:着色器记录里的魔数 0x34127698(小端 98 76 12 34) */
-        size_t off = 0, lim = sd[i].size > 0x1000 ? 0x1000 : sd[i].size - 0x880;
-        int found = 0;
-        for (; off <= lim; off++) {
-            if (d[off] == 0x98 && d[off+1] == 0x76 && d[off+2] == 0x12 && d[off+3] == 0x34) { found = 1; break; }
-        }
-        if (!found) continue;
-        sha256_hex16(d + off, 0x880, g_prog_keys[g_prog_key_n]);
+        const uint8_t *c = (const uint8_t *)sd[i].control;
+        if (c == NULL || ((uintptr_t)c & 3)) continue;
+        sha256_hex16(c, 0x880, g_prog_keys[g_prog_key_n]);
         g_prog_key_n++;
     }
     g_progs++;
@@ -776,45 +770,64 @@ static void sha256_hex16(const void *in, size_t len, char out[17])
 {
     const uint8_t *p = (const uint8_t *)in;
     uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
-    uint8_t blk[64];
-    size_t total = len;
-    for (size_t off = 0; off < len; off += 64) {
-        size_t n = len - off < 64 ? len - off : 64;
-        memcpy(blk, p + off, n);
-        if (n < 64) {
-            blk[n] = 0x80; memset(blk + n + 1, 0, 63 - n);
-            if (n >= 56) { /* 需要额外块:这里 len 固定 0x880,不会走到 */ }
-            uint64_t bits = (uint64_t)total * 8;
-            for (int k = 0; k < 8; k++) blk[63 - k] = (uint8_t)(bits >> (8 * k));
-        }
-        uint32_t w[64];
-        for (int i = 0; i < 16; i++) w[i] = ((uint32_t)blk[i*4] << 24) | ((uint32_t)blk[i*4+1] << 16) | ((uint32_t)blk[i*4+2] << 8) | blk[i*4+3];
-        for (int i = 16; i < 64; i++) {
-            uint32_t s0 = ROR32(w[i-15],7) ^ ROR32(w[i-15],18) ^ (w[i-15] >> 3);
-            uint32_t s1 = ROR32(w[i-2],17) ^ ROR32(w[i-2],19) ^ (w[i-2] >> 10);
-            w[i] = w[i-16] + s0 + w[i-7] + s1;
+    uint32_t w[64];
+    size_t i = 0;
+    while (i + 64 <= len) {
+        for (int k = 0; k < 16; k++)
+            w[k] = ((uint32_t)p[i+k*4]<<24)|((uint32_t)p[i+k*4+1]<<16)|((uint32_t)p[i+k*4+2]<<8)|p[i+k*4+3];
+        i += 64;
+        for (int k = 16; k < 64; k++) {
+            uint32_t s0 = ROR32(w[k-15],7) ^ ROR32(w[k-15],18) ^ (w[k-15] >> 3);
+            uint32_t s1 = ROR32(w[k-2],17) ^ ROR32(w[k-2],19) ^ (w[k-2] >> 10);
+            w[k] = w[k-16] + s0 + w[k-7] + s1;
         }
         uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
-        for (int i = 0; i < 64; i++) {
+        for (int k = 0; k < 64; k++) {
             uint32_t S1 = ROR32(e,6) ^ ROR32(e,11) ^ ROR32(e,25);
             uint32_t ch = (e & f) ^ (~e & g);
-            uint32_t t1 = hh + S1 + ch + K256[i] + w[i];
+            uint32_t t1 = hh + S1 + ch + K256[k] + w[k];
             uint32_t S0 = ROR32(a,2) ^ ROR32(a,13) ^ ROR32(a,22);
             uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
             uint32_t t2 = S0 + mj;
             hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
         }
         h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
-        if (n < 64) break;
+    }
+    /* 末尾补齐:0x80 + 0 + 64 位长度(恰好 64 字节时也要多一个块) */
+    uint8_t pad[128];
+    size_t rem = len - i;
+    memset(pad, 0, sizeof(pad));
+    if (rem) memcpy(pad, p + i, rem);
+    pad[rem] = 0x80;
+    size_t padlen = (rem < 56) ? 64 : 128;
+    uint64_t bits = (uint64_t)len * 8;
+    for (int k = 0; k < 8; k++) pad[padlen - 1 - k] = (uint8_t)(bits >> (8 * k));
+    for (size_t off = 0; off < padlen; off += 64) {
+        for (int k = 0; k < 16; k++)
+            w[k] = ((uint32_t)pad[off+k*4]<<24)|((uint32_t)pad[off+k*4+1]<<16)|((uint32_t)pad[off+k*4+2]<<8)|pad[off+k*4+3];
+        for (int k = 16; k < 64; k++) {
+            uint32_t s0 = ROR32(w[k-15],7) ^ ROR32(w[k-15],18) ^ (w[k-15] >> 3);
+            uint32_t s1 = ROR32(w[k-2],17) ^ ROR32(w[k-2],19) ^ (w[k-2] >> 10);
+            w[k] = w[k-16] + s0 + w[k-7] + s1;
+        }
+        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int k = 0; k < 64; k++) {
+            uint32_t S1 = ROR32(e,6) ^ ROR32(e,11) ^ ROR32(e,25);
+            uint32_t ch = (e & f) ^ (~e & g);
+            uint32_t t1 = hh + S1 + ch + K256[k] + w[k];
+            uint32_t S0 = ROR32(a,2) ^ ROR32(a,13) ^ ROR32(a,22);
+            uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+            hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+S0+mj;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
     }
     static const char hexd[] = "0123456789abcdef";
-    for (int i = 0; i < 8; i++) {
+    for (int q = 0; q < 8; q++)
         for (int k = 0; k < 4; k++) {
-            uint8_t byte = (uint8_t)(h[i] >> (24 - 8*k));
-            out[i*4 + k*2] = hexd[byte >> 4];
-            out[i*4 + k*2 + 1] = hexd[byte & 15];
+            uint8_t byte = (uint8_t)(h[q] >> (24 - 8*k));
+            out[q*8 + k*2] = hexd[byte >> 4];
+            out[q*8 + k*2 + 1] = hexd[byte & 15];
         }
-    }
     out[16] = 0;
 }
 
