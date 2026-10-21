@@ -220,7 +220,7 @@ static uint32_t nvn_queue_init(void *q, const void *b)
 }
 static void nvn_queue_submit(void *q, int n, const void *handles)
 {
-    DMLOG_I("NVN queue submit q=%{public}llx n=%{public}d", (unsigned long long)(uintptr_t)q, n);
+    if (g_nvn_submits <= 5) DMLOG_I("NVN queue submit q=%{public}llx n=%{public}d", (unsigned long long)(uintptr_t)q, n);
     (void)handles;
     if (q) ((nvn_queue_t *)q)->submits++;
     g_nvn_submits++;
@@ -311,9 +311,24 @@ static void nvn_cb_addctlmem(void *c, void *m, uint64_t n)
 static void nvn_cb_begin(void *c) { if (c) { ((nvn_cb_t *)c)->recording = 1; DMLOG_I("NVN cb begin c=%{public}llx", (unsigned long long)(uintptr_t)c); } }
 static uint64_t nvn_cb_end(void *c)
 {
-    if (c == NULL) return 0;
-    ((nvn_cb_t *)c)->recording = 0;
-    return ++((nvn_cb_t *)c)->handles;
+    nvn_cb_t *o = (nvn_cb_t *)c;
+    if (o == NULL) return 0;
+    o->recording = 0;
+    /* NVNcommandHandle 是「命令内存里的地址」,不是自增计数;引擎会拿着它当
+     * 指针/地址用。把一条 8 字节命令头写进游戏给的命令内存,返回其地址。 */
+    uint8_t *base = NULL;
+    const nvn_pool_t *p = (const nvn_pool_t *)o->pool;
+    if (p != NULL && p->mem != NULL) {
+        base = (uint8_t *)p->mem + (size_t)o->pool_off;
+    } else {
+        static uint8_t fallback[4096];
+        base = fallback;
+    }
+    uint64_t *h = (uint64_t *)(base + ((o->handles * 8) & 0x7F8));
+    *h = 0;
+    o->handles++;
+    DMLOG_I("NVN cb end h=%{public}llx n=%{public}llu", (unsigned long long)(uintptr_t)h, (unsigned long long)o->handles);
+    return (uint64_t)(uintptr_t)h;
 }
 static uint32_t nvn_cb_isrec(const void *c) { return c ? ((const nvn_cb_t *)c)->recording : 0; }
 static void nvn_cb_clear_color(void *c, int idx, const float *rgba, int mask)
@@ -478,7 +493,32 @@ static uint64_t nvn_bufb_getsize(const void *b) { return b ? ((const nvn_bufb_t 
 static void *nvn_bufb_getpool(const void *b) { return b ? ((const nvn_bufb_t *)b)->pool : NULL; }
 static int64_t nvn_bufb_getoff(const void *b) { return b ? ((const nvn_bufb_t *)b)->off : 0; }
 
+
+/* ---- 纹理对象:GetStorageSize/GetViewOffset 都是直接返回值(nvn.h) ---- */
+typedef struct { uint32_t magic; uint32_t pad; uint64_t size; uint64_t align; void *dev; } nvn_tex_t;
+static uint32_t nvn_texture_init2(void *t, const void *b)
+{
+    if (t == NULL) return 0;
+    nvn_tex_t *o = (nvn_tex_t *)t;
+    memset(o, 0, sizeof(*o));
+    o->magic = 0x58544554U;
+    o->size = nvn_texb_size(b);
+    o->align = 4096;
+    return 1;
+}
+static int nvn_texture_get_storage_size(const void *t)
+{
+    const nvn_tex_t *o = (const nvn_tex_t *)t;
+    return o ? (int)o->size : 0;
+}
+static int64_t nvn_texture_get_view_offset(const void *t, const void *view)
+{
+    (void)t; (void)view;
+    return 0;
+}
+
 void dmNvnInit(void)
+
 {
     dm_nvn_register_traces();
     dmNvnRegister("nvnDeviceGetProcAddress", (nvn_func_t)h_nvn_device_get_proc);
@@ -544,7 +584,9 @@ void dmNvnInit(void)
     dmNvnRegister("nvnProgramSetShadersExt", (nvn_func_t)nvn_program_set_shaders);
     dmNvnRegister("nvnTexturePoolInitialize", (nvn_func_t)nvn_texture_pool_init);
     dmNvnRegister("nvnSamplerPoolInitialize", (nvn_func_t)nvn_sampler_pool_init);
-    dmNvnRegister("nvnTextureInitialize", (nvn_func_t)nvn_texture_init);
+    dmNvnRegister("nvnTextureInitialize", (nvn_func_t)nvn_texture_init2);
+    dmNvnRegister("nvnTextureGetStorageSize", (nvn_func_t)nvn_texture_get_storage_size);
+    dmNvnRegister("nvnTextureGetViewOffset", (nvn_func_t)nvn_texture_get_view_offset);
     dmNvnRegister("nvnSamplerInitialize", (nvn_func_t)nvn_sampler_init);
     dmNvnRegister("nvnBufferInitialize", (nvn_func_t)nvn_buffer_init);
     dmNvnRegister("nvnMemoryPoolGetBufferAddress", (nvn_func_t)nvn_pool_addr);

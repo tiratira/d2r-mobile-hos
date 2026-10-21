@@ -396,7 +396,27 @@ static int64_t now_mono_ns(void)
 }
 
 /* 处理线程/同步类 SVC;返回 1 = 已处理 */
+static int svc_thread_body(int num, uint64_t *regs);
+
+#ifdef __aarch64__
+uint64_t dm_host_stack_run(uint64_t sp_top, uint64_t fn, uint64_t a, uint64_t b);
+static _Thread_local uint8_t g_svc_host_stack[65536] __attribute__((aligned(16)));
+#endif
+
+/* svc 处理函数跑在客体线程的小栈上(十几 KiB),内部再 pthread_create/malloc
+ * 会栈溢出;整段切到 64 KiB 宿主栈执行。 */
 int svc_thread(int num, uint64_t *regs)
+{
+#ifdef __aarch64__
+    return (int)dm_host_stack_run((uint64_t)(uintptr_t)(g_svc_host_stack + sizeof(g_svc_host_stack)),
+                                  (uint64_t)(uintptr_t)&svc_thread_body,
+                                  (uint64_t)(uintptr_t)num, (uint64_t)(uintptr_t)regs);
+#else
+    return svc_thread_body(num, regs);
+#endif
+}
+
+static int svc_thread_body(int num, uint64_t *regs)
 {
     {
         thr_t *me = pthread_getspecific(g_keythr);

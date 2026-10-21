@@ -149,3 +149,20 @@ dm_thread_exit_to:              // x0 = 宿主栈顶,不返回
     mov x30, xzr
     bl dm_thread_exit_final
     brk #0
+
+// 在宿主栈上执行一段 C 代码并返回结果,然后切回原栈。
+// svc 处理函数运行在客体线程的小栈上,内部再调 pthread/malloc 会栈溢出。
+// x0=宿主栈顶, x1=函数, x2=a, x3=b -> x0 = 函数返回值
+    .globl dm_host_stack_run
+    .p2align 2
+dm_host_stack_run:
+    mov x9, sp
+    mov sp, x0
+    stp x9, x30, [sp, #-16]!
+    mov x16, x1
+    mov x0, x2
+    mov x1, x3
+    blr x16
+    ldp x9, x30, [sp], #16
+    mov sp, x9
+    ret

@@ -11,6 +11,32 @@
 #include "hal/dm_platform.h"
 #include "loader/dm_guest_loader.h"
 
+#ifdef __aarch64__
+/* 客体线程栈很小(十几 KiB),svc/supervisor 处理里做文件/线程/malloc 等宿主
+ * 调用会栈溢出。整段 gateway 处理切到 256 KiB 宿主栈(按嵌套深度偏移)。 */
+uint64_t svc_dispatch(uint32_t num, uint64_t *regs, uint64_t orig_addr);
+uint64_t dm_host_stack_run(uint64_t sp_top, uint64_t fn, uint64_t a, uint64_t b);
+static _Thread_local uint8_t g_gw_stack[262144] __attribute__((aligned(16)));
+static _Thread_local int g_gw_depth;
+struct gw_call { uint32_t num; uint64_t *regs; uint64_t orig; uint64_t ret; };
+static uint64_t gw_body(uint64_t arg)
+{
+    struct gw_call *c = (struct gw_call *)(uintptr_t)arg;
+    c->ret = svc_dispatch(c->num, c->regs, c->orig);
+    return c->ret;
+}
+static uint64_t gw_host_call(uint32_t num, uint64_t *regs, uint64_t orig)
+{
+    struct gw_call c = { num, regs, orig, 0 };
+    int depth = g_gw_depth++;
+    uint8_t *top = g_gw_stack + sizeof(g_gw_stack) - (size_t)depth * 65536;
+    dm_host_stack_run((uint64_t)(uintptr_t)top, (uint64_t)(uintptr_t)&gw_body,
+                      (uint64_t)(uintptr_t)&c, 0);
+    g_gw_depth = depth;
+    return c.ret;
+}
+#endif
+
 /* ---------- 未实现导入:记名桩(entry_hos.S 静态桩表) ---------- */
 #define DM_MAX_STUB 4096
 static unsigned g_nstub;
@@ -267,7 +293,11 @@ uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs)
                 }
                 return 0;
             default:
+#ifdef __aarch64__
+                return gw_host_call(g->arg, regs, g->orig);
+#else
                 return svc_dispatch(g->arg, regs, g->orig);
+#endif
             }
         }
         if (!g->ret) {

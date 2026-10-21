@@ -103,8 +103,8 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
         if (mm != NULL) {
             const unsigned long guest_base = (unsigned long)(uintptr_t)mm->base;
             const unsigned long main_vaddr = 0x4c000UL;   /* __dm_guest_main_start */
-            static const unsigned long slots[3] = {0x325ADA0UL, 0x325AE08UL, 0x325AE10UL};
-            for (int i = 0; i < 3; i++) {
+            static const unsigned long slots[] = {0x325ADA0UL, 0x325AE08UL, 0x325AE10UL, 0x327ADA0UL, 0x327AE08UL, 0x327AE10UL};
+            for (unsigned i = 0; i < sizeof(slots) / sizeof(slots[0]); i++) {
                 unsigned long addr = guest_base + (slots[i] - main_vaddr);
                 unsigned long v = 0;
                 struct iovec l = {&v, sizeof(v)};
