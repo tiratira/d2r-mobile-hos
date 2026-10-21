@@ -1296,8 +1296,8 @@ static void dm_dump_submit(int n, const uint64_t *h, uint64_t *outbuf, int maxw)
 static void dm_dump_frame(void)
 {
     static int done;
-    if (done) return;
-    if (getenv("DM_DUMP_FRAME") == NULL) return;
+    if (done || g_nvn_submits < 30 || g_rp_pub_n < 16) return;
+    /* 调试构建:总是抓一帧,便于 PC 端复现 */
     done = 1;
     mkdir("/data/storage/el2/base/haps/entry/files/frames", 0755);
     FILE *f = fopen("/data/storage/el2/base/haps/entry/files/frames/f000.dump", "wb");
