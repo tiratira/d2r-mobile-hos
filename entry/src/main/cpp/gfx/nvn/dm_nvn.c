@@ -257,6 +257,9 @@ static uint32_t nvn_queue_init(void *q, const void *b)
 typedef struct { uint32_t op, n; uint64_t a, b, c, d; float f[4]; } dm_op_t;
 enum { DM_OP_END = 0, DM_OP_CLEAR, DM_OP_BARRIER, DM_OP_DRAW, DM_OP_BIND, DM_OP_COPY, DM_OP_DISPATCH };
 static nvn_cb_t *g_cur_cb;
+static uint64_t g_addcmd_n, g_begin_n, g_end_n;
+static void *g_cb_ev[64]; static uint8_t g_cb_kind[64]; static int g_cb_ev_n;
+static void dm_cb_ev(void *cb, int kind) { if (g_cb_ev_n < 64) { g_cb_ev[g_cb_ev_n] = cb; g_cb_kind[g_cb_ev_n] = (uint8_t)kind; g_cb_ev_n++; } }
 static void *g_last_base; static uint64_t g_last_used; static void *g_last_pool;
 static uint64_t g_dm_ops;
 static uint32_t g_op_hist[16];
@@ -416,6 +419,7 @@ static void nvn_cb_finalize(void *c) { if (c) ((nvn_cb_t *)c)->magic = 0; }
 static void nvn_cb_setmemcb(void *c, void *fn, void *data) { (void)c; (void)fn; (void)data; }
 static void nvn_cb_addcmdmem(void *c, const void *pool, int64_t off, uint64_t n)
 {
+    g_addcmd_n++; dm_cb_ev(c, 1);
     DMLOG_I("NVN cb addcmd pool=%{public}llx off=%{public}lld n=%{public}llu", (unsigned long long)(uintptr_t)pool, (long long)off, (unsigned long long)n);
     if (c) { ((nvn_cb_t *)c)->pool = pool; ((nvn_cb_t *)c)->pool_off = off; ((nvn_cb_t *)c)->pool_size = n; }
 }
@@ -425,6 +429,7 @@ static void nvn_cb_addctlmem(void *c, void *m, uint64_t n)
 }
 static void nvn_cb_begin(void *c)
 {
+    g_begin_n++; dm_cb_ev(c, 2);
     if (c == NULL) return;
     ((nvn_cb_t *)c)->recording = 1;
     ((nvn_cb_t *)c)->used = 0;
@@ -435,6 +440,7 @@ static void nvn_cb_begin(void *c)
 }
 static uint64_t nvn_cb_end(void *c)
 {
+    g_end_n++; dm_cb_ev(c, 3);
     nvn_cb_t *o = (nvn_cb_t *)c;
     if (o == NULL) return 0;
     o->recording = 0;
@@ -975,6 +981,22 @@ static void *nvn_stats_thread(void *arg)
                     (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);
+            {
+                static int cb_dumped;
+                if (!cb_dumped) {
+                    cb_dumped = 1;
+                    FILE *cf = fopen("/data/storage/el2/base/haps/entry/files/dm_cb.txt", "w");
+                    if (cf != NULL) {
+                        fprintf(cf, "addcmd=%llu begin=%llu end=%llu last_base=%llx last_used=%llu last_pool=%llx\n",
+                                (unsigned long long)g_addcmd_n, (unsigned long long)g_begin_n, (unsigned long long)g_end_n,
+                                (unsigned long long)(uintptr_t)g_last_base, (unsigned long long)g_last_used,
+                                (unsigned long long)(uintptr_t)g_last_pool);
+                        for (int i = 0; i < g_cb_ev_n; i++)
+                            fprintf(cf, "ev kind=%u cb=%llx\n", g_cb_kind[i], (unsigned long long)(uintptr_t)g_cb_ev[i]);
+                        fclose(cf);
+                    }
+                }
+            }
             if (g_prog_key_n > 0) {
                 FILE *kf = fopen("/data/storage/el2/base/haps/entry/files/dm_keys.txt", "w");
                 if (kf != NULL) { for (int i = 0; i < g_prog_key_n; i++) fprintf(kf, "%s\n", g_prog_keys[i]); fclose(kf); }
