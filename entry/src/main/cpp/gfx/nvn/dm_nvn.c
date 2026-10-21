@@ -105,7 +105,7 @@ static uint32_t nvn_dev_init(void *d, const void *b)
     memset(d, 0, sizeof(nvn_dev_t));
     ((nvn_dev_t *)d)->magic = NVN_MAGIC_DEV;
     ((nvn_dev_t *)d)->flags = b ? ((const nvn_devb_t *)b)->flags : 0;
-    DMLOG_I("NVN device 初始化(宿主对象模型)");
+    DMLOG_I("NVN device init d=%{public}llx", (unsigned long long)(uintptr_t)d);
     g_nvn_devs++;
     return 1;
 }
@@ -123,7 +123,7 @@ static void nvn_qb_defaults(void *b)
 {
     if (b) { memset(b, 0, sizeof(nvn_queueb_t)); ((nvn_queueb_t *)b)->magic = NVN_MAGIC_QUEUE; ((nvn_queueb_t *)b)->prio = 0; }
 }
-static void nvn_qb_setdev(void *b, void *d) { if (b) ((nvn_queueb_t *)b)->dev = d; }
+static void nvn_qb_setdev(void *b, void *d) { if (b) { ((nvn_queueb_t *)b)->dev = d; DMLOG_I("NVN qb setdev b=%{public}llx d=%{public}llx", (unsigned long long)(uintptr_t)b, (unsigned long long)(uintptr_t)d); } }
 static void nvn_qb_setcmdsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->cmdsz = n; }
 static void nvn_qb_setcompsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->compsz = n; }
 static void nvn_qb_setctlsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->ctlsz = n; }
@@ -132,6 +132,7 @@ static void nvn_qb_setflush(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->f
 static void nvn_qb_setprio(void *b, int n) { if (b) ((nvn_queueb_t *)b)->prio = n; }
 static uint32_t nvn_queue_init(void *q, const void *b)
 {
+    DMLOG_I("NVN queue init q=%{public}llx", (unsigned long long)(uintptr_t)q);
     if (q == NULL) return 0;
     memset(q, 0, sizeof(nvn_queue_t));
     ((nvn_queue_t *)q)->magic = NVN_MAGIC_QUEUE;
@@ -159,6 +160,7 @@ static void nvn_winb_setinterval(void *b, int n) { if (b) ((nvn_winb_t *)b)->int
 static void nvn_winb_setnbuf(void *b, int n) { if (b) ((nvn_winb_t *)b)->ntex = n; }
 static uint32_t nvn_win_init(void *w, const void *b)
 {
+    DMLOG_I("NVN window init w=%{public}llx", (unsigned long long)(uintptr_t)w);
     if (w == NULL) return 0;
     memset(w, 0, sizeof(nvn_win_t));
     ((nvn_win_t *)w)->magic = NVN_MAGIC_WIN;
@@ -207,6 +209,7 @@ static uint32_t nvn_pool_init(void *p, const void *b)
 
 static uint32_t nvn_cb_init(void *c, void *d)
 {
+    DMLOG_I("NVN cb init c=%{public}llx dev=%{public}llx", (unsigned long long)(uintptr_t)c, (unsigned long long)(uintptr_t)d);
     if (c == NULL) return 0;
     memset(c, 0, sizeof(nvn_cb_t));
     ((nvn_cb_t *)c)->magic = NVN_MAGIC_CB;
@@ -555,3 +558,4 @@ const char *dmNvnSelfTest(void)
              a ? "ok" : "null", b == 0 ? "null" : "non-null");
     return report;
 }
+
