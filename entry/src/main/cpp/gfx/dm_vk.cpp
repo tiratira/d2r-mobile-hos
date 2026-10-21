@@ -38,6 +38,8 @@ static VkPipelineLayout g_gpipe_layout;
 static VkRenderPass g_gpipe_rp;
 static int g_draw_test = 1;   /* 回放 draw(不绑顶点缓冲,稳定) */
 static int g_bind_test;   /* 顶点缓冲绑定(管线缺顶点输入时会 hang,默认关) */
+static const uint32_t *g_ov_attr; static int g_ov_nattr;
+static const uint32_t *g_ov_stream; static int g_ov_nstream;
 static VkDescriptorSet g_gpipe_set;
 static VkDescriptorPool g_dummy_pool;
 static VkBuffer g_dummy_buf;
@@ -51,10 +53,13 @@ extern "C" int dmNvnNextRequestedPair(char *k0, char *k1);
 extern "C" int dmNvnVertexLayout(const uint32_t **attr, int *nattr, const uint32_t **stream, int *nstream);
 static int vk_buf_create(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer *out, VkDeviceMemory *mem, bool host);
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1);
+extern "C" uint64_t dmVkPipelineForKeysLayout(const char *k0, const char *k1,
+    const uint32_t *attrs, int nattr, const uint32_t *streams, int nstream);
 extern "C" uint64_t dmVkCachedPipeline(const char *k0, const char *k1);
 extern "C" int dmNvnReplayCount(void);
 extern "C" int dmNvnReplayGet(int i, int *kind, char *k0, char *k1, unsigned *a, unsigned *b);
 extern "C" int dmNvnReplayGetVB(int i, unsigned *n, uint64_t *addr, uint64_t *sz);
+extern "C" int dmNvnReplayGetLayout(int i, const uint32_t **attrs, int *nattr, const uint32_t **streams, int *nstream);
 extern "C" uint64_t dmVkReplayDrawCount(void);
 static _Atomic uint64_t g_replay_draws;
 static _Atomic int g_rp_cond;
@@ -955,7 +960,9 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     {
         const uint32_t *lva = NULL, *lvs = NULL; int lna = 0, lns = 0;
-        if (dmNvnVertexLayout(&lva, &lna, &lvs, &lns) && lna > 0) {
+        if (g_ov_attr != NULL && g_ov_nattr > 0) { lva = g_ov_attr; lna = g_ov_nattr; lvs = g_ov_stream; lns = g_ov_nstream; }
+        else (void)dmNvnVertexLayout(&lva, &lna, &lvs, &lns);
+        if (lna > 0) {
             VkVertexInputBindingDescription vbs[8]; uint32_t nvb = 0;
             VkVertexInputAttributeDescription vas[16]; uint32_t nva = 0;
             for (int k = 0; k < lna && k < 16 && nva < 16; k++) {
@@ -1148,6 +1155,15 @@ extern "C" int dmVkPipelineObjCount(void)
     int n = 0;
     for (int i = 0; i < g_kp_n; i++) if (g_kp[i].pipe != VK_NULL_HANDLE) n++;
     return n;
+}
+
+extern "C" uint64_t dmVkPipelineForKeysLayout(const char *k0, const char *k1,
+    const uint32_t *attrs, int nattr, const uint32_t *streams, int nstream)
+{
+    g_ov_attr = attrs; g_ov_nattr = nattr; g_ov_stream = streams; g_ov_nstream = nstream;
+    uint64_t r = dmVkPipelineForKeys(k0, k1);
+    g_ov_attr = NULL; g_ov_nattr = 0; g_ov_stream = NULL; g_ov_nstream = 0;
+    return r;
 }
 
 extern "C" uint64_t dmVkPipelineForKeys(const char *k0, const char *k1)

@@ -175,6 +175,7 @@ static uint64_t g_nvn_presents, g_nvn_submits, g_nvn_clears, g_nvn_ops;
 static uint64_t g_draws, g_pipe_hits;
 /* 上游 nvn_obj.h: va_st{ fmt:8, offset:19, stream:5 }, vs_st{ stride, divisor } */
 static uint32_t g_vattr[16]; static int g_vattr_n;
+static uint32_t g_pend_stream[32]; static int g_pend_stream_n;
 static uint32_t g_vfmt_hist[256];
 static uint32_t g_vstream[32]; static int g_vstream_n;
 int dmNvnVertexLayout(const uint32_t **attr, int *nattr, const uint32_t **stream, int *nstream)
@@ -185,7 +186,8 @@ int dmNvnVertexLayout(const uint32_t **attr, int *nattr, const uint32_t **stream
 }
 static uint64_t g_bind_args[8][3]; static int g_bind_args_n;
 /* M4-5:把解析结果发布给渲染线程(PROG=0/DRAW=1),由 dm_vk 在 render pass 内执行 */
-typedef struct { int kind; char k0[17], k1[17]; uint32_t a, b; unsigned nvb; uint64_t vba[4], vbs[4]; } dm_rp_t;
+typedef struct { int kind; char k0[17], k1[17]; uint32_t a, b; unsigned nvb; uint64_t vba[4], vbs[4];
+    uint32_t attrs[16]; int nattr; uint32_t streams[32]; int nstream; } dm_rp_t;
 static dm_rp_t g_rp[4096];
 static dm_rp_t g_rp_pub[4096];
 static _Atomic int g_rp_n;
@@ -210,6 +212,9 @@ static void dm_rp_add(int kind, const char *k0, const char *k1, unsigned a, unsi
     if (k1) memcpy(g_rp[n].k1, k1, 17); else g_rp[n].k1[0] = 0;
     g_rp[n].a = a; g_rp[n].b = b;
     g_rp[n].nvb = 0;
+    g_rp[n].nattr = g_vattr_n; g_rp[n].nstream = g_pend_stream_n;
+    for (int t = 0; t < g_vattr_n && t < 16; t++) g_rp[n].attrs[t] = g_vattr[t];
+    for (int t = 0; t < g_pend_stream_n && t < 32; t++) g_rp[n].streams[t] = g_pend_stream[t];
     g_rp_n = n + 1;
     dm_rp_vb_index = (kind == 2) ? n : dm_rp_vb_index;
 }
@@ -220,6 +225,13 @@ static void dm_rp_add_vb(unsigned n, const uint64_t *addr, const uint64_t *sz)
     if (n > 4) n = 4;
     g_rp[i].nvb = n;
     for (unsigned k = 0; k < n; k++) { g_rp[i].vba[k] = addr[k]; g_rp[i].vbs[k] = sz[k]; }
+}
+int dmNvnReplayGetLayout(int i, const uint32_t **attrs, int *nattr, const uint32_t **streams, int *nstream)
+{
+    if (i < 0 || i >= g_rp_pub_n) return 0;
+    *attrs = g_rp_pub[i].attrs; *nattr = g_rp_pub[i].nattr;
+    *streams = g_rp_pub[i].streams; *nstream = g_rp_pub[i].nstream;
+    return 1;
 }
 int dmNvnReplayGetVB(int i, unsigned *n, uint64_t *addr, uint64_t *sz)
 {
@@ -466,8 +478,8 @@ static void nvn_queue_submit(void *q, int n, const void *handles)
                     struct iovec liov = { buf, n * 8 };
                     struct iovec riov = { (void *)(uintptr_t)o->c, n * 8 };
                     if (process_vm_readv(getpid(), &liov, 1, &riov, 1, 0) == (ssize_t)(n * 8)) {
-                        for (unsigned k = 0; k < n * 2; k++) g_vstream[k] = buf[k];
-                        g_vstream_n = (int)(n * 2);
+                        for (unsigned k = 0; k < n * 2; k++) { g_vstream[k] = buf[k]; g_pend_stream[k] = buf[k]; }
+                        g_vstream_n = (int)(n * 2); g_pend_stream_n = (int)(n * 2);
                     }
                 }
             } else if (o->op == DM_OP_BIND) {
