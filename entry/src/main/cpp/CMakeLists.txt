@@ -25,10 +25,12 @@ add_library(dmhost SHARED
     host/hle_time.c
     host/hle_misc.c
     host/hle_account.c
+    host/hle_net.c
     host/loader_hos.c
     host/front_hos.c
     host/host_boot.c
     host/host_start.c
+    host/crash_hos.c
     gfx/dm_gfx_backend.c
     gfx/dm_vk.cpp
     gfx/nvn/dm_nvn.c
@@ -80,3 +82,7 @@ target_link_libraries(dmhost PUBLIC
     libz.so
     libohaudio.so
 )
+
+# 隐式函数声明一律报错:guest 导入解析返回 uint64_t,漏声明会按 int 截断成
+# 32 位(真机表现为跳到 0x7d19ed4 这种半截地址、SIGSEGV@低地址)。
+target_compile_options(dmhost PRIVATE -Werror=implicit-function-declaration)

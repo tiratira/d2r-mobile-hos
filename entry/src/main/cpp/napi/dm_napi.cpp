@@ -360,6 +360,7 @@ static napi_value Init(napi_env env, napi_value exports)
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     RegisterCallbacks(env, exports);
+    dmCrashInstall();
     dmPlatInit();
     dmInputInit();
     return exports;

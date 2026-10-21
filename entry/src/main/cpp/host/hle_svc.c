@@ -326,6 +326,20 @@ uint64_t svc_dispatch(uint32_t num, uint64_t *regs, uint64_t orig_addr)
         LOG("Break reason=%{public}llx Result=%{public}#x svc 位于 %{public}s+%{public}llx",
             (unsigned long long)regs[0], res, mm ? mm->name : "?",
             mm ? (unsigned long long)(orig_addr - (uint64_t)(uintptr_t)mm->base) : 0ull);
+        /* 客体调用链(x29 帧指针):定位是哪个 SDK 函数走到的 Break */
+        uint64_t fp = regs[29];
+        for (int i = 0; i < 16 && fp > 0x1000 && (fp & 7) == 0; i++) {
+            uint64_t prev = *(volatile uint64_t *)(uintptr_t)fp;
+            uint64_t ret = *(volatile uint64_t *)(uintptr_t)(fp + 8);
+            const dm_module_t *rm = dm_module_of(ret);
+            LOG("  bt[%{public}d] ret=%{public}llx %{public}s+%{public}llx", i,
+                (unsigned long long)ret, rm ? rm->name : "?",
+                rm ? (unsigned long long)(ret - (uint64_t)(uintptr_t)rm->base) : 0ull);
+            if (prev <= fp) {
+                break;
+            }
+            fp = prev;
+        }
         if (regs[0] & 0x80000000ull) {
             regs[0] = 0;
             return 0;   /* 仅通知,可继续 */
@@ -378,9 +392,30 @@ uint64_t svc_dispatch(uint32_t num, uint64_t *regs, uint64_t orig_addr)
     default:
         if (!g_seen[num & 0xff]) {
             g_seen[num & 0xff] = 1;
-            LOG("SVC %{public}#x x0=%{public}llx x1=%{public}llx x2=%{public}llx(占位返回成功)",
+            const dm_module_t *mm = dm_module_of(orig_addr);
+            LOG("SVC %{public}#x x0=%{public}llx x1=%{public}llx x2=%{public}llx(占位返回成功) 调用点 %{public}s+%{public}llx",
                 num, (unsigned long long)regs[0], (unsigned long long)regs[1],
-                (unsigned long long)regs[2]);
+                (unsigned long long)regs[2], mm ? mm->name : "?",
+                mm ? (unsigned long long)(orig_addr - (uint64_t)(uintptr_t)mm->base) : 0ull);
+            /* 0x1f / 0x21 很可能是 IPC(ConnectToNamedPort/SendSyncRequest):
+             * 把 x1 当字符串试着打出来,便于定位未接管的服务名。 */
+            if (num == 0x1f || num == 0x21) {
+                const char *s = (const char *)(uintptr_t)regs[1];
+                if (s) {
+                    char nm[64];
+                    int ok = 1;
+                    for (int i = 0; i < (int)sizeof(nm) - 1; i++) {
+                        char ch = s[i];
+                        if (ch == 0) { nm[i] = 0; break; }
+                        if ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7e) { ok = 0; break; }
+                        nm[i] = ch;
+                        nm[i + 1] = 0;
+                    }
+                    if (ok) {
+                        LOG("  SVC %{public}#x 字符串: \"%{public}s\"", num, nm);
+                    }
+                }
+            }
         }
         regs[0] = 0;
         return 0;

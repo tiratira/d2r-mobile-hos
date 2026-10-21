@@ -10,6 +10,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+
+/* hilog 的 OH_LOG_* 宏用 LOG_DOMAIN / LOG_TAG;不定义时 tag 为 NULL,
+ * 设备上 `hilog | grep D2RMobileHOS` 就看不到本模块的日志。 */
+#ifndef LOG_DOMAIN
+#define LOG_DOMAIN 0x0
+#endif
+#ifndef LOG_TAG
+#define LOG_TAG "D2RMobileHOS"
+#endif
 #include <hilog/log.h>
 
 #define DM_LOG_TAG "D2RMobileHOS"
@@ -55,6 +64,7 @@ typedef struct { const char *name; void *fn; const char *why; } hle_force_ent;
 
 uint64_t hle_lookup(const char *name);           /* swhle 表:0 = 没有 */
 const void *dm_swforce_lookup(const char *name); /* swforce 表:NULL = 没有 */
+uint64_t resolve_import(const char *name, int weak);  /* 未定义导入 → 接管/HLE/记名桩 */
 void hle_force_report(void);
 int hle_registered_counts(uint32_t *hle, uint32_t *force);
 
@@ -126,6 +136,7 @@ int dmHostBoot(const char *which, char *report, int report_size);
 int dmHostProbeModules(char *report, int report_size);
 int dmHostStart(char *report, int report_size);   /* 真实 SDK 启动序;ARM64 才执行 */
 const char *dmHostBootStage(void);                /* 最后到达的启动阶段(UI/hilog) */
+void dmCrashInstall(void);                        /* SIGSEGV/ABRT 现场记录到 hilog */
 
 /* 服务层 HLE(host/hle_fs.c、hle_oe.c、hle_hid.c、hle_time.c) */
 void dmFsInit(void);                                     /* 建挂载表(沙箱目录) */

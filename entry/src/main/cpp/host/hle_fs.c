@@ -117,6 +117,24 @@ static void mount_add(const char *name, const char *host, int writable)
     g_nmnt++;
 }
 
+/* 客体的挂载名由游戏自己定(实测 3.3.94012:rom="$",临时="^"),必须按名字登记,
+ * 否则 "^:/Diablo II/GameLogs" 找不到挂载点 → 写成只读失败 → 游戏初始化退出。 */
+static void mount_set(const char *name, const char *host, int writable)
+{
+    if (name == NULL || name[0] == 0) {
+        return;
+    }
+    for (int i = 0; i < g_nmnt; i++) {
+        if (strcmp(g_mnt[i].name, name) == 0) {
+            snprintf(g_mnt[i].host, sizeof(g_mnt[0].host), "%s", host);
+            trim_slash(g_mnt[i].host);
+            g_mnt[i].writable = writable;
+            return;
+        }
+    }
+    mount_add(name, host, writable);
+}
+
 void dmFsInit(void)
 {
     pthread_mutex_lock(&g_fs_mu);
@@ -336,6 +354,7 @@ HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv;rom → 宿主 RomFS 目录",
     (void)cache;
     (void)sz;
     dmFsInit();
+    mount_set(name, g_romfs, 0);
     DMLOG_I("fs: MountRom %{public}s → %{public}s", name ? name : "?", g_romfs);
     return RES_OK;
 }
@@ -344,6 +363,8 @@ HLE_FORCE("_ZN2nn2fs21MountTemporaryStorageEPKc", "fsp-srv;临时区 → 宿主�
           Result, h_fs_MountTemp, const char *name)
 {
     dmFsInit();
+    mkdir_p(g_temp);
+    mount_set(name, g_temp, 1);
     DMLOG_I("fs: MountTemporaryStorage %{public}s → %{public}s", name ? name : "?", g_temp);
     return RES_OK;
 }
@@ -361,6 +382,7 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv;存档 → 
     (void)uid;
     dmFsInit();
     mkdir_p(g_save);
+    mount_set(name, g_save, 1);
     DMLOG_I("fs: MountSaveData %{public}s → %{public}s", name ? name : "?", g_save);
     return RES_OK;
 }

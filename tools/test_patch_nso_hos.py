@@ -113,7 +113,11 @@ class TestRewriterHos(unittest.TestCase):
         self.assertEqual(len(bls), 5)
         img = self.read('synth.patched.bin')
         for off in bls:
+            # bl 前一条是 stp x29,x30,[sp,#-16]!(与桩尾 ldp [sp],#16 配对;
+            # 编码写错成 -32 会让每次门调用净漏 16 字节栈,真机跑一段后 ret 到 0)
+            self.assertEqual(struct.unpack_from('<I', img, off - 4)[0], 0xA9BF7BFD)
             self.assertEqual(struct.unpack_from('<I', img, off)[0], 0x94000000)
+            self.assertEqual(struct.unpack_from('<I', img, off + 4)[0], 0xA8C17BFD)
 
     def test_embed_asm(self):
         out_s = os.path.join(self.tmp, 'guest_synth.S')

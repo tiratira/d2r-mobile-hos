@@ -99,7 +99,7 @@ def B(frm, to):
     off = to - frm
     assert -(1 << 27) <= off < (1 << 27) and off % 4 == 0
     return 0x14000000 | ((off >> 2) & 0x3FFFFFF)
-STP_PRE_2930 = 0xA9BE7BFD        # stp x29, x30, [sp, #-16]!
+STP_PRE_2930 = 0xA9BF7BFD        # stp x29, x30, [sp, #-16]!
 LDP_POST_2930 = 0xA8C17BFD       # ldp x29, x30, [sp], #16
 NOP = 0xD503201F
 BL_GATE = 0x94000000             # 占位:hos_embed.py 会在这些位置发 `bl _dm_gate`
@@ -164,27 +164,28 @@ for oa, wa, ob_, wb, r, key, why in params:
 os.makedirs(outdir, exist_ok=True)
 P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
 open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch)
-with open(P('fixups.tsv'), 'w') as f:
+with open(P('fixups.tsv'), 'w', encoding='utf-8') as f:
     f.write(f'# RULESET\thos\n# PATCH_OFF\t{PATCH_OFF:#x}\n# KEY_PAGE_OFF\t{KEY_PAGE_OFF:#x}\n'
             f'# TEXT_END\t{TEXT_END:#x}\n# RO_OFF\t{RO_OFF:#x}\n# DATA_OFF\t{DATA_OFF:#x}\n')
     for k in KEY_INDEX: f.write(f'# KEY_{k}_IDX\t{KEY_INDEX[k]}\n')
-with open(P('gates.tsv'), 'w') as f:
+with open(P('gates.tsv'), 'w', encoding='utf-8') as f:
     for ret, k, arg, orig in gates: f.write(f'{ret:#x}\t{k}\t{arg}\t{orig:#x}\n')
-with open(P('sites.tsv'), 'w') as f:
+with open(P('sites.tsv'), 'w', encoding='utf-8') as f:
     for a in sorted(kinds): f.write(f'{a:#x}\t{kinds[a][0]}\n')
-with open(P('gatebl.tsv'), 'w') as f:
+with open(P('gatebl.tsv'), 'w', encoding='utf-8') as f:
     for o in gatebl: f.write(f'{o:#x}\n')
-with open(P('cuts.tsv'), 'w') as f:
+with open(P('cuts.tsv'), 'w', encoding='utf-8') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, ob, nb, *rest in cuts:
         why = rest[-1] if isinstance(rest[-1], str) else ''
         scope = rest[0] if rest and isinstance(rest[0], str) and rest[0] in ('全', '仅宿主') else '全'
         f.write(f'{off:#x}\t{ob}\t{nb}\t{scope}\t{why}\n')
-with open(P('params.tsv'), 'w') as f:
+with open(P('params.tsv'), 'w', encoding='utf-8') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for oa, wa, ob_, wb, r, key, why in params: f.write(f'{oa:#x}\t{ob_:#x}\tx{r}\t{key}\t{why}\n')
-with open(P('obs.tsv'), 'w') as f:
+with open(P('obs.tsv'), 'w', encoding='utf-8') as f:
     f.write(f'# BUILD_ID\t{BUILD_ID}\n')
     for off, oid, ow, why in obs: f.write(f'{off:#x}\t{oid}\t{ow}\t{why}\n')
 print(NAME, stats, 'cuts', len(cuts), 'obs', len(obs), 'params', len(params),
       'patch', len(patch), 'PATCH_OFF', hex(PATCH_OFF), 'gates', len(gates))
+

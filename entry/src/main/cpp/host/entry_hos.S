@@ -132,6 +132,7 @@ dm_thread_enter:
     mov x29, #0
     mov x16, x0
     mov x0, x1
+    mov x18, xzr          // Horizon 新线程 x18 初值 = 0(客体自写自读的 TCB)
     adr x30, 1f
     br x16
 1:  bl dm_thread_returned

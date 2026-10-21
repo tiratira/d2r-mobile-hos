@@ -78,6 +78,12 @@ static void *guest_boot_thread(void *arg)
     void (*nnMain)(void) = (void (*)(void))sym[8];
 
     uint32_t hmain = dm_svc_thread_main_init();   /* 主线程句柄:nnosInitialize 的 x0 */
+    /* Horizon 新线程 x18 初值 = 0(客体自写自读的 TCB);宿主 pthread 的 x18 是
+     * 平台寄存器,不一定是 0,进客体前先清零,否则 libc 启动期读到宿主 x18
+     * 会当自己的 TCB 解引用(真机实测:进游戏即 SIGSEGV @PC=0)。 */
+#if defined(__aarch64__)
+    __asm__ volatile("mov x18, xzr" ::: "x18");
+#endif
     stage("_init_libc0");
     init0();
     stage("nnosInitialize");
@@ -147,6 +153,7 @@ int dmHostStart(char *report, int report_size)
 {
     /* 1) 确认三模块已装载/重定位(幂等) */
     char mods[320];
+    dmCrashInstall();
     dmHostProbeModules(mods, sizeof(mods));
     dmServiceInitAll();
     hle_force_report();
