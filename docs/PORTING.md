@@ -278,8 +278,14 @@ NVN 命令录制 → Vulkan 回放后才有游戏画面。
 - **真机推进(3.3.94012)**:`nvnDeviceGetProcAddress` 已换成真实宿主函数
   (`dmNvnInit` 登记 + proc 分发),真机第一次进入游戏即解析出 **128 个
   NVN 入口**(清单见 [nvn_capture.md](nvn_capture.md));未实现的入口返回
-  统一非空占位(不再跳 0)。当前引擎在 `nvnDeviceInitialize` 之后解引用
-  未初始化的 NVN 对象而崩(NULL deref),说明下一步必须实现 NVN 对象语义。
+  统一非空占位(不再跳 0)。随后补了 device/queue/window/commandBuffer/
+  memoryPool/program/texturePool/samplerPool 的最小宿主对象模型,引擎可以
+  走完 NVN device 初始化、资源池、program 编译和 queue builder 设置。
+- 当前最后一道墙:引擎在某个 guest 对象的 **`+0xE8`** 处取一张函数表
+  (`ldr x1,[x0,#232]; ldr x8,[x1,#16]; 24 字节步长索引;尾调用`),该表为空
+  导致 NULL deref。`host/crash_hos.c` 现在会 dump callee-saved 对象及其
+  `[0..24]`/`+0xE8`,下一个里程碑就是按上游 `nvn_obj.h` 的对象契约把这张
+  表补出来(然后才能录命令、present)。
 - 旁路服务已补齐:`hle_vi.c`(显示层 4 条)、`hle_friends.c`(好友/在线/
   邀请/游玩记录 26 条,真机实测挡住 `friends::GetPlayHistoryRegistrationKey
   → sm:` 的 diag::Abort)、`hle_net.c`(socket/nifm/ssl 离线化)、
