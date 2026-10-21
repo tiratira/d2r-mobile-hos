@@ -26,6 +26,7 @@ extern uint64_t dmVkCreateComputePipeline(const char *path);
 extern uint64_t dmVkPipelineCount(void);
 extern int dmVkPipelineError(void);
 extern int dmVkDslBindings(void);
+extern int dmVkShaderStageOfFile(const char *path);
 extern uint64_t dmVkGraphicsPipeCount(void);
 extern int dmVkGraphicsPipeError(void);
 extern uint64_t dmVkShaderTestCount(void);
@@ -738,6 +739,7 @@ typedef struct { uint64_t data; const void *control; } nvn_shader_data_t;
 static char g_prog_keys[512][17];
 static int g_prog_key_n;
 static int g_progs;
+static int g_keys_loaded, g_cspipes;
 
 static void sha256_hex16(const void *in, size_t len, char out[17]);
 static uint32_t nvn_program_setshaders(void *prog, int n, const void *sdv)
@@ -848,6 +850,25 @@ static void *nvn_stats_thread(void *arg)
                 px[i * 4 + 2] = 0x40; px[i * 4 + 3] = 0xff;
             }
             uint64_t h = dmVkUploadTexture(px, 64, 64, 37 /* VK_FORMAT_R8G8B8A8_UNORM */, 4);
+            {
+                FILE *kf = fopen("/data/storage/el2/base/haps/entry/files/dm_keys.txt", "r");
+                if (kf != NULL) {
+                    char line[64];
+                    while (fgets(line, sizeof line, kf) != NULL && g_keys_loaded < 64) {
+                        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
+                        if (line[0] == 0) continue;
+                        char path[256];
+                        snprintf(path, sizeof path, "/data/storage/el2/base/haps/entry/files/shaders/%s.spv", line);
+                        int st = dmVkShaderStageOfFile(path);
+                        if (st < 0) continue;
+                        uint64_t m = dmVkLoadShaderModule(path);
+                        if (m) g_keys_loaded++;
+                        if (st == 5) { if (dmVkCreateComputePipeline(path)) g_cspipes++; }
+                    }
+                    fclose(kf);
+                }
+                DMLOG_I("M4 shader keys loaded=%d cspipes=%d", g_keys_loaded, g_cspipes);
+            }
             DMLOG_I("M2 tex upload self-test h=%{public}llx count=%{public}llu",
                     (unsigned long long)h, (unsigned long long)dmVkUploadCount());
         }
@@ -855,12 +876,12 @@ static void *nvn_stats_thread(void *arg)
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
             fprintf(f, "progs=%d keys=%d ", g_progs, g_prog_key_n);
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu bufs=%llu texs=%llu shader=%llu kload=%d cspipe=%d pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
                     (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount(),
                     (unsigned long long)g_nvn_bufs, (unsigned long long)g_nvn_textures,
-                    (unsigned long long)dmVkShaderTestCount(),
+                    (unsigned long long)dmVkShaderTestCount(), g_keys_loaded, g_cspipes,
                     (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
                     (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);

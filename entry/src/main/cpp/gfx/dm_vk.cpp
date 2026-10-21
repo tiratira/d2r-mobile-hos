@@ -900,3 +900,28 @@ extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *p
     g_gpipe_err = 0; g_gpipes++;
     return 1;
 }
+
+
+/* ================= M4-3b:按 <key> 从设备目录加载真实着色器 ================= */
+extern "C" int dmVkShaderStageOfFile(const char *path);
+extern "C" int dmVkShaderStageOfFile(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return -1;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 20 || n > (1 << 24)) { fclose(f); return -1; }
+    uint32_t *w = (uint32_t *)malloc((size_t)n);
+    if (w == NULL) { fclose(f); return -1; }
+    size_t got = fread(w, 1, (size_t)n, f); fclose(f);
+    if (got != (size_t)n || w[0] != 0x07230203u) { free(w); return -1; }
+    int stage = -1;
+    size_t wc_total = (size_t)got / 4, i = 5;
+    while (i < wc_total) {
+        uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (op == 15 && wc >= 2) { stage = (int)w[i + 1]; break; }  /* OpEntryPoint: ExecutionModel */
+        if (wc == 0) break;
+        i += wc;
+    }
+    free(w);
+    return stage;   /* 0=Vertex, 4=Fragment, 5=GLCompute */
+}
