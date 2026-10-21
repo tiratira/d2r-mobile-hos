@@ -48,7 +48,7 @@ struct Game {
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
       // native 画面(暗黑风演示渐变,等待 NVN->Vulkan 回放器接管)
-      XComponent({ id: 'game_surface', type: XComponentType.SURFACE, libraryname: 'dmhost',
+      XComponent({ id: 'game_surface', type: XComponentType.SURFACE, libraryname: 'dmxe',
         controller: this.xcController })
         .width('100%')
         .height('100%')

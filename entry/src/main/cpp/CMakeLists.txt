@@ -89,3 +89,16 @@ target_link_libraries(dmhost PUBLIC
 # 隐式函数声明一律报错:guest 导入解析返回 uint64_t,漏声明会按 int 截断成
 # 32 位(真机表现为跳到 0x7d19ed4 这种半截地址、SIGSEGV@低地址)。
 target_compile_options(dmhost PRIVATE -Werror=implicit-function-declaration)
+
+# 独立的 XComponent napi 模块:libdmhost.so 被 ArkTS import 先初始化后,
+# XComponent 复用同一模块不再调 Init,导致原生 surface 回调注册不上。
+# 这个 .so 只由 XComponent(libraryname="dmxe")加载,专门注册回调并调
+# libdmhost 导出的 dmVkStart/dmVkStop。
+add_library(dmxe SHARED napi/dm_xc_napi.cpp)
+target_link_libraries(dmxe PRIVATE
+    libace_napi.z.so
+    libace_ndk.z.so
+    libhilog_ndk.z.so
+    libnative_window.so
+    dl
+)

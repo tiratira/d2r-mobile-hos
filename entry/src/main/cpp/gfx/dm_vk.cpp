@@ -15,9 +15,13 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+
+/* hilog 的 tag/domain 宏必须在 <hilog/log.h> 之前定义,否则 dm_vk 的日志
+ * 会落到默认 domain 而被过滤(排查时看不到 "vk loop running")。 */
+#define LOG_DOMAIN 0x0000
+#define LOG_TAG "D2RMobileHOS"
 #include <hilog/log.h>
 
-#define DM_LOG_TAG "D2RMobileHOS"
 #define DMLOG_I(...) OH_LOG_INFO(LOG_APP, __VA_ARGS__)
 #define DMLOG_E(...) OH_LOG_ERROR(LOG_APP, __VA_ARGS__)
 
@@ -179,15 +183,39 @@ static void *vk_loop(void *arg)
     uint32_t want = 2;
     if (caps.minImageCount > want) want = caps.minImageCount;
     if (caps.maxImageCount && caps.maxImageCount < want) want = caps.maxImageCount;
+
+    /* 真机 swapchain 只接受它列出的 format(日志里有 "format 44 unsupported");
+     * 不能硬编码 B8G8R8A8,否则 vkCreateSwapchainKHR 直接失败。 */
+    VkSurfaceFormatKHR chosen{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    uint32_t nfmt = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(pd, v.surf, &nfmt, nullptr);
+    if (nfmt > 0) {
+        VkSurfaceFormatKHR fmts[8];
+        uint32_t n = nfmt > 8 ? 8 : nfmt;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(pd, v.surf, &n, fmts);
+        chosen = fmts[0];
+        for (uint32_t i = 0; i < n; i++) {
+            if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM ||
+                fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM ||
+                fmts[i].format == VK_FORMAT_B8G8R8A8_SRGB ||
+                fmts[i].format == VK_FORMAT_R8G8B8A8_SRGB) {
+                chosen = fmts[i];
+                break;
+            }
+        }
+    }
+    DMLOG_I("vk: surface format=%{public}d colorspace=%{public}d count=%{public}u",
+            (int)chosen.format, (int)chosen.colorSpace, nfmt);
+
     VkSwapchainCreateInfoKHR swci{};
     swci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     swci.surface = v.surf;
     swci.minImageCount = want;
-    swci.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
-    swci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    swci.imageFormat = chosen.format;
+    swci.imageColorSpace = chosen.colorSpace;
     swci.imageExtent = caps.currentExtent;
     swci.imageArrayLayers = 1;
-    swci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    swci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     swci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swci.preTransform = caps.currentTransform;
     swci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -307,7 +335,7 @@ static void *vk_loop(void *arg)
     return nullptr;
 }
 
-int dmVkStart(OHNativeWindow *window)
+extern "C" __attribute__((visibility("default"))) int dmVkStart(OHNativeWindow *window)
 {
     pthread_mutex_lock(&g_mu);
     if (g_running) {
@@ -324,7 +352,7 @@ int dmVkStart(OHNativeWindow *window)
     return 0;
 }
 
-void dmVkStop(void)
+extern "C" __attribute__((visibility("default"))) void dmVkStop(void)
 {
     pthread_mutex_lock(&g_mu);
     if (!g_running) {
@@ -336,7 +364,8 @@ void dmVkStop(void)
     pthread_join(g_thread, nullptr);
 }
 
-int dmVkRunning(void)
+extern "C" __attribute__((visibility("default"))) int dmVkRunning(void)
 {
     return g_running;
 }
+
