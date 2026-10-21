@@ -10,6 +10,7 @@
  */
 #define _GNU_SOURCE 1
 #include "host/dm.h"
+#include "gfx/nvn/dm_nvn.h"
 
 #include <signal.h>
 #include <stdarg.h>
@@ -90,6 +91,28 @@ static void crash_handler(int sig, siginfo_t *si, void *ctx)
                          w[0], w[1], w[2], w[3],
                          n2 == (ssize_t)sizeof(e) ? e[0] : 0UL,
                          n2 == (ssize_t)sizeof(e) ? e[1] : 0UL);
+            }
+        }
+    }
+
+    /* 引擎在 guest 数据段缓存 NVN 函数指针(运行时由 nvnBootstrapLoader /
+     * nvnDeviceGetProcAddress 写入)。崩溃前它用两个槽的返回值当分配器参数,
+     * 这里把槽值读出来并反查 NVN 名字。 */
+    {
+        const dm_module_t *mm = dm_module_find("main");
+        if (mm != NULL) {
+            const unsigned long guest_base = (unsigned long)(uintptr_t)mm->base;
+            const unsigned long main_vaddr = 0x4c000UL;   /* __dm_guest_main_start */
+            static const unsigned long slots[3] = {0x325ADA0UL, 0x325AE08UL, 0x325AE10UL};
+            for (int i = 0; i < 3; i++) {
+                unsigned long addr = guest_base + (slots[i] - main_vaddr);
+                unsigned long v = 0;
+                struct iovec l = {&v, sizeof(v)};
+                struct iovec r = {(void *)addr, sizeof(v)};
+                if (syscall(SYS_process_vm_readv, getpid(), &l, 1, &r, 1, 0) == (ssize_t)sizeof(v)) {
+                    const char *nm = dmNvnNameForAddr((uint64_t)v);
+                    log_line("NVNGOT slot=%lx val=%lx name=%s", slots[i], v, nm ? nm : "?");
+                }
             }
         }
     }

@@ -29,6 +29,9 @@ void dmNvnRegister(const char *name, nvn_func_t fn);
 /* 启动时登记最小真实入口(当前:nvnDeviceGetProcAddress)。 */
 void dmNvnInit(void);
 
+/* 已解析的宿主函数地址 -> NVN 名字(崩溃现场 GOT 槽反查用)。 */
+const char *dmNvnNameForAddr(uint64_t addr);
+
 /* 已登记入口数 / 被调用过的入口数(观测骨架是否被走到)。 */
 uint32_t dmNvnEntryCount(void);
 uint32_t dmNvnCalledCount(void);
@@ -41,3 +44,4 @@ const char *dmNvnSelfTest(void);
 #endif
 
 #endif /* DM_NVN_H */
+

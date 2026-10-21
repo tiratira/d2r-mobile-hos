@@ -45,6 +45,47 @@ static uint64_t nvn_unimpl_fn(void)
  * 返回宿主已实现的真实函数;没有实现的回统一占位函数(非空,避免引擎把
  * 0 存进函数表后跳飞)。每个名字首次解析时打一行 hilog —— 这就是接下来
  * 要逐个实现的 NVN 录制入口清单。 */
+/* 解析出的「宿主函数地址 -> NVN 名字」表:崩溃现场从游戏 GOT 槽读到函数
+ * 指针后可以反查是哪个 NVN 入口(引擎在初始化时把两者写进自己的数据段)。 */
+#define NVN_RESOLVED_MAX 640
+static struct { uint64_t addr; char name[64]; } g_resolved[NVN_RESOLVED_MAX];
+static int g_resolved_n;
+static pthread_mutex_t g_resmu = PTHREAD_MUTEX_INITIALIZER;
+
+static void nvn_record_resolved(uint64_t addr, const char *name)
+{
+    if (addr == 0 || name == NULL || name[0] == 0) {
+        return;
+    }
+    pthread_mutex_lock(&g_resmu);
+    for (int i = 0; i < g_resolved_n; i++) {
+        if (g_resolved[i].addr == addr) {
+            pthread_mutex_unlock(&g_resmu);
+            return;
+        }
+    }
+    if (g_resolved_n < NVN_RESOLVED_MAX) {
+        g_resolved[g_resolved_n].addr = addr;
+        snprintf(g_resolved[g_resolved_n].name, sizeof(g_resolved[0].name), "%s", name);
+        g_resolved_n++;
+    }
+    pthread_mutex_unlock(&g_resmu);
+}
+
+const char *dmNvnNameForAddr(uint64_t addr)
+{
+    /* 崩溃处理器里调用:不加锁,只读已发布的表项 */
+    const char *r = NULL;
+    int n = g_resolved_n;
+    for (int i = 0; i < n; i++) {
+        if (g_resolved[i].addr == addr) {
+            r = g_resolved[i].name;
+            break;
+        }
+    }
+    return r;
+}
+
 static uint64_t h_nvn_device_get_proc(void *dev, const char *name)
 {
     (void)dev;
@@ -60,6 +101,7 @@ static uint64_t h_nvn_device_get_proc(void *dev, const char *name)
                 nvn_func_t fn = g_fns[i];
                 pthread_mutex_unlock(&g_mu);
                 if (fn != NULL) {
+                    nvn_record_resolved((uint64_t)(uintptr_t)fn, name);
                     return (uint64_t)(uintptr_t)fn;
                 }
                 break;
@@ -67,6 +109,7 @@ static uint64_t h_nvn_device_get_proc(void *dev, const char *name)
         }
         pthread_mutex_unlock(&g_mu);
     }
+    nvn_record_resolved((uint64_t)(uintptr_t)&nvn_unimpl_fn, name);
     return (uint64_t)(uintptr_t)&nvn_unimpl_fn;
 }
 
@@ -558,10 +601,15 @@ uint64_t dmNvnBootstrapLoader(const char *name)
     }
     pthread_mutex_unlock(&g_mu);
     if (id < g_count && g_fns[id] != NULL) {
+        nvn_record_resolved((uint64_t)(uintptr_t)g_fns[id], name);
         return (uint64_t)(uintptr_t)g_fns[id];   /* 已实现/录制入口 */
     }
 #ifdef __aarch64__
-    return (uint64_t)(uintptr_t)(dm_nvn_thunks + (size_t)id * 8);
+    {
+        uint64_t r = (uint64_t)(uintptr_t)(dm_nvn_thunks + (size_t)id * 8);
+        nvn_record_resolved(r, name);
+        return r;
+    }
 #else
     return (uint64_t)(uintptr_t)&nvn_stub0;   /* data-only:表/名字自检,不执行 */
 #endif
@@ -618,6 +666,7 @@ const char *dmNvnSelfTest(void)
              a ? "ok" : "null", b == 0 ? "null" : "non-null");
     return report;
 }
+
 
 
 
