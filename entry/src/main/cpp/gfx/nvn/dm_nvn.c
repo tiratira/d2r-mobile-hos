@@ -26,6 +26,8 @@ extern uint64_t dmVkCreateComputePipeline(const char *path);
 extern uint64_t dmVkPipelineCount(void);
 extern int dmVkPipelineError(void);
 extern int dmVkDslBindings(void);
+extern uint64_t dmVkGraphicsPipeCount(void);
+extern int dmVkGraphicsPipeError(void);
 extern uint64_t dmVkShaderTestCount(void);
 
 #define NVN_TABLE_MAX 512
@@ -740,12 +742,13 @@ static void *nvn_stats_thread(void *arg)
         /* hilog 在热路径下轮转很快,计数落盘更可靠 */
         FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
         if (f != NULL) {
-            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu shader=%llu pipe=%llu pipe_err=%d dsl=%d\n",
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu tex=%llu shader=%llu pipe=%llu pipe_err=%d dsl=%d gpipe=%llu gpipe_err=%d\n",
                     (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
                     (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
                     (unsigned long long)dmVkFrames(), (unsigned long long)dmVkUploadCount(),
                     (unsigned long long)dmVkShaderTestCount(),
-                    (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings());
+                    (unsigned long long)dmVkPipelineCount(), dmVkPipelineError(), dmVkDslBindings(),
+                    (unsigned long long)dmVkGraphicsPipeCount(), dmVkGraphicsPipeError());
             fclose(f);
         }
     }

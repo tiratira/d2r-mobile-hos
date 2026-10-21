@@ -35,6 +35,7 @@ static VkQueue g_upload_queue;
 static VkPhysicalDevice g_upload_pd;
 extern "C" uint64_t dmVkLoadShaderModule(const char *path);
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
+extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath);
 
 extern "C" void dmVkSetClearColor(float r, float g, float b, float a)
 {
@@ -200,6 +201,9 @@ static void *vk_loop(void *arg)
             (unsigned long long)dmVkLoadShaderModule("/data/storage/el2/base/haps/entry/files/test.spv"));
     DMLOG_I("M3 compute pipeline test=%{public}llu",
             (unsigned long long)dmVkCreateComputePipeline("/data/storage/el2/base/haps/entry/files/test_cs.spv"));
+    DMLOG_I("M3 graphics pipeline test=%{public}llu",
+            (unsigned long long)dmVkCreateGraphicsPipeline("/data/storage/el2/base/haps/entry/files/test_vs.spv",
+                                                           "/data/storage/el2/base/haps/entry/files/test_ps.spv"));
 
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, v.surf, &caps);
@@ -560,6 +564,7 @@ extern "C" uint64_t dmVkLoadShaderModule(const char *path)
  * 取离线翻译的 compute 着色器:VkShaderModule + 空 descriptor/pipeline layout
  * + VkComputePipeline(证明「SPIR-V 资产 → 管线」链路)。返回 1 成功。 */
 extern "C" uint64_t dmVkCreateComputePipeline(const char *path);
+extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath);
 extern "C" uint64_t dmVkPipelineCount(void);
 static _Atomic uint64_t g_pipelines;
 static _Atomic int g_pipe_err = -123;
@@ -649,5 +654,121 @@ extern "C" uint64_t dmVkCreateComputePipeline(const char *path)
     if (r != VK_SUCCESS) { g_pipe_err = (int)r; return 0; }
     g_pipe_err = 0;
     g_pipelines++;
+    return 1;
+}
+
+
+/* ================= M3-4:图形管线(真实 vs/ps SPIR-V) ================= */
+extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath);
+extern "C" uint64_t dmVkGraphicsPipeCount(void);
+extern "C" int dmVkGraphicsPipeError(void);
+static _Atomic uint64_t g_gpipes;
+static _Atomic int g_gpipe_err = -123;
+extern "C" uint64_t dmVkGraphicsPipeCount(void) { return g_gpipes; }
+extern "C" int dmVkGraphicsPipeError(void) { return g_gpipe_err; }
+
+static VkShaderModule load_module(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return VK_NULL_HANDLE;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 20 || n > (1 << 24)) { fclose(f); return VK_NULL_HANDLE; }
+    void *buf = malloc((size_t)n);
+    if (buf == NULL) { fclose(f); return VK_NULL_HANDLE; }
+    size_t got = fread(buf, 1, (size_t)n, f); fclose(f);
+    if (got != (size_t)n) { free(buf); return VK_NULL_HANDLE; }
+    VkShaderModuleCreateInfo sci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    sci.codeSize = (size_t)n; sci.pCode = (const uint32_t *)buf;
+    VkShaderModule mod = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(g_upload_dev, &sci, nullptr, &mod) != VK_SUCCESS) mod = VK_NULL_HANDLE;
+    free(buf);
+    return mod;
+}
+
+extern "C" uint64_t dmVkCreateGraphicsPipeline(const char *vsPath, const char *psPath)
+{
+    if (g_upload_dev == VK_NULL_HANDLE || !vsPath || !psPath) return 0;
+    VkShaderModule vs = load_module(vsPath), ps = load_module(psPath);
+    if (!vs || !ps) { if (vs) vkDestroyShaderModule(g_upload_dev, vs, nullptr);
+                      if (ps) vkDestroyShaderModule(g_upload_dev, ps, nullptr); return 0; }
+    VkAttachmentDescription att{};
+    att.format = VK_FORMAT_R8G8B8A8_UNORM; att.samples = VK_SAMPLE_COUNT_1_BIT;
+    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkAttachmentReference ar{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1; sub.pColorAttachments = &ar;
+    VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpci.attachmentCount = 1; rpci.pAttachments = &att;
+    rpci.subpassCount = 1; rpci.pSubpasses = &sub;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(g_upload_dev, &rpci, nullptr, &rp) != VK_SUCCESS) {
+        vkDestroyShaderModule(g_upload_dev, vs, nullptr); vkDestroyShaderModule(g_upload_dev, ps, nullptr); return 0;
+    }
+    VkDescriptorSetLayoutBinding binds[128] = {}; int nb = 0;
+    {
+        char jp[512]; static char jb[65536];
+        for (int side = 0; side < 2; side++) {
+            snprintf(jp, sizeof jp, "%s.res.json", side == 0 ? vsPath : psPath);
+            FILE *jf = fopen(jp, "rb");
+            if (!jf) continue;
+            size_t jn = fread(jb, 1, sizeof(jb) - 1, jf); fclose(jf); jb[jn] = 0;
+            VkDescriptorSetLayoutBinding tmp[64] = {};
+            int tn = dsl_bindings(jb, tmp, 64);
+            for (int i = 0; i < tn && nb < 128; i++) {
+                int dup = 0;
+                for (int k = 0; k < nb; k++) if (binds[k].binding == tmp[i].binding) { dup = 1; break; }
+                if (!dup) binds[nb++] = tmp[i];
+            }
+        }
+    }
+    VkDescriptorSetLayoutCreateInfo dlci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    if (nb > 0) { dlci.bindingCount = (uint32_t)nb; dlci.pBindings = binds; }
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    vkCreateDescriptorSetLayout(g_upload_dev, &dlci, nullptr, &dsl);
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1; plci.pSetLayouts = &dsl;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    vkCreatePipelineLayout(g_upload_dev, &plci, nullptr, &pl);
+    VkPipelineShaderStageCreateInfo st[2]{};
+    st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
+    st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = ps; st[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = 0xf;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2; ds.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo gpci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpci.stageCount = 2; gpci.pStages = st;
+    gpci.pVertexInputState = &vi; gpci.pInputAssemblyState = &ia;
+    gpci.pViewportState = &vp; gpci.pRasterizationState = &rs;
+    gpci.pMultisampleState = &ms; gpci.pColorBlendState = &cb;
+    gpci.pDynamicState = &ds; gpci.layout = pl; gpci.renderPass = rp; gpci.subpass = 0;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(g_upload_dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipe);
+    if (pipe) vkDestroyPipeline(g_upload_dev, pipe, nullptr);
+    vkDestroyPipelineLayout(g_upload_dev, pl, nullptr);
+    vkDestroyDescriptorSetLayout(g_upload_dev, dsl, nullptr);
+    vkDestroyRenderPass(g_upload_dev, rp, nullptr);
+    vkDestroyShaderModule(g_upload_dev, vs, nullptr);
+    vkDestroyShaderModule(g_upload_dev, ps, nullptr);
+    if (r != VK_SUCCESS) { g_gpipe_err = (int)r; return 0; }
+    g_gpipe_err = 0; g_gpipes++;
     return 1;
 }
