@@ -124,6 +124,24 @@
 
 **M0 验收：通过**（6704/6704）。
 
+## 5.1 M3-2 关键发现:必须清洗 SPIR-V 能力(已解决)
+
+真机 Vulkan 设备:HUAWEI Maleoon 920,API 1.3.309。用离线 SPIR-V 建管线时
+`vkCreateComputePipelines` 返回 **VK_ERROR_OUT_OF_HOST_MEMORY(-1)**,即使是无绑定
+的 compute 着色器、入口点 main、SPIR-V 1.3、且改到渲染线程单线程调用。
+
+关���在 **Ryujinx 输出的 SPIR-V 声明了一批「未使用」的能力**:
+Float64(10)、ImageBuffer(46)、ImageMSArray(47)、DerivativeControl(50)、
+GroupNonUniformArithmetic/Shuffle(62/64/65)、ImageGatherExtended(25)。
+Maleoon 驱动对这些不支持的声明直接以 OOM 报错。按「对应浮点/整数类型或指令是否
+真实存在」逐项删除后,同一着色器 **pipe=1 成功**。
+
+已落盘:
+- `tools/spv_scrub.py`:通用清洗器;
+- 全部 **6704/6704** 个 SPIR-V 都已清洗到 `dm-work/build/hos_shaders/spv_scrub/`
+  (每个都触发了清洗;Float64/ImageBuffer/ImageMSArray/group 能力出现于全部 6704 个);
+- 真机验证:`tex=1 shader=1 pipe=1 pipe_err=0`。
+
 ## 6. 下一步（M1 起）
 
 1. 把 SPIR-V 资产打包进 app：350 MB 原样推设备 files 目录，或 deflate 后作为资源

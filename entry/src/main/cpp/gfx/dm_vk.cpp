@@ -185,6 +185,17 @@ static void *vk_loop(void *arg)
     }
     vkGetDeviceQueue(v.dev, v.qfam, 0, &v.queue);
     g_upload_dev = v.dev; g_upload_queue = v.queue; g_upload_pd = pd;
+    {
+        VkPhysicalDeviceProperties pr{};
+        vkGetPhysicalDeviceProperties(pd, &pr);
+        FILE *f = fopen("/data/storage/el2/base/haps/entry/files/vk_info.txt", "w");
+        if (f != NULL) {
+            fprintf(f, "device=%s api=%u.%u.%u driver=0x%08x vendor=0x%04x\n",
+                    pr.deviceName, VK_VERSION_MAJOR(pr.apiVersion), VK_VERSION_MINOR(pr.apiVersion),
+                    VK_VERSION_PATCH(pr.apiVersion), pr.driverVersion, pr.vendorID);
+            fclose(f);
+        }
+    }
     DMLOG_I("M3 shader module test=%{public}llu",
             (unsigned long long)dmVkLoadShaderModule("/data/storage/el2/base/haps/entry/files/test.spv"));
     DMLOG_I("M3 compute pipeline test=%{public}llu",
