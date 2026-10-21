@@ -14,6 +14,8 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+extern uint64_t dmVkFrames(void);
 
 #define NVN_TABLE_MAX 512
 
@@ -30,7 +32,8 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* Vulkan 呈现后端(dm_vk.cpp):把最近一次 NVN ClearColor 交给回放器画下一帧 */
 extern void dmVkSetClearColor(float r, float g, float b, float a);
-static float g_nvn_clear[4] = {0.10f, 0.04f, 0.03f, 1.0f};
+/* 默认清屏色故意用绿色:宿主 Vulkan 通路是否在出帧一眼可见 */
+static float g_nvn_clear[4] = {0.0f, 0.45f, 0.0f, 1.0f};
 
 /* 占位返回用的非空缓冲:让未实现的 NVN 入口返回非 0,避免引擎把空指针当对象/函数表用 */
 uint8_t dm_nvn_dummy[0x100];
@@ -289,7 +292,9 @@ static uint32_t nvn_pool_init(void *p, const void *b)
 
 static uint32_t nvn_cb_init(void *c, void *d)
 {
-    DMLOG_I("NVN cb init c=%{public}llx dev=%{public}llx", (unsigned long long)(uintptr_t)c, (unsigned long long)(uintptr_t)d);
+    if (g_nvn_cbs < 8) {
+        DMLOG_I("NVN cb init c=%{public}llx dev=%{public}llx", (unsigned long long)(uintptr_t)c, (unsigned long long)(uintptr_t)d);
+    }
     if (c == NULL) return 0;
     memset(c, 0, sizeof(nvn_cb_t));
     ((nvn_cb_t *)c)->magic = NVN_MAGIC_CB;
@@ -308,7 +313,14 @@ static void nvn_cb_addctlmem(void *c, void *m, uint64_t n)
 {
     if (c) { ((nvn_cb_t *)c)->ctl = m; ((nvn_cb_t *)c)->ctl_size = n; }
 }
-static void nvn_cb_begin(void *c) { if (c) { ((nvn_cb_t *)c)->recording = 1; DMLOG_I("NVN cb begin c=%{public}llx", (unsigned long long)(uintptr_t)c); } }
+static void nvn_cb_begin(void *c)
+{
+    if (c == NULL) return;
+    ((nvn_cb_t *)c)->recording = 1;
+    if (g_nvn_cbs < 8) {
+        DMLOG_I("NVN cb begin c=%{public}llx", (unsigned long long)(uintptr_t)c);
+    }
+}
 static uint64_t nvn_cb_end(void *c)
 {
     nvn_cb_t *o = (nvn_cb_t *)c;
@@ -327,7 +339,9 @@ static uint64_t nvn_cb_end(void *c)
     uint64_t *h = (uint64_t *)(base + ((o->handles * 8) & 0x7F8));
     *h = 0;
     o->handles++;
-    DMLOG_I("NVN cb end h=%{public}llx n=%{public}llu", (unsigned long long)(uintptr_t)h, (unsigned long long)o->handles);
+    if (o->handles <= 2) {
+        DMLOG_I("NVN cb end h=%{public}llx", (unsigned long long)(uintptr_t)h);
+    }
     return (uint64_t)(uintptr_t)h;
 }
 static uint32_t nvn_cb_isrec(const void *c) { return c ? ((const nvn_cb_t *)c)->recording : 0; }
@@ -470,7 +484,9 @@ static void nvn_texb_setdepth(void *b, int d) { if (b) ((nvn_texb_t *)b)->depth 
 static void nvn_texb_setlevels(void *b, int l) { if (b) ((nvn_texb_t *)b)->levels = l; }
 static void nvn_texb_setformat(void *b, int f) { if (b) ((nvn_texb_t *)b)->format = (uint32_t)f; }
 static void nvn_texb_setsamples(void *b, int s) { if (b) ((nvn_texb_t *)b)->samples = s; }
-/* NVNformat -> 每像素字节数(见 nvn.h 的 NVN_FORMAT_* 枚举;R8=1 ... RGBA8=0x25) */
+/* NVNformat -> 每像素字节数 / 压缩格式块大小(见 nvn.h 的 NVN_FORMAT_*)。
+ * D2R 大量用 BC1/BC5/BC7:压缩格式若按 4B/px 估,存储会被高估 4~8 倍,
+ * 内存池很快耗尽,引擎的 StandardAllocator 会返回 NULL。 */
 static unsigned nvn_format_bpp(unsigned f)
 {
     if (f >= 0x1 && f <= 0x4) return 1;      /* R8 */
@@ -484,8 +500,41 @@ static unsigned nvn_format_bpp(unsigned f)
     if (f >= 0x22 && f <= 0x24) return 12;   /* RGB32 */
     if (f >= 0x25 && f <= 0x28) return 4;    /* RGBA8 */
     if (f >= 0x29 && f <= 0x2D) return 8;    /* RGBA16 */
-    if (f >= 0x2E && f <= 0x32) return 16;   /* RGBA32 */
+    if (f >= 0x2E && f <= 0x30) return 16;   /* RGBA32 */
+    switch (f) {
+    case 0x31: return 1;                     /* STENCIL8 */
+    case 0x32: return 2;                     /* DEPTH16 */
+    case 0x33: return 4;                     /* DEPTH24 */
+    case 0x34: return 4;                     /* DEPTH32F */
+    case 0x35: return 4;                     /* DEPTH24_STENCIL8 */
+    case 0x36: return 8;                     /* DEPTH32F_STENCIL8 */
+    case 0x37: case 0x38: return 4;          /* RGBX8/RGBA8 sRGB */
+    case 0x39: case 0x3A: case 0x3B: case 0x3C: return 2;  /* 4/5/565 */
+    case 0x3D: case 0x3E: return 4;          /* RGB10A2 */
+    case 0x3F: case 0x40: return 4;          /* R11G11B10F/RGB9E5F */
+    case 0x69: case 0x6A: case 0x6B: case 0x6C: return 4;  /* RGB10A2 variants */
+    case 0x6D: return 4;                     /* RGBX8 */
+    default: break;
+    }
+    if (f >= 0x51 && f <= 0x6C) {             /* *_UI2F/*_I2F:同上但整体偏移 0x50 */
+        return nvn_format_bpp(f - 0x50);
+    }
     return 4;
+}
+/* 压缩格式:返回每 4x4 块的字节数;0 = 非压缩 */
+static unsigned nvn_format_block(unsigned f)
+{
+    switch (f) {
+    case 0x41: case 0x42: case 0x45: case 0x46:    /* DXT1 (BC1) 8B/块 */
+    case 0x49: case 0x4A:                          /* RGTC1 8B/块 */
+        return 8;
+    case 0x43: case 0x44: case 0x47: case 0x48:    /* DXT3/DXT5 */
+    case 0x4B: case 0x4C: case 0x4D: case 0x4E:    /* RGTC2/BPTC */
+    case 0x4F: case 0x50:                          /* BPTC float */
+        return 16;
+    default:
+        return 0;
+    }
 }
 static uint64_t nvn_texb_size(const void *b)
 {
@@ -495,18 +544,24 @@ static uint64_t nvn_texb_size(const void *b)
     uint64_t h = t->height > 0 ? (uint64_t)t->height : 1;
     uint64_t depth = t->depth > 0 ? (uint64_t)t->depth : 1;
     uint64_t levels = t->levels > 0 ? (uint64_t)t->levels : 1;
+    unsigned blk = nvn_format_block(t->format);
     unsigned bpp = nvn_format_bpp(t->format);
     uint64_t bytes = 0;
     for (uint64_t l = 0; l < levels; l++) {
         uint64_t lw = w >> l; if (lw == 0) lw = 1;
         uint64_t lh = h >> l; if (lh == 0) lh = 1;
-        bytes += lw * lh * depth * bpp;
+        if (blk != 0) {
+            bytes += ((lw + 3) / 4) * ((lh + 3) / 4) * blk * depth;
+        } else {
+            bytes += lw * lh * depth * bpp;
+        }
     }
     uint64_t aligned = (bytes + 4095) & ~(uint64_t)4095;
-    DMLOG_I("NVN texb size %{public}dx%{public}dx%{public}d lv=%{public}d fmt=%{public}u bpp=%{public}u -> %{public}llu",
-            t->width, t->height, t->depth, t->levels, t->format, bpp, (unsigned long long)aligned);
+    DMLOG_I("NVN texb size %{public}dx%{public}dx%{public}d lv=%{public}d fmt=%{public}u bpp=%{public}u blk=%{public}u -> %{public}llu",
+            t->width, t->height, t->depth, t->levels, t->format, bpp, blk, (unsigned long long)aligned);
     return aligned;
 }
+
 static uint64_t nvn_texb_align(const void *b) { (void)b; return 4096; }
 
 static void nvn_bufb_defaults(void *b) { if (b) { memset(b, 0, sizeof(nvn_bufb_t)); ((nvn_bufb_t *)b)->magic = NVN_MAGIC_BUFB; } }
@@ -576,7 +631,29 @@ static uint64_t nvn_texb_getpool(const void *b) { (void)b; return 0; }
 static int64_t nvn_texb_getoff(const void *b) { (void)b; return 0; }
 static int nvn_texb_getrawclass(const void *b) { (void)b; return 0; }
 
+
+/* 状态看门狗:热路径 trace 会刷爆 hilog,这里每 5 s 打一次累计计数,
+ * 便于判断 present/submit 是否真的在发生。 */
+static void *nvn_stats_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        sleep(2);
+        /* hilog 在热路径下轮转很快,计数落盘更可靠 */
+        FILE *f = fopen("/data/storage/el2/base/haps/entry/files/dm_stats.txt", "w");
+        if (f != NULL) {
+            fprintf(f, "present=%llu submit=%llu clear=%llu ops=%llu vk=%llu\n",
+                    (unsigned long long)g_nvn_presents, (unsigned long long)g_nvn_submits,
+                    (unsigned long long)g_nvn_clears, (unsigned long long)g_nvn_ops,
+                    (unsigned long long)dmVkFrames());
+            fclose(f);
+        }
+    }
+    return NULL;
+}
+
 void dmNvnInit(void)
+
 
 
 {
@@ -729,6 +806,13 @@ void dmNvnInit(void)
     dmNvnRegister("nvnBufferBuilderGetSize", (nvn_func_t)nvn_bufb_getsize);
     dmNvnRegister("nvnBufferBuilderGetMemoryPool", (nvn_func_t)nvn_bufb_getpool);
     dmNvnRegister("nvnBufferBuilderGetMemoryOffset", (nvn_func_t)nvn_bufb_getoff);
+
+    {
+        pthread_t th;
+        if (pthread_create(&th, NULL, nvn_stats_thread, NULL) == 0) {
+            pthread_detach(th);
+        }
+    }
 }
 
 #ifdef __aarch64__

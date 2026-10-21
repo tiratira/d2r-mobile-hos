@@ -29,6 +29,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_thread;
 static volatile int g_running = 0;
 static float g_clear[4] = {-1.0f, -1.0f, -1.0f, -1.0f};   /* <0 = 演示动画 */
+static _Atomic uint64_t g_vk_frames;
 
 extern "C" void dmVkSetClearColor(float r, float g, float b, float a)
 {
@@ -237,6 +238,9 @@ static void *vk_loop(void *arg)
     while (g_running) {
         uint32_t idx = 0;
         VkResult r = vkAcquireNextImageKHR(v.dev, v.swc, UINT64_MAX, v.semAcq, VK_NULL_HANDLE, &idx);
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+            g_vk_frames++;
+        }
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
             DMLOG_E("vk: acquire %{public}s", vkerr(r));
             break;
@@ -324,6 +328,9 @@ static void *vk_loop(void *arg)
         r = vkQueuePresentKHR(v.queue, &pi);
         vkQueueWaitIdle(v.queue);
         vkDestroyCommandPool(v.dev, pool, nullptr);
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+            g_vk_frames++;
+        }
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
             DMLOG_E("vk: present %{public}s", vkerr(r));
             break;
@@ -369,3 +376,9 @@ extern "C" __attribute__((visibility("default"))) int dmVkRunning(void)
     return g_running;
 }
 
+
+
+extern "C" __attribute__((visibility("default"))) uint64_t dmVkFrames(void)
+{
+    return g_vk_frames;
+}

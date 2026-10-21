@@ -345,3 +345,61 @@ d2r-mobile-hos/
 │   └── common/DmNative.ets      ← dm_touch_game_bridge.c 的 ArkTS 版
 └── docs/PORTING.md              ← 本文档
 ```
+
+
+## 12. 真机运行状态(最新,2026-10)
+
+真机 HUAWEI Mate 80(VYG-AL00,HarmonyOS 7.0.0.109,API 26,arm64-v8a)已经
+**跑通完整启动链并进入游戏自己的帧循环**:
+
+```
+BOOT _init_libc0 → nnosInitialize → _init_libc1 → nninitInitializeSdkModule
+     → nninitStartup → _init_libc2 → DT_INIT → SetHostArgc/Argv → nnMain
+NVN device/queue/pool/texture/commandBuffer 初始化
+NVN window init
+nvnCommandBuffer{Begin,Clear,Barrier,Copy,SetCopyRowStride,Bind*,Draw*,End}Recording
+nvnQueueFenceSync → nvnSyncWait → …(逐帧)
+nvnQueueSubmitCommands / nvnWindowPresent(每帧)
+```
+
+判据(宿主每 2 s 落盘的计数器,`/data/storage/el2/base/haps/entry/files/dm_stats.txt`):
+
+```
+present≈6.6k / 45 s   submit≈6.6k   clear≈73k   vk(Vulkan 呈现帧)≈4.9k
+```
+
+即引擎以 ~150 fps 提交、~110 fps 呈现,**连续运行数分钟无崩溃**。
+屏幕上的颜色来自游戏 `nvnCommandBufferClearColor` 的真实清屏色(当前是
+D2R 加载界面的深红黑),由 `gfx/dm_vk.cpp` 的 Vulkan 呈现循环直接输出。
+
+### 仍未完成:真正的画面回放
+
+现在 Vulkan 只回放**清屏色**,`nvnCommandBuffer` 里的绘制/纹理/着色器
+命令只是被记录、没有翻译。要看到游戏画面,需要移植上游
+`gfx/nvn/hle_nvn.c` 的命令流 + `gfx/nvn/nvn_mtl.m` 的 Metal 回放逻辑到
+Vulkan(含着色器 Maxwell→SPIR-V 离线翻译)。这是剩余的主要工程量。
+
+### 本轮排查中修掉的真机问题(按出现顺序)
+
+1. 门桩序言 `stp/ldp` 编码不一致 → 每层栈泄漏 16 B → SIGSEGV@0;
+2. `resolve_import()` 隐式声明截断 64 位地址 → 跳到错误地址;
+3. fs 挂载名(`$`/`^`)未生效 → 写日志目录失败提前返回;
+4. 缺 `nn::vi` → 真 `sm:` IPC → diag abort;
+5. 缺 socket/nifm/ssl → `nn::socket::Initialize` 走真 IPC;
+6. `nn::friends` 播放历史 → `friends::detail::ipc` → abort;
+7. NVN `nvnDeviceGetProcAddress` 返回 0 → 引擎存 0 后跳 PC=0;
+8. Vulkan 交换链格式写死(44 不支持)→ 改为从 surface formats 选;
+9. ArkTS 侧切 Vulkan 与 EGL 渲染线程竞争 → 改由 XComponent 回调启动;
+10. `libdmhost` 被 ArkTS 先导入导致 XComponent 回调未注册 → 独立
+    `libdmxe.so` + dlsym 桥;
+11. 多个 NVN getter 原型错误(GetBufferAddress 无 offset、MapVirtual/
+    GetFlags/WindowGet* 返回值语义、SetStorage 的 size 参数);
+12. 纹理/缓冲 builder 存储尺寸按 4 B/px 估算 → 压缩纹理(BC1/BC5/BC7)
+    被高估 4–8 倍 → 内存池耗尽、StandardAllocator 返回 NULL;
+13. 客体线程栈只有十几 KiB,svc 网关里做 pthread_create/文件 IO 会栈溢出
+    → 网关整体切宿主栈(256 KiB,按嵌套深度偏移);
+14. 线程退出在客体小栈上 `pthread_exit` → musl tcache 清理越界 → 切宿主栈;
+15. `nn::os::SystemEvent` 假对象被 SDK 校验 → diag abort → 宿主接管;
+16. `nn::audio::ListAudioOuts` 走 hipc → abort → 剪成无音频降级;
+17. `nvnCommandBufferEndRecording` 返回自增计数 → 改为命令内存地址;
+18. 热路径 trace 全量打日志 → 每入口前 3 次(否则 hilog 轮转、拖慢启动)。
