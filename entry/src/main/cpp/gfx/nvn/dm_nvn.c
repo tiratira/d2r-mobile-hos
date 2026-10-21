@@ -126,7 +126,8 @@ static uint64_t h_nvn_device_get_proc(void *dev, const char *name)
 
 typedef struct { uint32_t magic; uint32_t flags; } nvn_devb_t;
 typedef struct { uint32_t magic; uint32_t flags; } nvn_dev_t;
-typedef struct { uint32_t magic; void *dev; uint64_t cmdsz, compsz, ctlsz, flush, qmem, qmemsz; int32_t prio, flags; } nvn_queueb_t;
+/* 必须 <= sizeof(NVNqueueBuilder)=64(见 nvn.h),否则会写坏相邻栈/堆内存 */
+typedef struct { uint32_t magic; uint32_t flags; void *dev; uint64_t cmdsz, compsz, ctlsz; int32_t prio; uint32_t pad; } nvn_queueb_t;
 typedef struct { uint32_t magic; void *dev; uint64_t submits; } nvn_queue_t;
 typedef struct { uint32_t magic; void *dev; void *native; int32_t ntex, interval, flags; } nvn_winb_t;
 typedef struct { uint32_t magic; void *dev; void *native; int32_t ntex, interval; uint64_t presents; } nvn_win_t;
@@ -204,8 +205,8 @@ static void nvn_qb_setdev(void *b, void *d) { if (b) { ((nvn_queueb_t *)b)->dev 
 static void nvn_qb_setcmdsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->cmdsz = n; DMLOG_I("NVN qb cmdsz=%{public}llu", (unsigned long long)n); }
 static void nvn_qb_setcompsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->compsz = n; }
 static void nvn_qb_setctlsz(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->ctlsz = n; }
-static void nvn_qb_setqmem(void *b, void *m, uint64_t n) { if (b) { ((nvn_queueb_t *)b)->qmem = (uint64_t)(uintptr_t)m; ((nvn_queueb_t *)b)->qmemsz = n; } DMLOG_I("NVN qb qmem=%{public}llx size=%{public}llu", (unsigned long long)(uintptr_t)m, (unsigned long long)n); }
-static void nvn_qb_setflush(void *b, uint64_t n) { if (b) ((nvn_queueb_t *)b)->flush = n; }
+static void nvn_qb_setqmem(void *b, void *m, uint64_t n) { (void)b; DMLOG_I("NVN qb qmem=%{public}llx size=%{public}llu", (unsigned long long)(uintptr_t)m, (unsigned long long)n); }
+static void nvn_qb_setflush(void *b, uint64_t n) { (void)b; (void)n; }
 static void nvn_qb_setprio(void *b, int n) { if (b) ((nvn_queueb_t *)b)->prio = n; }
 static uint32_t nvn_queue_init(void *q, const void *b)
 {
@@ -405,16 +406,16 @@ static uint64_t nvn_qb_get_qmemsz(const void *b)
     DMLOG_I("NVN qb get qmemsz b=%{public}llx", (unsigned long long)(uintptr_t)b);
     const nvn_queueb_t *q = b;
     if (q == NULL) return 0;
-    return q->cmdsz + q->compsz + q->ctlsz + q->flush;
+    return (q->cmdsz + q->compsz + q->ctlsz + 4095) & ~(uint64_t)4095;
 }
 static void *nvn_qb_get_dev(const void *b) { const nvn_queueb_t *q = b; return q ? q->dev : NULL; }
 static void nvn_qb_get_flags(const void *b, int *out) { const nvn_queueb_t *q = b; if (q && out) *out = q->flags; }
 static void nvn_qb_get_cmdsz(const void *b, uint64_t *out) { const nvn_queueb_t *q = b; if (q && out) *out = q->cmdsz; }
 static void nvn_qb_get_compsz(const void *b, uint64_t *out) { const nvn_queueb_t *q = b; if (q && out) *out = q->compsz; }
 static void nvn_qb_get_ctlsz(const void *b, uint64_t *out) { const nvn_queueb_t *q = b; if (q && out) *out = q->ctlsz; }
-static void nvn_qb_get_flush(const void *b, uint64_t *out) { const nvn_queueb_t *q = b; if (q && out) *out = q->flush; }
+static void nvn_qb_get_flush(const void *b, uint64_t *out) { (void)b; if (out) *out = 0; }
 static uint64_t nvn_qb_get_memsz(const void *b) { return nvn_qb_get_qmemsz(b); }
-static void nvn_qb_get_mem(const void *b, uint64_t *out) { const nvn_queueb_t *q = b; if (q && out) *out = q->qmem; }
+static void nvn_qb_get_mem(const void *b, uint64_t *out) { (void)b; if (out) *out = 0; }
 
 /* ---- 队列收尾/present ---- */
 static void nvn_queue_flush(void *q) { (void)q; }
@@ -733,6 +734,8 @@ const char *dmNvnSelfTest(void)
              a ? "ok" : "null", b == 0 ? "null" : "non-null");
     return report;
 }
+
+
 
 
 
