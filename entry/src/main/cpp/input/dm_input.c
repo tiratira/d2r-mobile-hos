@@ -16,6 +16,7 @@ static pthread_mutex_t g_skill_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static float g_stick_dx, g_stick_dy;
 static uint64_t g_pad_buttons;
+static uint64_t g_chord_buttons;
 static pthread_mutex_t g_stick_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t now_us(void)
@@ -35,6 +36,7 @@ void dmInputInit(void)
     pthread_mutex_unlock(&g_skill_mu);
     pthread_mutex_lock(&g_stick_mu);
     g_stick_dx = g_stick_dy = 0.0f;
+    g_pad_buttons = g_chord_buttons = 0;
     pthread_mutex_unlock(&g_stick_mu);
 }
 
@@ -71,7 +73,7 @@ void dmInputSetStick(float dx, float dy)
     pthread_mutex_lock(&g_stick_mu);
     g_stick_dx = dx;
     g_stick_dy = dy;
-    dmHidSet(g_pad_buttons,(int32_t)(dx*32767),(int32_t)(-dy*32767),0,0);
+    dmHidSet(g_pad_buttons | g_chord_buttons,(int32_t)(dx*32767),(int32_t)(-dy*32767),0,0);
     pthread_mutex_unlock(&g_stick_mu);
 }
 
@@ -110,4 +112,25 @@ int dmInputPollSkills(DmSkillEvent *out, int max)
     return n;
 }
 
-void dmInputSetButton(int bit,int pressed){if(bit<0||bit>31)return;pthread_mutex_lock(&g_stick_mu);if(pressed)g_pad_buttons|=1ull<<bit;else g_pad_buttons&=~(1ull<<bit);dmHidSet(g_pad_buttons,(int32_t)(g_stick_dx*32767),(int32_t)(-g_stick_dy*32767),0,0);pthread_mutex_unlock(&g_stick_mu);}
+void dmInputSetButton(int bit, int pressed)
+{
+    if (bit < 0 || bit > 31) return;
+    pthread_mutex_lock(&g_stick_mu);
+    if (pressed) g_pad_buttons |= 1ull << bit;
+    else g_pad_buttons &= ~(1ull << bit);
+    dmHidSet(g_pad_buttons | g_chord_buttons, (int32_t)(g_stick_dx*32767),
+             (int32_t)(-g_stick_dy*32767), 0, 0);
+    pthread_mutex_unlock(&g_stick_mu);
+}
+
+void dmInputSetChord(uint32_t mask, int pressed)
+{
+    pthread_mutex_lock(&g_stick_mu);
+    if (pressed) g_chord_buttons |= mask;
+    else g_chord_buttons &= ~(uint64_t)mask;
+    uint64_t buttons = g_pad_buttons | g_chord_buttons;
+    dmHidSet(buttons, (int32_t)(g_stick_dx*32767), (int32_t)(-g_stick_dy*32767), 0, 0);
+    LOG("[input] chord=%{public}x pressed=%{public}d buttons=%{public}llx",
+        mask, pressed, (unsigned long long)buttons);
+    pthread_mutex_unlock(&g_stick_mu);
+}

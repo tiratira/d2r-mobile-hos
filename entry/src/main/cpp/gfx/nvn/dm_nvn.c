@@ -9,6 +9,7 @@
 #include "host/dm.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -211,6 +212,17 @@ static void sha256_hex16(const void *in, size_t len, char out[17]) {
 }
 
 #include "dm_nvn_trace.inc"
+#include "dm_nvn_fallback_report.inc"
+/* Capture diagnostics must survive the bounded device log. These counters only
+ * belong to fallback wrappers; implemented draw entry points replace them. */
+unsigned dmNvnFallbackDrawMask(void) {
+    return (atomic_load(&nvn_trace_n_nvnCommandBufferDrawArraysInstanced) != 0) |
+           ((atomic_load(&nvn_trace_n_nvnCommandBufferDrawElementsBaseVertex) != 0) << 1) |
+           ((atomic_load(&nvn_trace_n_nvnCommandBufferDrawArraysIndirect) != 0) << 2) |
+           ((atomic_load(&nvn_trace_n_nvnCommandBufferDrawElementsIndirect) != 0) << 3) |
+           ((atomic_load(&nvn_trace_n_nvnCommandBufferMultiDrawArraysIndirectCount) != 0) << 4) |
+           ((atomic_load(&nvn_trace_n_nvnCommandBufferMultiDrawElementsIndirectCount) != 0) << 5);
+}
 #include "nvn_obj.h"
 extern void dmNvnInitRuntime(void);
 void dmNvnShaderKey(const void *p, char out[17]) { sha256_hex16(p, 0x880, out); }

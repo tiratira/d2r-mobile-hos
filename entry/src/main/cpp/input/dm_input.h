@@ -47,6 +47,8 @@ int  dmInputPollTouch(DmTouchEvent *out, int max); /* 取走并清空,返回条�
 /* 摇杆:归一化向量 [-1,1],回中为 (0,0) */
 void dmInputSetStick(float dx, float dy);
 void dmInputSetButton(int bit,int pressed);
+/* Publish a synthetic chord atomically, independently of held touch buttons. */
+void dmInputSetChord(uint32_t mask, int pressed);
 void dmInputGetStick(float *dx, float *dy);
 
 /* 技能施放事件(点按或拖拽瞄准) */

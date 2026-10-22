@@ -80,6 +80,10 @@ export class DmNative {
     dmhost.setPadButton(bit, pressed);
   }
 
+  static setPadChord(mask: number, pressed: number): void {
+    dmhost.setPadChord(mask, pressed);
+  }
+
   /** 从下一帧起抓取 n 帧呈现画面到 files/flash/ */
   static armCapture(frames: number): void {
     dmhost.armCapture(frames);

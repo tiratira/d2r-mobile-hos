@@ -1,8 +1,8 @@
 #include "gfx/nvn/nvn_dirty.h"
 #include "gfx/nvn/index_range.h"
+#include "gfx/nvn/occlusion_counter.h"
 // Vulkan replay of the upstream NVN record ABI. All submissions and presentation
-// share one mutex; a submit returns only after GPU completion, preserving guest
-// command-memory, uniform-update, event and fence lifetimes.
+// share one mutex; submission slots retain resources until GPU completion.
 #include "gfx/nvn/dm_replay.h"
 #include "gfx/nvn/nvn.h"
 #include "gfx/nvn/nvn_obj.h"
@@ -21,6 +21,7 @@
 #include <mutex>
 #include <native_window/external_window.h>
 #include <string>
+#include <string_view>
 #include <set>
 #include <thread>
 #include <tuple>
@@ -32,6 +33,8 @@ extern "C" {
 #include "gfx/tex/nvn_bcdec.h"
 #include "gfx/tex/nvn_deswizzle.h"
 void dmNvnShaderKey(const void *, char out[17]);
+unsigned dmNvnFallbackDrawMask(void);
+void dmNvnTraceFallbacks(FILE *out);
 }
 #define LOG_DOMAIN 0
 #define LOG_TAG "D2RMobileHOS"
@@ -55,6 +58,7 @@ uint32_t qfamily{};
 VkCommandBuffer cmd{};
 VkDescriptorPool setpool{};      // descriptor-set cache pool; sets live across frames
 VkPipelineCache pipelineCache{};
+VkShaderModule waterDebugModule{};
 VkPhysicalDeviceProperties properties{};
 struct Buffer {
     VkBuffer b{};
@@ -121,7 +125,9 @@ struct Writeback {
     uint64_t addr;
     Slice slice;
     size_t size;
+    bool hostReady{}; // CPU-emulated kernel result; no GPU wait needed to consume it
 };
+struct GpuCapture { std::string name; Slice data; };
 struct DeferredEvent {   // guest-visible event write, applied on GPU completion
     uint32_t *ptr;
     uint32_t mode, value;
@@ -129,7 +135,7 @@ struct DeferredEvent {   // guest-visible event write, applied on GPU completion
 struct DeferredCounter { // guest-visible counter report, applied on GPU completion
     uint64_t *ptr;
     uint64_t a, b;
-    int query{-1};   // >= 0: report the GPU occlusion result of this slot-local query
+    OcclusionSnapshot samples;
 };
 uint64_t draws{}, dispatches{}, uploads{}, missing{}, pipelineErrors{}, submits{};
 using Clock = std::chrono::steady_clock;
@@ -143,17 +149,42 @@ uint64_t setAllocs{}, setHits{}, setInvalidations{}, bankHits{}, bankBuilds{}, s
 uint64_t submittedSerial{}, completedSerial{};   // completed = GPU done AND effects applied
 std::atomic<int> armedCapture{0};
 uint64_t capturedFrames{};
+FILE *captureTrace{};
+std::set<uint64_t> captureBuffers;
+uint64_t captureSequence{};
+bool geometryCapture{};
+size_t geometryCaptureBytes{};
+uint64_t gpuWriteVersion{};
+std::map<std::tuple<uint64_t, uint64_t, uint64_t, uint64_t, uint64_t>, std::string> geometrySlices;
 // Real occlusion queries for NVN_COUNTER_TYPE_SAMPLES_PASSED: a zero report
 // tells the game "fully occluded" and it culls light sources and items (the
 // upstream Metal port documents this exact failure).
-enum { QUERIES_PER_SLOT = 256 };
+enum { QUERIES_PER_SLOT = 8192 };
 VkQueryPool queryPool{};
 Buffer queryResults;
 int queryCount{}, queryOpen{-1};
+OcclusionCounter occlusion;
+uint64_t queryReports{}, queryZeros{}, queryFallbacks{}, passCount{};
 struct Timer {
     double &total;
-    Clock::time_point start{Clock::now()};
-    ~Timer() { total += std::chrono::duration<double, std::milli>(Clock::now() - start).count(); }
+    unsigned weight;
+    Clock::time_point start;
+    explicit Timer(double &value) : total(value) {
+        // Two system clock calls per tiny binding/upload became a measurable
+        // render-thread cost on device. Sample phases with probability 1/32;
+        // frame rate and full submission/wait timings remain measured in full.
+        // Pseudorandom selection avoids sampling the same draw phase each time.
+        static thread_local uint32_t state = 0x98a54c31;
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        weight = (state & 31) == 0 ? 32 : 0;
+        if (weight) start = Clock::now();
+    }
+    ~Timer() {
+        if (weight)
+            total += weight * std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    }
 };
 Clock::time_point recordingStart;
 bool deviceLost{};
@@ -234,6 +265,9 @@ void deferBufferDestroy(Buffer b);          // defined after the submission ring
 void invalidateSetsForBuffer(VkBuffer b);   // defined with the descriptor cache
 void invalidateSetsForTexture(uint64_t serial, uint32_t gen);
 void drainIfOverlap(uint64_t addr, uint64_t n);
+void endpass();
+void begin();
+void finish(VkSemaphore wait = {}, VkSemaphore signal = {});
 void reclaimAll();
 void destroyBuffer(Buffer &b) {
     vkUnmapMemory(dev, b.mem);
@@ -253,8 +287,11 @@ void retireResident(decltype(residentBuffers)::iterator it) {
 bool overlaps(uint64_t a, uint64_t n, uint64_t b, uint64_t m) {
     return a <= b ? b - a < n : a - b < m;
 }
+void markGpuWritesUnknown(uint64_t address, uint64_t size);
 void recordGpuWrite(uint64_t address, uint64_t size) {
+    markGpuWritesUnknown(address, size);
     if (!address || !size) return;
+    gpuWriteVersion++;
     if (std::find(gpuWrites.begin(), gpuWrites.end(), std::make_pair(address, size)) != gpuWrites.end())
         return;
     gpuWrites.emplace_back(address, size);
@@ -382,10 +419,12 @@ struct Slot {
     uint64_t submitSerial{}, submittedAtNs{}, completedAtNs{};
     std::vector<VkFramebuffer> framebuffers;
     std::vector<Writeback> writebacks;
+    std::vector<GpuCapture> captures;
     std::vector<Buffer> deadBuffers;
     std::vector<Texture> deadTextures;
     std::vector<DeferredEvent> events;
     std::vector<DeferredCounter> counters;
+    std::vector<std::shared_ptr<OcclusionSegment>> queries;
     std::vector<Buffer> arenaPages;
     size_t arenaPage{}, cursor{}, dynStart{};
     Buffer arena;
@@ -393,6 +432,11 @@ struct Slot {
 Slot ring[RING];
 int curSlot{};
 Slot *cur{};
+void markGpuWritesUnknown(uint64_t address, uint64_t size) {
+    if (cur && !cur->live)
+        for (auto &w : cur->writebacks)
+            if (overlaps(address, size, w.addr, w.size)) w.hostReady = false;
+}
 // One shared staging ring backs every dynamic UBO/storage binding: descriptor
 // sets reference it once and draws supply per-bind offsets, so sets stay
 // valid while guest data moves through the ring each submission.
@@ -512,7 +556,9 @@ std::map<uint64_t, std::pair<Slice, std::vector<uint8_t>>> bankCache;
 Slice bankSlice(const void *p, size_t n) {
     if (debugFlags & 64)   // bisect switch: transient arena, no cross-frame bank
         return bytes(p, n);
-    uint64_t h = fnv1a(p, n);
+    // libc++ hashes machine words; byte-at-a-time FNV forms a 4096-step
+    // dependency chain per bank. Full byte comparison below still proves hits.
+    uint64_t h = std::hash<std::string_view>{}({static_cast<const char *>(p), n});
     auto it = bankCache.find(h);
     if (it != bankCache.end() && it->second.second.size() == n &&
         !memcmp(it->second.second.data(), p, n)) {
@@ -560,15 +606,59 @@ Slice resident(uint64_t address, size_t size) {
     residentBytes += size;
     return {b.b, 0, size, b.map};
 }
-Slice guest(uint64_t addr, size_t n, bool readOnly = false, bool keep = false, bool dyn = false) {
+Slice guest(uint64_t addr, size_t n, bool readOnly = false, bool keep = false, bool dyn = false,
+            size_t alignment = 1) {
     if (!addr || !n)
         return zeroSlice.b ? zeroSlice : (zeroSlice = persistent(nullptr, 65536));
     n = std::min(n, size_t(64 << 20));
-    auto &cache = dyn ? dynCopies : copies;
+    // A later binding can select the opaque/transparent HALF of a compute
+    // output, with a different guest base address. Exact-start cache lookup
+    // alone silently snapshots last frame's CPU shadow instead of GPU results.
+    if (cur) for (auto it = cur->writebacks.rbegin(); it != cur->writebacks.rend(); ++it) {
+        if (!overlaps(addr, n, it->addr, it->size)) continue;
+        if (addr >= it->addr && addr - it->addr <= it->size &&
+            n <= it->size - (addr - it->addr)) {
+            size_t delta = size_t(addr - it->addr);
+            Slice slice = it->slice;
+            if ((slice.off + delta) % alignment == 0) {
+                slice.off += delta;
+                slice.mapped += delta;
+                slice.size = n;
+                static unsigned logged = 0;
+                if (delta && logged++ < 8)
+                    RLOG("GPU subrange forwarded offset=%{public}zu bytes=%{public}zu parent=%{public}zu",
+                         delta, n, it->size);
+                return slice;
+            }
+            // A legal NVN subrange can require stricter host descriptor
+            // alignment. Copy the GPU bytes to aligned staging, never to CPU.
+            endpass();
+            Slice aligned = dyn ? stageDyn(nullptr, n) : bytes(nullptr, n);
+            VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 1, &before, 0, nullptr, 0, nullptr);
+            VkBufferCopy region{slice.off + delta, aligned.off, n};
+            vkCmdCopyBuffer(cmd, slice.b, aligned.b, 1, &region);
+            VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 0, 1, &after, 0, nullptr, 0, nullptr);
+            cur->writebacks.push_back({addr, aligned, n});
+            return aligned;
+        }
+        break;
+    }
+    // Descriptor layout (dynamic offset vs static offset) must never split
+    // guest memory identity. A compute storage write and a later vertex/fragment
+    // read of the same range must reference the SAME Vulkan buffer slice.
+    auto &cache = copies;
     auto key = std::make_pair(addr, (uint64_t)n);
     auto it = cache.lower_bound(key);
     if (it != cache.end() && it->first.first == addr &&
-        (it->first.second == n || (readOnly && n >= 16))) {
+        (it->first.second == n || n >= 16)) {
         // Several meshes bind different prefixes of the same vertex/storage
         // buffer. Reuse an existing larger snapshot rather than recopy it for
         // every prefix; expose only the requested descriptor range.
@@ -626,6 +716,26 @@ void endpass() {
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                              1, &b, 0, nullptr, 0, nullptr);
     }
+}
+void closeQuery() {
+    if (queryOpen < 0) return;
+    endpass();
+    vkCmdEndQuery(cmd, queryPool, uint32_t(queryOpen));
+    queryOpen = -1;
+}
+void resumeQuery() {
+    if (!occlusion.counting || queryOpen >= 0) return;
+    auto segment = occlusion.segment();
+    if (!queryPool || queryCount == QUERIES_PER_SLOT || (debugFlags & 256)) {
+        // An unavailable measurement must not mean "fully occluded".
+        segment->value = 1;
+        segment->ready = true;
+        queryFallbacks++;
+        return;
+    }
+    queryOpen = int((cur - ring) * QUERIES_PER_SLOT + queryCount++);
+    cur->queries.push_back(std::move(segment));
+    vkCmdBeginQuery(cmd, queryPool, uint32_t(queryOpen), 0);
 }
 VkFormat format(int f) {
     static const VkFormat primary[] = {VK_FORMAT_UNDEFINED,
@@ -1259,7 +1369,9 @@ bool beginpass() {
     rb.renderPass = currentPass;
     rb.framebuffer = fb;
     rb.renderArea = {{0, 0}, {passW, passH}};
+    resumeQuery();
     vkCmdBeginRenderPass(cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    passCount++;
     inPass = true;
     return true;
 }
@@ -1325,6 +1437,7 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
     Shader *vs = p.sh[compute ? 5 : 0], *ps = compute ? nullptr : p.sh[1];
     if (!vs)
         return nullptr;
+    const bool water = !compute && vs->key == "a9a839a220417792";
     std::string key = vs->key + (ps ? ps->key : "");
     key.append((char *)&prim, sizeof prim);
     if (!compute) {
@@ -1336,7 +1449,9 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
         key.append((char *)&S.mask, sizeof S.mask);
         key.append((char *)&S.ds, sizeof S.ds);
         key.append((char *)&S.poly, sizeof S.poly);
-        key.append((char *)&debugFlags, sizeof debugFlags);
+        unsigned pipelineFlags = debugFlags & 7;
+        if (water) pipelineFlags |= debugFlags & (1024 | 2048);
+        key.append((char *)&pipelineFlags, sizeof pipelineFlags);
     }
     auto it = pipelines.find(key);
     if (it != pipelines.end())
@@ -1356,6 +1471,18 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
                                   : VK_SHADER_STAGE_VERTEX_BIT;
         stages[i].module = i ? ps->module : vs->module;
         stages[i].pName = "main";
+    }
+    if (water && ps && (debugFlags & 2048)) {
+        if (!waterDebugModule) {
+            auto code = read(std::string(base) + "dm_water_flat.spv");
+            if (code.size() >= 20 && code.size() % 4 == 0) {
+                VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                info.codeSize = code.size();
+                info.pCode = reinterpret_cast<const uint32_t *>(code.data());
+                check(vkCreateShaderModule(dev, &info, nullptr, &waterDebugModule), "water diagnostic shader");
+            }
+        }
+        if (waterDebugModule) stages[1].module = waterDebugModule;
     }
     VkResult result;
     if (compute) {
@@ -1400,6 +1527,7 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
         rs.polygonMode = VK_POLYGON_MODE_FILL;
         rs.cullMode = S.poly.cull == 1 ? VK_CULL_MODE_FRONT_BIT : S.poly.cull == 2 ? VK_CULL_MODE_BACK_BIT : S.poly.cull == 3 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE;
         if (debugFlags & 4) rs.cullMode = VK_CULL_MODE_NONE;
+        if (water && (debugFlags & 2048)) rs.cullMode = VK_CULL_MODE_NONE;
         rs.frontFace = S.poly.front ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
         rs.lineWidth = 1;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -1409,6 +1537,7 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
             VkPipelineColorBlendAttachmentState c{};
             c.colorWriteMask = (S.mask.mask >> (i * 4)) & 15;
             c.blendEnable = (S.color.blend_en >> i) & 1;
+            if (water && (debugFlags & 2048)) { c.blendEnable = false; c.colorWriteMask = 15; }
             const auto &b = S.blend[i];
             c.srcColorBlendFactor = blendFactor(b.src_rgb);
             c.dstColorBlendFactor = blendFactor(b.dst_rgb);
@@ -1427,6 +1556,7 @@ Pipeline *pipeline(Prog &p, int prim, bool compute = false) {
         ds.depthCompareOp = compare(S.ds.df);
         if ((debugFlags & 1) && S.ds.df == 3) ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
         if (debugFlags & 2) ds.depthTestEnable = false;
+        if (water && (debugFlags & (1024 | 2048))) ds.depthTestEnable = false;
         ds.minDepthBounds = 0;
         ds.maxDepthBounds = 1;
         // Stencil enum values map from NVN's GL ordering to Vulkan.
@@ -1529,6 +1659,16 @@ Texture *dummyTexture(int dim) {
     return texture(&t);
 }
 
+struct DriverBankLast {
+    Slice slice{};
+    bool valid{};
+};
+DriverBankLast lastDriverBank[6][2];
+void updateDriverTable(void *dst, const void *src, size_t n, int stage, int bank) {
+    if (!memcmp(dst, src, n)) return;
+    memcpy(dst, src, n);
+    lastDriverBank[stage][bank].valid = false;
+}
 Slice bindingBuffer(const Binding &b, Shader &sh) {
     int stage = sh.stage;
     if (b.kind == 0) {
@@ -1542,12 +1682,20 @@ Slice bindingBuffer(const Binding &b, Shader &sh) {
     if (b.kind == 1) {
         if (b.slot >= 3 && b.slot < 19) {
             auto &u = S.ub[stage][b.slot - 3];
-            return guest(u.addr, u.size, true, !b.dynamic, b.dynamic);
+            return guest(u.addr, u.size, true, !b.dynamic, b.dynamic,
+                         properties.limits.minUniformBufferOffsetAlignment);
         }
         if (b.slot == 1) {
             auto it = constantSlices.find(sh.key);
             if (it != constantSlices.end())
                 return it->second;
+        }
+        // Only binding commands change these tables. Reuse the snapshot before
+        // constructing/hashing 4 KiB again for every draw.
+        auto &last = lastDriverBank[stage][b.slot == 2 ? 1 : 0];
+        if ((b.slot == 0 || b.slot == 2) && !(debugFlags & 64) && last.valid) {
+            bankHits++;
+            return last.slice;
         }
         // Driver banks mirror the current binding table; identical tables reuse
         // one content-keyed persistent slice so descriptor identities stay stable.
@@ -1576,7 +1724,12 @@ Slice bindingBuffer(const Binding &b, Shader &sh) {
             constantSlices[sh.key] = result;
             return result;
         }
-        return bankSlice(bank, sizeof bank);
+        Slice result = bankSlice(bank, sizeof bank);
+        if ((b.slot == 0 || b.slot == 2) && !(debugFlags & 64)) {
+            last.slice = result;
+            last.valid = true;
+        }
+        return result;
     }
     if (b.kind == 2) {
         int baseoff = stage == 0 ? 0x110 : stage == 1 ? 0x510 : 0x310;
@@ -1590,7 +1743,8 @@ Slice bindingBuffer(const Binding &b, Shader &sh) {
             note("storage binding=%u stage=%d cbOffset=%x slot=%d addr=%llx size=%llu", b.binding, stage,
                  b.offset, slot, (unsigned long long)u.addr, (unsigned long long)u.size);
         if (b.writable) recordGpuWrite(u.addr, u.size);
-        Slice s = guest(u.addr, u.size, !b.writable, !b.writable && !b.dynamic, b.dynamic);
+        Slice s = guest(u.addr, u.size, !b.writable, !b.writable && !b.dynamic, b.dynamic,
+                        properties.limits.minStorageBufferOffsetAlignment);
         if (b.writable && u.addr && u.size)
             cur->writebacks.push_back({u.addr, s, std::min(size_t(u.size), s.size)});
         return s;
@@ -1730,6 +1884,11 @@ VkDescriptorSet descriptors(Shader &sh, std::vector<std::pair<uint32_t, uint32_t
                                         ? size_t(properties.limits.maxUniformBufferRange)
                                         : size_t(properties.limits.maxStorageBufferRange));
             r.range = range;
+            if (captureTrace && armedCapture.load() > 0 && b.kind == 2 && sh.stage == 1) {
+                fprintf(captureTrace, "F %llu %s binding=%u offset=%x buffer=%llx off=%zu size=%zu\n",
+                        (unsigned long long)capturedFrames, sh.key.c_str(), b.binding, b.offset,
+                        (unsigned long long)r.slice.b, r.slice.off, r.slice.size);
+            }
             if (b.dynamic) {
                 // Position rides in the draw's dynamic offset; the cached set
                 // identity needs the backing buffer (ring vs zero slice) and
@@ -1752,12 +1911,17 @@ VkDescriptorSet descriptors(Shader &sh, std::vector<std::pair<uint32_t, uint32_t
             auto it = registrations.find(h & 0xfffff);
             if (it != registrations.end() && it->second.tex.mem) {
                 auto &t = it->second.tex;
-                r.slice = guest((uint64_t)(uintptr_t)t.mem, t.L.size, true);
+                r.slice = guest((uint64_t)(uintptr_t)t.mem, t.L.size, true, false, false,
+                                properties.limits.minTexelBufferOffsetAlignment);
                 r.fmt = format(t.d.format);
             } else {
                 r.slice = bytes(nullptr, 4096);
                 r.fmt = VK_FORMAT_R32G32B32A32_SFLOAT;
             }
+            if (captureTrace && armedCapture.load() > 0 && sh.stage == 1)
+                fprintf(captureTrace, "FT %llu %s binding=%u handle=%llx buffer=%llx off=%zu size=%zu fmt=%d\n",
+                        (unsigned long long)capturedFrames, sh.key.c_str(), b.binding,
+                        (unsigned long long)h, (unsigned long long)r.slice.b, r.slice.off, r.slice.size, int(r.fmt));
             identity.push_back(2);
             identity.push_back((uint64_t)r.slice.b);
             identity.push_back(r.slice.off);
@@ -1779,6 +1943,13 @@ VkDescriptorSet descriptors(Shader &sh, std::vector<std::pair<uint32_t, uint32_t
                 if (reg != registrations.end() && reg->second.hasView) r.view = &reg->second.view;
                 r.viewKey = r.view ? fnv1a(r.view, sizeof(view_t)) : 0;
             }
+            if (captureTrace && armedCapture.load() > 0 &&
+                (sh.key == "a9a839a220417792" || sh.key == "3be9871c4d40cf22"))
+                fprintf(captureTrace, "WATER_TEXTURE %s binding=%u handle=%llx serial=%llu gen=%u size=%ux%u depth=%u levels=%u format=%d sampler=%d\n",
+                        sh.key.c_str(), b.binding, (unsigned long long)h, (unsigned long long)r.serial,
+                        r.gen, r.tex ? r.tex->w : 0, r.tex ? r.tex->h : 0,
+                        r.tex ? r.tex->depth : 0, r.tex ? r.tex->levels : 0,
+                        r.tex ? int(r.tex->format) : 0, r.sampId);
             identity.push_back(3);
             identity.push_back(r.serial);
             identity.push_back(r.gen);
@@ -1790,7 +1961,10 @@ VkDescriptorSet descriptors(Shader &sh, std::vector<std::pair<uint32_t, uint32_t
             note("descriptor %s binding=%u kind=%d type=%d slot=%d", sh.key.c_str(), b.binding, b.kind, b.type,
                  b.slot);
     }
-    uint64_t hash = fnv1a(identity.data(), identity.size() * sizeof(uint64_t));
+    // Hash whole machine words, then prove a hit with full identity equality.
+    // Byte-serial FNV here ran for every vertex/fragment set on every draw.
+    uint64_t hash = std::hash<std::string_view>{}(
+        {reinterpret_cast<const char *>(identity.data()), identity.size() * sizeof(uint64_t)});
     if (!(debugFlags & 32)) {   // bisect switch 32: rebuild sets every call
         auto &bucket = sh.byHash[hash];
         for (uint32_t idx : bucket) {
@@ -1831,12 +2005,11 @@ VkDescriptorSet descriptors(Shader &sh, std::vector<std::pair<uint32_t, uint32_t
     static thread_local std::vector<std::vector<VkDescriptorImageInfo>> images;
     static thread_local std::vector<std::vector<VkBufferView>> texels;
     writes.clear();
-    buffers.clear();
-    buffers.resize(sh.bindings.size());
-    images.clear();
-    images.resize(sh.bindings.size());
-    texels.clear();
-    texels.resize(sh.bindings.size());
+    // Keep each binding's backing storage too: clearing the outer vectors
+    // discarded all inner capacities and allocated them again on every miss.
+    if (buffers.size() < sh.bindings.size()) buffers.resize(sh.bindings.size());
+    if (images.size() < sh.bindings.size()) images.resize(sh.bindings.size());
+    if (texels.size() < sh.bindings.size()) texels.resize(sh.bindings.size());
     size_t bindingIndex = 0;
     for (auto &b : sh.bindings) {
         Resolved &r = rs[bindingIndex];
@@ -1902,30 +2075,160 @@ VkDescriptorSet descriptors(Shader &sh, std::vector<std::pair<uint32_t, uint32_t
     sh.logged = true;
     return set;
 }
+void traceDraw(const Prog &p, int count, const p_draw *dw, const p_draw_idx *di) {
+    if (!captureTrace || armedCapture.load() <= 0) return;
+    fprintf(captureTrace, "D %llu %llu %s %s %d %ux%u ds=%d/%d/%d blend=%u mask=%x",
+            (unsigned long long)capturedFrames, (unsigned long long)draws,
+            p.sh[0]->key.c_str(), p.sh[1] ? p.sh[1]->key.c_str() : "-", count,
+            passW, passH, S.ds.dt, S.ds.dw, S.ds.df, S.color.blend_en, S.mask.mask);
+    for (int i = 0; i < S.rt.n; ++i)
+        fprintf(captureTrace, " rt%d=%llu", i, (unsigned long long)(S.rt.color[i] ? S.rt.color[i]->serial : 0));
+    fprintf(captureTrace, " prim=%d first=%d base_vertex=%d base_instance=%d instances=%d stencil=%d\n",
+            di ? di->prim : dw->prim, dw ? dw->first : 0, di ? di->base_vertex : 0,
+            di ? di->base_instance : 0, di ? di->instances : 1, int(S.ds.st));
+    for (int stage = 0; stage < 6; ++stage) {
+        if (!p.sh[stage]) continue;
+        bool used[16]{};
+        for (const auto &b : p.sh[stage]->bindings)
+            if (b.kind == 1 && b.slot >= 3 && b.slot < 19) used[b.slot - 3] = true;
+        for (int i = 0; i < 16; ++i) {
+            if (!used[i]) continue;
+            auto u = S.ub[stage][i];
+            if (!u.addr || !u.size) continue;
+            size_t n = std::min(size_t(u.size), size_t(65536));
+            uint64_t hash = fnv1a((const void *)(uintptr_t)u.addr, n);
+            fprintf(captureTrace, "U %d %d %llx %zu %016llx\n", stage, i,
+                    (unsigned long long)u.addr, n, (unsigned long long)hash);
+            if (captureBuffers.insert(hash).second) {
+                char name[96]; snprintf(name, sizeof name, "flash/ub_%016llx.bin", (unsigned long long)hash);
+                if (FILE *f = fopen((std::string(base) + name).c_str(), "wb")) {
+                    fwrite((const void *)(uintptr_t)u.addr, 1, n, f); fclose(f);
+                }
+            }
+        }
+        fprintf(captureTrace, "T %d", stage);
+        for (int i = 0; i < 128; ++i)
+            if (S.tex[stage][i]) fprintf(captureTrace, " %d:%llx", i, (unsigned long long)S.tex[stage][i]);
+        fprintf(captureTrace, "\n");
+    }
+}
+void captureGeometrySlice(const Slice &src, int stream, uint64_t address, int stride, int divisor) {
+    if (!src.b || !src.size) return;
+    // Immutable slices are shared by many draws. A GPU writer advances the
+    // version, so a later changed result is never mistaken for the earlier one.
+    auto key = std::make_tuple(capturedFrames, uint64_t(src.b), uint64_t(src.off),
+                               uint64_t(src.size), gpuWriteVersion);
+    auto found = geometrySlices.find(key);
+    std::string name;
+    size_t n = std::min(src.size, size_t(8 << 20));
+    if (found == geometrySlices.end()) {
+        if (geometryCaptureBytes + n > (128u << 20)) {
+            fprintf(captureTrace, "GEOM_LIMIT %llu requested=%zu\n", (unsigned long long)draws, src.size);
+            return;
+        }
+        endpass(); // copies are forbidden inside a render pass
+        Slice dst = bytes(nullptr, n);
+        VkBufferCopy copy{src.off, dst.off, n};
+        vkCmdCopyBuffer(cmd, src.b, dst.b, 1, &copy);
+        VkMemoryBarrier ordered{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        ordered.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        ordered.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &ordered, 0, nullptr, 0, nullptr);
+        char path[128];
+        snprintf(path, sizeof path, "flash/geom_%llu_%llu.bin",
+                 (unsigned long long)capturedFrames, (unsigned long long)captureSequence++);
+        name = path;
+        cur->captures.push_back({name, dst});
+        geometrySlices.emplace(key, name);
+        geometryCaptureBytes += n;
+    } else name = found->second;
+    fprintf(captureTrace, "V %llu stream=%d addr=%llx stride=%d divisor=%d bytes=%zu full=%zu %s\n",
+            (unsigned long long)draws, stream, (unsigned long long)address, stride, divisor,
+            n, src.size, name.c_str());
+}
+// Vulkan retains these states within a command buffer. All graphics pipelines
+// declare the same six dynamic states, so unchanged values need no new command.
+struct GraphicsCommands {
+    VkPipeline pipeline{};
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    float blend[4]{};
+    int stencilRef{}, stencilValueMask{}, stencilMask{};
+    bool valid{};
+} graphicsCommands;
+uint64_t graphicsStateCommands{}, graphicsStateSkipped{};
+void bindGraphicsPipeline(VkPipeline pipeline) {
+    if (graphicsCommands.pipeline == pipeline) {
+        graphicsStateSkipped++;
+        return;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    graphicsCommands.pipeline = pipeline;
+    graphicsStateCommands++;
+}
 void dynamic() {
+    auto &old = graphicsCommands;
+    auto changed = [&](const void *a, const void *b, size_t n) {
+        if (!old.valid || memcmp(a, b, n)) { graphicsStateCommands++; return true; }
+        graphicsStateSkipped++;
+        return false;
+    };
     float w = S.viewport[2] > 0 ? S.viewport[2] : passW, h = S.viewport[3] > 0 ? S.viewport[3] : passH;
     VkViewport vp{S.viewport[0], S.viewport[1] + h, w, -h, S.nearZ, S.farZ};
-    vkCmdSetViewport(cmd, 0, 1, &vp);
+    if (changed(&vp, &old.viewport, sizeof vp)) {
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        old.viewport = vp;
+    }
     int x = std::max(0, S.sc.x), y = std::max(0, S.sc.y);
     uint32_t sw = S.sc.w > 0 ? std::min(uint32_t(S.sc.w), passW - std::min(passW, uint32_t(x))) : passW,
              sh = S.sc.h > 0 ? std::min(uint32_t(S.sc.h), passH - std::min(passH, uint32_t(y))) : passH;
     VkRect2D sc{{x, y}, {sw, sh}};
-    vkCmdSetScissor(cmd, 0, 1, &sc);
-    vkCmdSetBlendConstants(cmd, S.blendColor);
-    vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, S.stencilRef);
-    vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, S.stencilValueMask);
-    vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, S.stencilMask);
+    if (changed(&sc, &old.scissor, sizeof sc)) {
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        old.scissor = sc;
+    }
+    if (changed(S.blendColor, old.blend, sizeof old.blend)) {
+        vkCmdSetBlendConstants(cmd, S.blendColor);
+        memcpy(old.blend, S.blendColor, sizeof old.blend);
+    }
+    if (changed(&S.stencilRef, &old.stencilRef, sizeof S.stencilRef)) {
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, S.stencilRef);
+        old.stencilRef = S.stencilRef;
+    }
+    if (changed(&S.stencilValueMask, &old.stencilValueMask, sizeof S.stencilValueMask)) {
+        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, S.stencilValueMask);
+        old.stencilValueMask = S.stencilValueMask;
+    }
+    if (changed(&S.stencilMask, &old.stencilMask, sizeof S.stencilMask)) {
+        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, S.stencilMask);
+        old.stencilMask = S.stencilMask;
+    }
+    old.valid = true;
 }
 void draw(const p_draw *dw, const p_draw_idx *di) {
     Prog *p = program();
+    if (captureTrace && armedCapture.load() > 0)
+        fprintf(captureTrace, "ATTEMPT %llu %s %s count=%d\n",
+                (unsigned long long)draws, p && p->sh[0] ? p->sh[0]->key.c_str() : "-",
+                p && p->sh[1] ? p->sh[1]->key.c_str() : "-", di ? di->count : dw->count);
     if (!p || !p->sh[0])
         return;
+    const bool water = p->sh[0]->key == "a9a839a220417792";
     lastGraphics = p->sh[0]->key + "/" + (p->sh[1] ? p->sh[1]->key : "depth");
     // Resource creation and transfer commands must precede the render pass.
-    std::vector<std::pair<uint32_t, uint32_t>> dyn0, dyn1;
+    static thread_local std::vector<std::pair<uint32_t, uint32_t>> dyn0, dyn1;
+    dyn0.clear();
+    dyn1.clear();
     VkDescriptorSet sets[2]{descriptors(*p->sh[0], &dyn0),
                             p->sh[1] ? descriptors(*p->sh[1], &dyn1) : VK_NULL_HANDLE};
     if (!sets[0] || (p->sh[1] && !sets[1]) || !beginpass()) {
+        if (water) {
+            static unsigned logged = 0;
+            if (logged++ < 8)
+                RLOG("WATER skipped descriptor/pass vs=%{public}d ps=%{public}d pass=%{public}d",
+                     sets[0] != 0, sets[1] != 0, int(inPass));
+        }
         if (draws + dispatches < 16)
             note("draw bail: vs_set=%d ps_set=%d pass=%d vs=%s", sets[0] != 0, p->sh[1] ? sets[1] != 0 : 1,
                  inPass, p->sh[0]->key.c_str());
@@ -1933,21 +2236,24 @@ void draw(const p_draw *dw, const p_draw_idx *di) {
     }
     Pipeline *pipe = pipeline(*p, di ? di->prim : dw->prim);
     if (!pipe || !pipe->pipe) {
+        if (water) RLOG("WATER skipped pipeline");
         if (draws + dispatches < 16)
             note("draw bail: pipe=%d vs=%s ps=%s", pipe && pipe->pipe, p->sh[0]->key.c_str(),
                  p->sh[1] ? p->sh[1]->key.c_str() : "-");
         return;
     }
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->pipe);
+    bindGraphicsPipeline(pipe->pipe);
     std::sort(dyn0.begin(), dyn0.end());
     std::sort(dyn1.begin(), dyn1.end());
-    std::vector<uint32_t> offsets;
+    static thread_local std::vector<uint32_t> offsets;
+    offsets.clear();
     offsets.reserve(dyn0.size() + dyn1.size());
     for (auto &[binding, off] : dyn0) offsets.push_back(off);
     for (auto &[binding, off] : dyn1) offsets.push_back(off);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe->layout, 0, p->sh[1] ? 2 : 1, sets,
                             uint32_t(offsets.size()), offsets.data());
     dynamic();
+    traceDraw(*p, di ? di->count : dw->count, dw, di);
     if (draws < 4) {
         note("draw %llu vs=%s ps=%s rt=%dx%d viewport=%g,%g,%g,%g count=%d first=%d",
              (unsigned long long)draws, p->sh[0]->key.c_str(), p->sh[1] ? p->sh[1]->key.c_str() : "depth", passW, passH,
@@ -2017,10 +2323,14 @@ void draw(const p_draw *dw, const p_draw_idx *di) {
         it = di->itype == 2 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     }
     std::array<bool, 16> bound{};
+    std::array<Slice, 16> geometryVertices;
+    const bool captureMesh = geometryCapture && armedCapture.load() > 0 && S.rt.depth &&
+                             passW <= 1920 && passH <= 1080;
     for (uint32_t loc : p->sh[0]->inputs) {
         if (loc >= 16)
             continue;
         int stream = S.va[loc].stream;
+        if (stream < 0 || stream >= 16) continue;
         if (bound[stream])
             continue;
         bound[stream] = true;
@@ -2031,6 +2341,7 @@ void draw(const p_draw *dw, const p_draw_idx *di) {
             needed = (uint64_t)(di ? di->instances : 1) * S.streams[stream].stride + 256;
         size_t n = std::min<uint64_t>(v.size, needed);
         Slice b = v.address && n ? guest(v.address, n, true, true) : bytes(nullptr, 4096);
+        if (captureMesh) geometryVertices[stream] = b;
         VkDeviceSize off = b.off;
         vkCmdBindVertexBuffers(cmd, stream, 1, &b.b, &off);
     }
@@ -2039,7 +2350,74 @@ void draw(const p_draw *dw, const p_draw_idx *di) {
         vkCmdDrawIndexed(cmd, di->count, std::max(1, di->instances), 0, di->base_vertex, di->base_instance);
     } else if (dw->count > 0)
         vkCmdDraw(cmd, dw->count, 1, dw->first, 0);
+    if (water) {
+        static unsigned logged = 0;
+        if (logged++ < 4)
+            RLOG("WATER submitted vertices=%{public}d target=%{public}ux%{public}u depth=%{public}d/%{public}d/%{public}d",
+                 di ? di->count : dw->count, passW, passH, int(S.ds.dt), int(S.ds.dw), int(S.ds.df));
+    }
+    if (captureMesh) {
+        if (di) {
+            fprintf(captureTrace, "I %llu type=%d count=%d\n", (unsigned long long)draws, di->itype, di->count);
+            captureGeometrySlice(indices, -1, di->ibuf, 0, 0);
+        }
+        for (uint32_t loc : p->sh[0]->inputs)
+            if (loc < 16)
+                fprintf(captureTrace, "A %llu loc=%u stream=%u fmt=%u offset=%u\n",
+                        (unsigned long long)draws, loc, S.va[loc].stream, S.va[loc].fmt, S.va[loc].offset);
+        for (int stream = 0; stream < 16; ++stream)
+            if (bound[stream]) captureGeometrySlice(geometryVertices[stream], stream, S.vb[stream].address,
+                                                    S.streams[stream].stride, S.streams[stream].divisor);
+    }
     draws++;
+}
+bool counterWord(const Slot &slot, uint64_t address, uint64_t &value) {
+    for (auto it = slot.counters.rbegin(); it != slot.counters.rend(); ++it) {
+        uint64_t start = (uint64_t)(uintptr_t)it->ptr;
+        if (address == start + 8) { value = it->b; return true; }
+        if (address != start) continue;
+        for (const auto &part : it->samples.pending)
+            if (!part->ready) return false;
+        value = it->a + it->samples.value();
+        return true;
+    }
+    return false;
+}
+uint64_t cpuKernelWord(uint64_t address) {
+    uint64_t value{};
+    if (cur && !cur->live) {
+        for (auto it = cur->writebacks.rbegin(); it != cur->writebacks.rend(); ++it) {
+            if (!overlaps(address, 8, it->addr, it->size)) continue;
+            if (it->hostReady && address >= it->addr && address - it->addr <= it->size &&
+                8 <= it->size - (address - it->addr)) {
+                memcpy(&value, it->slice.mapped + address - it->addr, 8);
+                return value;
+            }
+            // A real compute producer must complete before CPU consumption.
+            drainIfOverlap(address, 8);
+            memcpy(&value, (const void *)(uintptr_t)address, 8);
+            return value;
+        }
+        for (const auto &c : cur->counters) {
+            auto start = (uint64_t)(uintptr_t)c.ptr;
+            if (address != start && address != start + 8) continue;
+            if (counterWord(*cur, address, value)) return value;
+            drainIfOverlap(address, 8);
+            memcpy(&value, (const void *)(uintptr_t)address, 8);
+            return value;
+        }
+    }
+    const Slot *latest = nullptr;
+    for (const auto &slot : ring)
+        if (slot.live) for (const auto &c : slot.counters) {
+            auto start = (uint64_t)(uintptr_t)c.ptr;
+            if ((address == start || address == start + 8) &&
+                (!latest || slot.submitSerial > latest->submitSerial)) latest = &slot;
+        }
+    if (latest && counterWord(*latest, address, value)) return value;
+    drainIfOverlap(address, 8);
+    memcpy(&value, (const void *)(uintptr_t)address, 8);
+    return value;
 }
 bool builtinDispatch() {
     if (!S.prog || S.prog->nstage != 1)
@@ -2056,26 +2434,70 @@ bool builtinDispatch() {
     auto u = S.ub[5][0], src = S.ssbo[5][0], dst = S.ssbo[5][1];
     if (!u.addr || u.size < 4 || !src.addr || !dst.addr)
         return true;
-    // CPU-side emulation must observe GPU-produced inputs and not be clobbered
-    // by pending writebacks of the same ranges.
-    drainIfOverlap(src.addr, src.size);
-    drainIfOverlap(dst.addr, dst.size);
+    // Timestamp reports are known while recording. Forward their values to
+    // this emulated GPU command without stalling the entire submission; publish
+    // its output only with the submission's other completed writebacks.
+    drainIfOverlap(u.addr, 4);
     uint32_t n;
     memcpy(&n, (void *)(uintptr_t)u.addr, 4);
-    n = std::min<uint64_t>(n, dst.size / 8);
+    n = std::min<uint64_t>(n, std::min<uint64_t>(dst.size, 64u << 20) / 8);
+    std::vector<uint64_t> result;
+    result.reserve(n);
     for (unsigned i = 0; i < n; i++) {
-        uint64_t a = 0, b = 0;
         size_t off = i * (mode < 2 ? 16 : 32) + (mode % 2 ? 8 : 0);
-        if (off + 8 > src.size)
-            break;
-        memcpy(&a, (void *)(uintptr_t)(src.addr + off), 8);
-        if (mode >= 2 && off + 24 <= src.size)
-            memcpy(&b, (void *)(uintptr_t)(src.addr + off + 16), 8);
-        uint64_t v = mode >= 2 ? b - a : a;
-        memcpy((void *)(uintptr_t)(dst.addr + i * 8), &v, 8);
+        if (off + 8 > src.size) break;
+        uint64_t a = cpuKernelWord(src.addr + off);
+        uint64_t b = mode >= 2 && off + 24 <= src.size ? cpuKernelWord(src.addr + off + 16) : 0;
+        result.push_back(mode >= 2 ? b - a : a);
     }
-    invalidateCopies(dst.addr, uint64_t(n) * 8);
+    const size_t bytesWritten = result.size() * 8;
+    if (bytesWritten) {
+        recordGpuWrite(dst.addr, bytesWritten);
+        invalidateCopies(dst.addr, bytesWritten);
+        Slice output = stageDyn(result.data(), bytesWritten);
+        copies[{dst.addr, bytesWritten}] = output;
+        cur->writebacks.push_back({dst.addr, output, bytesWritten, true});
+    }
     return true;
+}
+void captureCompute(Shader &sh) {
+    if (!captureTrace || armedCapture.load() <= 0) return;
+    if (sh.key != "b54d192f7c620ded" && sh.key != "6a7a308d61928982" && sh.key != "1188eaedc8db3285") return;
+    fprintf(captureTrace, "C %llu %s\n", (unsigned long long)capturedFrames, sh.key.c_str());
+    for (const auto &b : sh.bindings) {
+        Slice src;
+        if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) {
+            uint64_t handle = bindingHandle(b, sh.stage);
+            auto reg = registrations.find(handle & 0xfffff);
+            if (reg == registrations.end() || !reg->second.tex.mem) continue;
+            const auto &t = reg->second.tex;
+            src = guest((uint64_t)(uintptr_t)t.mem, t.L.size, true);
+            fprintf(captureTrace, "TBUF %llu %s binding=%u handle=%llx addr=%p bytes=%llu fmt=%d\n",
+                    (unsigned long long)capturedFrames, sh.key.c_str(), b.binding,
+                    (unsigned long long)handle, t.mem, (unsigned long long)t.L.size, t.d.format);
+        } else {
+            if (b.kind != 2 && !(b.kind == 1 && b.slot >= 3 && b.slot < 19)) continue;
+            src = bindingBuffer(b, sh);
+        }
+        size_t n = std::min(src.size, size_t(4 << 20));
+        if (!src.b || !n) continue;
+        Slice dst = bytes(nullptr, n);
+        VkBufferCopy copy{src.off, dst.off, n};
+        vkCmdCopyBuffer(cmd, src.b, dst.b, 1, &copy);
+        char name[160];
+        snprintf(name, sizeof name, "flash/gpu_%llu_%s_b%u_%llu.bin",
+                 (unsigned long long)capturedFrames, sh.key.c_str(), b.binding,
+                 (unsigned long long)captureSequence++);
+        fprintf(captureTrace, "G %u kind=%d slot=%d offset=%x writable=%d buffer=%llx off=%zu size=%zu %s\n",
+                b.binding, b.kind, b.slot, b.offset, int(b.writable),
+                (unsigned long long)src.b, src.off, n, name);
+        cur->captures.push_back({name, dst});
+    }
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 void dispatch(const p_dispatch &d) {
     if (builtinDispatch())
@@ -2107,6 +2529,7 @@ void dispatch(const p_dispatch &d) {
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
                          &mb, 0, nullptr, 0, nullptr);
+    captureCompute(sh);
 }
 void clearColor(const p_clear_color &c) {
     if (!beginpass() || c.index < 0 || c.index >= S.rt.n)
@@ -2149,8 +2572,40 @@ void copyB2T(const p_copy_b2t &c) {
     vkCmdCopyBufferToImage(cmd, s.b, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     imageBarrier(*t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
 }
-void begin();
-void finish(VkSemaphore wait = {}, VkSemaphore signal = {});
+bool copyGpuResult(uint64_t src, uint64_t dst, size_t n) {
+    if (!src || !dst || !n || n > (64u << 20)) return false;
+    // A GPU-produced source needs an ordered GPU copy, not a memcpy from its
+    // deferred guest shadow. Handle subranges (opaque/transparent light bins).
+    Slice source{};
+    for (auto it = cur->writebacks.rbegin(); it != cur->writebacks.rend(); ++it) {
+        if (!overlaps(src, n, it->addr, it->size)) continue;
+        if (src < it->addr || src - it->addr > it->size || n > it->size - (src - it->addr))
+            return false; // partial producer: synchronize the CPU fallback
+        source = it->slice;
+        source.off += src - it->addr;
+        break;
+    }
+    if (!source.b) return false;
+    endpass();
+    recordGpuWrite(dst, n);
+    invalidateCopies(dst, n);
+    Slice target = stageDyn(nullptr, n);
+    VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    before.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    before.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &before, 0, nullptr, 0, nullptr);
+    VkBufferCopy region{source.off, target.off, n};
+    vkCmdCopyBuffer(cmd, source.b, target.b, 1, &region);
+    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &after, 0, nullptr, 0, nullptr);
+    copies[{dst, n}] = target;
+    cur->writebacks.push_back({dst, target, n});
+    return true;
+}
 void execute(const uint8_t *p, int depth = 0) {
     if (depth > 32)
         return;
@@ -2230,8 +2685,10 @@ void execute(const uint8_t *p, int depth = 0) {
         case OP_BIND_UBO:
         case OP_BIND_SSBO: {
             const auto &b = *(const p_bind_buf *)a;
-            if (b.stage >= 0 && b.stage < 6 && b.index >= 0 && b.index < 16)
-                (h.op == OP_BIND_UBO ? S.ub[b.stage][b.index] : S.ssbo[b.stage][b.index]) = b;
+            if (b.stage >= 0 && b.stage < 6 && b.index >= 0 && b.index < 16) {
+                if (h.op == OP_BIND_UBO) S.ub[b.stage][b.index] = b;
+                else updateDriverTable(&S.ssbo[b.stage][b.index], &b, sizeof b, b.stage, 0);
+            }
             break;
         }
         case OP_BIND_TEX:
@@ -2240,11 +2697,11 @@ void execute(const uint8_t *p, int depth = 0) {
             const auto &b = *(const p_bind_handles *)a;
             if (b.stage >= 0 && b.stage < 6 && b.first >= 0 &&
                 b.first + b.n <= (h.op == OP_BIND_IMG ? 32 : 128))
-                memcpy((h.op == OP_BIND_TEX    ? S.tex[b.stage]
+                updateDriverTable((h.op == OP_BIND_TEX    ? S.tex[b.stage]
                         : h.op == OP_BIND_SAMP ? S.samp[b.stage]
                                                : S.img[b.stage]) +
                            b.first,
-                       b.h, b.n * 8);
+                       b.h, b.n * 8, b.stage, 1);
             break;
         }
         case OP_VIEWPORTS: {
@@ -2284,6 +2741,8 @@ void execute(const uint8_t *p, int depth = 0) {
         case OP_COPY_B2B: {
             uint64_t x[3];
             memcpy(x, a, 24);
+            if (copyGpuResult(x[0], x[1], x[2])) break;
+            drainIfOverlap(x[0], x[2]);
             drainIfOverlap(x[1], x[2]);
             memmove((void *)(uintptr_t)x[1], (void *)(uintptr_t)x[0], x[2]);
             invalidateCopies(x[1], x[2]);
@@ -2333,34 +2792,21 @@ void execute(const uint8_t *p, int depth = 0) {
         case OP_REPORT_COUNTER: {
             uint64_t x[2];
             memcpy(x, a, 16);
-            // The report becomes guest-visible only when this submission's
-            // GPU work has completed.
-            int query = -1;
-            if (queryPool && x[0] == 1 && queryOpen >= 0) {
-                vkCmdEndQuery(cmd, queryPool, queryOpen);
-                query = queryOpen;
-                queryOpen = -1;
+            DeferredCounter report{(uint64_t *)x[1], 0, nowNs(), {}};
+            if (x[0] == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                closeQuery();
+                report.samples = occlusion.snapshot();
+                queryReports++;
             }
-            cur->counters.push_back({(uint64_t *)x[1], 0, serial.load(), query});
+            cur->counters.push_back(std::move(report));
             break;
         }
         case OP_RESET_COUNTER: {
             uint64_t t;
             memcpy(&t, a, 8);
-            if (queryPool && t == 1) {
-                // Occlusion counting resumes from zero for subsequent draws;
-                // vkCmdBeginQuery must sit outside a render pass.
-                endpass();
-                size_t slot = size_t(cur - ring);
-                uint32_t idx = uint32_t(slot * QUERIES_PER_SLOT + queryCount);
-                if (queryCount < QUERIES_PER_SLOT) {
-                    queryCount++;
-                    vkCmdBeginQuery(cmd, queryPool, idx, 0);
-                    queryOpen = int(idx);
-                } else if (queryOpen >= 0) {
-                    vkCmdEndQuery(cmd, queryPool, queryOpen);   // exhausted: keep the last value
-                    queryOpen = -1;
-                }
+            if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
+                closeQuery();
+                occlusion.reset();
             }
             break;
         }
@@ -2384,15 +2830,26 @@ void execute(const uint8_t *p, int depth = 0) {
 // events, writebacks) and free everything it owned.
 void slotProcess(Slot &s) {
     completedSerial = std::max(completedSerial, s.submitSerial);
-    submitLatencyMs += double(nowNs() - s.submittedAtNs) / 1e6;
-    for (auto &c : s.counters) {
-        uint64_t values[2]{c.a, c.b};
-        if (c.query >= 0 && queryResults.map) {
-            size_t slot = size_t(&s - ring);
-            memcpy(&values[0], queryResults.map + (slot * QUERIES_PER_SLOT + c.query % QUERIES_PER_SLOT) * 8, 8);
+    for (auto &c : s.captures) {
+        if (FILE *f = fopen((std::string(base) + c.name).c_str(), "wb")) {
+            fwrite(c.data.mapped, 1, c.data.size, f); fclose(f);
         }
-        memcpy((void *)c.ptr, values, 16);
     }
+    s.captures.clear();
+    submitLatencyMs += double(nowNs() - s.submittedAtNs) / 1e6;
+    for (size_t i = 0; i < s.queries.size(); ++i) {
+        auto &q = s.queries[i];
+        memcpy(&q->value, queryResults.map + ((&s - ring) * QUERIES_PER_SLOT + i) * 8, 8);
+        q->ready = true;
+    }
+    for (auto &c : s.counters) {
+        uint64_t values[2]{c.a + c.samples.value(), c.b};
+        if (!c.samples.pending.empty() && values[0] == 0) queryZeros++;
+        nvn_dirty_prepare_write(c.ptr, sizeof values);
+        memcpy((void *)c.ptr, values, sizeof values);
+    }
+    s.queries.clear();
+    occlusion.compact();
 
     // Writebacks land BEFORE events: an event is the guest's "you may read the
     // results now" signal, and the reader wakes concurrently with this loop.
@@ -2446,42 +2903,71 @@ void slotProcess(Slot &s) {
     s.counters.clear();
     s.live = false;
 }
-void reclaim(Slot &s) {
-    if (!s.live)
-        return;
-    auto waitStart = Clock::now();
-    check(vkWaitForFences(dev, 1, &s.fence, VK_TRUE, UINT64_MAX), "fence");
-    gpuMs += std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count();
-    slotProcess(s);
+Slot *oldestSlot() {
+    Slot *oldest = nullptr;
+    for (auto &s : ring)
+        if (s.live && (!oldest || s.submitSerial < oldest->submitSerial)) oldest = &s;
+    return oldest;
+}
+void reclaim(Slot &target) {
+    if (!target.live) return;
+    const auto through = target.submitSerial;
+    while (auto *s = oldestSlot()) {
+        if (s->submitSerial > through) break;
+        auto waitStart = Clock::now();
+        if (!check(vkWaitForFences(dev, 1, &s->fence, VK_TRUE, UINT64_MAX), "fence")) return;
+        gpuMs += std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count();
+        slotProcess(*s);
+    }
 }
 void reclaimSignaled() {
-    for (auto &s : ring)
-        if (s.live && vkGetFenceStatus(dev, s.fence) == VK_SUCCESS)
-            slotProcess(s);
+    while (auto *s = oldestSlot()) {
+        if (vkGetFenceStatus(dev, s->fence) != VK_SUCCESS) break;
+        slotProcess(*s);
+    }
 }
 void reclaimAll() {
-    for (auto &s : ring)
-        reclaim(s);
+    while (auto *s = oldestSlot()) {
+        reclaim(*s);
+        if (deviceLost) break;
+    }
 }
 // A pending writeback memcpy could clobber a newer CPU write into the same
 // guest range; when they overlap, finish all in-flight work first.
+bool pendingGuestWrite(const Slot &s, uint64_t addr, uint64_t n) {
+    for (auto &w : s.writebacks)
+        if (overlaps(addr, n, w.addr, w.size)) return true;
+    for (auto &c : s.counters)
+        if (overlaps(addr, n, (uint64_t)(uintptr_t)c.ptr, 16)) return true;
+    return false;
+}
 void drainIfOverlap(uint64_t addr, uint64_t n) {
-    if (!addr || !n)
-        return;
+    if (!addr || !n) return;
+    // CopyBufferToBuffer / built-in kernels execute on the CPU. A source may
+    // have been written by a compute shader EARLIER IN THIS COMMAND BUFFER.
+    // Waiting only for older submissions still reads last frame's guest shadow.
+    if (cur && !cur->live && pendingGuestWrite(*cur, addr, n)) {
+        Slot *submitted = cur;
+        finish();
+        reclaim(*submitted);
+        begin();
+        syncDrains++;
+        if (syncDrains <= 8)
+            RLOG("GPU->CPU copy dependency resolved addr=%{public}llx bytes=%{public}llu",
+                 (unsigned long long)addr, (unsigned long long)n);
+    }
     for (auto &s : ring)
-        if (s.live)
-            for (auto &w : s.writebacks)
-                if (overlaps(addr, n, w.addr, w.size)) {
-                    reclaimAll();
-                    syncDrains++;
-                    return;
-                }
+        if (s.live && pendingGuestWrite(s, addr, n)) {
+            reclaimAll();
+            syncDrains++;
+            return;
+        }
 }
 void readFlags() {
     // Only override the compiled-in default when a flags file is readable;
     // missing files must not clobber the bisect default.
-    for (const char *path : {"/data/local/tmp/dm_render_flags.txt",
-                             (std::string(base) + "dm_render_flags.txt").c_str()}) {
+    const std::string appFlags = std::string(base) + "dm_render_flags.txt";
+    for (const char *path : {"/data/local/tmp/dm_render_flags.txt", appFlags.c_str()}) {
         if (FILE *config = fopen(path, "r")) {
             unsigned flags = 0;
             if (fscanf(config, "%u", &flags) == 1)
@@ -2491,6 +2977,24 @@ void readFlags() {
     }
 }
 void begin() {
+    const std::string captureRequest = std::string(base) + "dm_flash_capture.txt";
+    if (FILE *request = fopen(captureRequest.c_str(), "r")) {
+        int n = 20;
+        if (fscanf(request, "%d", &n) == 1 && n > 0 && n <= 120)
+            dmReplayArmCapture(n);
+        fclose(request);
+        remove(captureRequest.c_str());
+    }
+    const std::string geometryRequest = std::string(base) + "dm_geometry_capture.txt";
+    if (FILE *request = fopen(geometryRequest.c_str(), "r")) {
+        int n = 3;
+        if (fscanf(request, "%d", &n) == 1 && n > 0 && n <= 3) {
+            dmReplayArmCapture(n);
+            geometryCapture = true;
+        }
+        fclose(request);
+        remove(geometryRequest.c_str());
+    }
     readFlags();
     recordingStart = Clock::now();
     gpuWrites.clear();
@@ -2503,13 +3007,14 @@ void begin() {
     cur = &s;
     s.dynStart = dynCursor;
     cmd = s.buffer;
-    if (queryPool)   // region reset in-command: host vkResetQueryPool needs Vulkan 1.2
-        vkCmdResetQueryPool(cmd, queryPool, uint32_t((&s - ring) * QUERIES_PER_SLOT), QUERIES_PER_SLOT);
     // slotProcess resets the pool at completion, so the buffer is in its
     // initial state here; an individual reset would need the pool flag.
     VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(cmd, &b), "begin command");
+    graphicsCommands = {};
+    if (queryPool)
+        vkCmdResetQueryPool(cmd, queryPool, uint32_t((&s - ring) * QUERIES_PER_SLOT), QUERIES_PER_SLOT);
     // Submissions execute in queue order, but Vulkan does not guarantee memory
     // visibility of the previous submission's storage writes (the game's
     // per-frame nvnCommandBufferWaitSync is stubbed out). One full barrier up
@@ -2522,14 +3027,12 @@ void begin() {
 }
 void finish(VkSemaphore wait, VkSemaphore signal) {
     endpass();
-    if (queryPool) {
-        size_t slot = size_t(cur - ring);
-        for (auto &c : cur->counters)
-            if (c.query >= 0)
-                vkCmdCopyQueryPoolResults(cmd, queryPool, c.query, 1, queryResults.b,
-                                          (slot * QUERIES_PER_SLOT + c.query % QUERIES_PER_SLOT) * 8, 8,
-                                          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        queryOpen = -1;
+    closeQuery();
+    if (queryPool && queryCount) {
+        vkCmdCopyQueryPoolResults(cmd, queryPool, uint32_t((cur - ring) * QUERIES_PER_SLOT),
+                                  uint32_t(queryCount), queryResults.b,
+                                  size_t(cur - ring) * QUERIES_PER_SLOT * 8, 8,
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     }
     check(vkEndCommandBuffer(cmd), "end command");
     VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -2564,8 +3067,11 @@ void finish(VkSemaphore wait, VkSemaphore signal) {
         reclaimAll();
 }
 void savePipelineCache() {
-    if (!pipelineCache)
+    static size_t savedPipelines = 0;
+    static uint64_t savedAt = 0;
+    if (!pipelineCache || pipelines.size() == savedPipelines || nowNs() - savedAt < 5000000000ull)
         return;
+    savedAt = nowNs();
     size_t n = 0;
     if (vkGetPipelineCacheData(dev, pipelineCache, &n, nullptr) || !n || n > (96u << 20))
         return;
@@ -2578,7 +3084,8 @@ void savePipelineCache() {
         return;
     fwrite(data.data(), 1, n, f);
     fclose(f);
-    rename((path + ".tmp").c_str(), path.c_str());
+    if (rename((path + ".tmp").c_str(), path.c_str()) == 0)
+        savedPipelines = pipelines.size();
 }
 void stats() {
     FILE *f = fopen((std::string(base) + "dm_replay_stats.txt").c_str(), "w");
@@ -2602,6 +3109,29 @@ void stats() {
                 debugFlags, retiredSets.size());
         fclose(f);
     }
+    static uint64_t lastAt = 0, lastFrames = 0, lastDraws = 0, lastPasses = 0;
+    static uint64_t lastStateCommands = 0, lastStateSkipped = 0;
+    static double lastReplay = 0, lastGpu = 0, lastDesc = 0, lastStage = 0, lastIndex = 0;
+    const auto at = nowNs();
+    if (lastAt && at - lastAt >= 1000000000ull) {
+        const auto n = frames.load() - lastFrames;
+        const double divisor = double(std::max(uint64_t(1), n));
+        RLOG("PERF fps=%{public}.1f draws/f=%{public}.0f passes/f=%{public}.0f cpu/f=%{public}.1f wait/f=%{public}.1f desc/f=%{public}.1f stage/f=%{public}.1f index/f=%{public}.1f queries=%{public}llu zero=%{public}llu fallback=%{public}llu flags=%{public}u state/f=%{public}.0f skipped/f=%{public}.0f phase_sample=32",
+             double(n)*1e9/double(at-lastAt), double(draws-lastDraws)/divisor,
+             double(passCount-lastPasses)/divisor, (replayMs-lastReplay)/divisor,
+             (gpuMs-lastGpu)/divisor, (descriptorMs-lastDesc)/divisor,
+             (stagingMs-lastStage)/divisor, (indexMs-lastIndex)/divisor,
+             (unsigned long long)queryReports, (unsigned long long)queryZeros,
+             (unsigned long long)queryFallbacks, debugFlags,
+             double(graphicsStateCommands-lastStateCommands)/divisor,
+             double(graphicsStateSkipped-lastStateSkipped)/divisor);
+    }
+    if (!lastAt || at-lastAt >= 1000000000ull) {
+        lastAt = at; lastFrames = frames.load(); lastDraws = draws; lastPasses = passCount;
+        lastReplay = replayMs; lastGpu = gpuMs; lastDesc = descriptorMs;
+        lastStage = stagingMs; lastIndex = indexMs;
+        lastStateCommands = graphicsStateCommands; lastStateSkipped = graphicsStateSkipped;
+    }
     savePipelineCache();
 }
 // Applies completions promptly even while the game thread is between submits
@@ -2622,6 +3152,18 @@ extern "C" void dmReplayArmCapture(int n) {
     std::lock_guard<std::recursive_mutex> lock(mu);
     capturedFrames = 0;
     armedCapture.store(n);
+    mkdir((std::string(base) + "flash").c_str(), 0755);
+    if (captureTrace) fclose(captureTrace);
+    captureBuffers.clear();
+    captureSequence = 0;
+    geometryCapture = false;
+    geometryCaptureBytes = 0;
+    geometrySlices.clear();
+    captureTrace = fopen((std::string(base) + "flash/draws.tsv").c_str(), "w");
+    if (captureTrace) {
+        fprintf(captureTrace, "FALLBACK_DRAW_MASK %x\n", dmNvnFallbackDrawMask());
+        dmNvnTraceFallbacks(captureTrace);
+    }
 }
 extern "C" void dmReplaySubmit(int n, const uint64_t *h) {
     std::lock_guard<std::recursive_mutex> lock(mu);
@@ -2770,6 +3312,10 @@ extern "C" void dmReplayPresent(const tex_t *t, const int *crop) {
     check(vkQueuePresentKHR(queue, &pi), "present");
     if (debugFlags & 0x10000 || legacyPresent)   // synchronous fallback for A/B comparison
         vkQueueWaitIdle(queue);
+    if (captureTrace) {
+        fflush(captureTrace);
+        if (armedCapture.load() <= 0) { fclose(captureTrace); captureTrace = nullptr; }
+    }
     frames++;
     if (frames % 10 == 0)
         stats();
@@ -2863,10 +3409,10 @@ extern "C" int mtl_wait(uint64_t s, uint64_t timeout) {
             leftNs = uint64_t(left);
         }
         auto waitStart = Clock::now();
-        VkResult r = vkWaitForFences(dev, 1, &oldest->fence, VK_TRUE, (leftNs + 999999) / 1000000);
+        VkResult r = vkWaitForFences(dev, 1, &oldest->fence, VK_TRUE, leftNs);
         gpuMs += std::chrono::duration<double, std::milli>(Clock::now() - waitStart).count();
-        if (r == VK_TIMEOUT)
-            return 0;
+        if (r == VK_TIMEOUT) return 0;
+        if (!check(r, "guest fence wait")) return 0;
         slotProcess(*oldest);
     }
     return completedSerial >= s;
@@ -2922,6 +3468,8 @@ static void replayCleanup() {
             vkDestroyPipelineLayout(dev, p.layout, nullptr);
     }
     pipelines.clear();
+    if (waterDebugModule) vkDestroyShaderModule(dev, waterDebugModule, nullptr);
+    waterDebugModule = {};
     if (pipelineCache) {
         vkDestroyPipelineCache(dev, pipelineCache, nullptr);
         pipelineCache = {};
@@ -2958,6 +3506,9 @@ static void replayCleanup() {
     persistentArena = {};
     persistentCursor = 0;
     bankCache.clear();
+    for (auto &stage : lastDriverBank)
+        for (auto &bank : stage) bank = {};
+    occlusion = {};
     copies.clear();
     dynCopies.clear();
     indexRanges.clear();
@@ -3192,7 +3743,7 @@ extern "C" void dmReplayLoop(OHNativeWindow *window, volatile int *running) {
                 queryResults = buffer(RING * QUERIES_PER_SLOT * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
                 note("occlusion queries enabled %u slots", qc.queryCount);
             } else
-                note("occlusion query pool unavailable; counters stay zero");
+                note("occlusion query pool unavailable; visibility uses conservative fallback");
         }
         persistentArena = {};   // first persistent() call allocates page 0
         {

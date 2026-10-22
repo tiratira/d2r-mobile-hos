@@ -35,11 +35,23 @@ struct Game {
   @State bootStage: string = '加载中';
   private stageTimer: number = -1;
   private startTimer: number = -1;
+  private graphicsToggleTimer: number = -1;
   private xcController: XComponentController = new XComponentController();
+
+  private toggleGraphics(): void {
+    if (this.graphicsToggleTimer >= 0) { return; }
+    DmNative.setPadChord((1 << 8) | (1 << 11), 1);
+    this.graphicsToggleTimer = setTimeout(() => {
+      DmNative.setPadChord((1 << 8) | (1 << 11), 0);
+      this.graphicsToggleTimer = -1;
+    }, 250);
+  }
 
   aboutToDisappear(): void {
     if (this.stageTimer >= 0) { clearInterval(this.stageTimer); }
     if (this.startTimer >= 0) { clearTimeout(this.startTimer); }
+    if (this.graphicsToggleTimer >= 0) { clearTimeout(this.graphicsToggleTimer); }
+    DmNative.setPadChord((1 << 8) | (1 << 11), 0);
     DmNative.setStick(0, 0);
     for (let bit: number = 0; bit < 16; bit++) { DmNative.setPadButton(bit, 0); }
   }
@@ -67,6 +79,9 @@ struct Game {
         Text('● 录制').fontSize(12).fontColor('#ffd28a')
           .padding(8).backgroundColor('rgba(0,0,0,0.5)').borderRadius(10)
           .onClick(() => { DmNative.armCapture(20); })
+        Text('新/旧画面').fontSize(12).fontColor('#ead7ab')
+          .padding(8).backgroundColor('rgba(0,0,0,0.5)').borderRadius(10)
+          .onClick(() => { this.toggleGraphics(); })
         Text(this.bootStage).fontSize(10).fontColor('#9da68a')
       }.margin(8)
       Row({ space: 8 }) {
