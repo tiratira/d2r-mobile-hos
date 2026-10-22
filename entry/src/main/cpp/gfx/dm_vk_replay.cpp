@@ -1,6 +1,7 @@
 #include "gfx/nvn/nvn_dirty.h"
 #include "gfx/nvn/index_range.h"
 #include "gfx/nvn/occlusion_counter.h"
+#include "gfx/nvn/texture_copy.h"
 // Vulkan replay of the upstream NVN record ABI. All submissions and presentation
 // share one mutex; submission slots retain resources until GPU completion.
 #include "gfx/nvn/dm_replay.h"
@@ -51,6 +52,8 @@ VkDevice dev{};
 VkQueue queue{};
 VkSurfaceKHR surface{};
 VkSwapchainKHR swapchain{};
+VkSwapchainCreateInfoKHR swapchainConfig{};
+bool swapchainNeedsRebuild{};
 VkExtent2D extent{};
 uint32_t qfamily{};
 // `cmd` mirrors the recording slot's command buffer; recording is single-threaded
@@ -395,7 +398,7 @@ struct Texture {
     VkDeviceMemory memory{};
     VkImageView view{};
     VkFormat format{};
-    uint32_t w{}, h{}, depth{}, layers{}, levels{1};
+    uint32_t w{}, h{}, depth{}, layers{}, levels{1}, texelBytes{};
     int target{};
     uint64_t stamp{}, seen{}, serial{};
     uint32_t gen{};   // bumped when a live serial is replaced by new contents
@@ -701,7 +704,7 @@ struct State {
     float viewport[4]{}, nearZ{}, farZ{1};
     int stencilRef{}, stencilMask{255}, stencilValueMask{255};
     float blendColor[4]{};
-    size_t rowStride{}, imageStride{};
+    int64_t rowStride{}, imageStride{};
 } S;
 bool inPass{};
 VkRenderPass currentPass{};
@@ -871,11 +874,11 @@ Texture makeTexture(const tex_t &t) {
     Texture out;
     out.target = t.d.target;
     out.w = std::max(1u, t.d.width);
-    out.h = std::max(1u, t.d.height);
+    out.h = t.d.target == 0 || t.d.target == 3 ? 1 : std::max(1u, t.d.height);
     out.depth = t.d.target == 2 ? std::max(1u, t.d.depth) : 1;
-    out.layers = (t.d.target == 4 || t.d.target == 3 || t.d.target == 9) ? std::max(1u, t.d.depth)
-                 : t.d.target == 8                                       ? 6
-                                                                         : 1;
+    uint64_t layerCount = textureLayerCount(t.d);
+    if (layerCount > UINT32_MAX) return {};
+    out.layers = uint32_t(layerCount);
     out.levels = std::max(1u, std::min(t.d.levels, 1u + (unsigned)std::log2(std::max({out.w, out.h, out.depth}))));
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t.d.format, &bw, &bh);
     bool bc = t.d.format >= 0x41 && t.d.format <= 0x50;
@@ -893,6 +896,11 @@ Texture makeTexture(const tex_t &t) {
     if (bc && (t.d.format == 0x45 || t.d.format == 0x46 || t.d.format == 0x47 || t.d.format == 0x48 ||
                t.d.format == 0x4e))
         out.format = VK_FORMAT_R8G8B8A8_SRGB;
+    if (bc) {
+        uint32_t unused; int pixelBytes{};
+        nvn_bc_unpacked(t.d.format, &unused, &pixelBytes);
+        out.texelBytes = pixelBytes;
+    } else if (bw == 1 && bh == 1) out.texelBytes = bpb;
     if (t.d.format >= 0x31 && t.d.format <= 0x36)
         out.aspect = t.d.format == 0x31
                          ? VK_IMAGE_ASPECT_STENCIL_BIT
@@ -1029,8 +1037,14 @@ VkImageView textureView(Texture &t, const view_t *v, bool attachment = false) {
     ci.format = t.format;
     if (q.set_format) {
         VkFormat f = format(q.format);
-        if ((t.format == VK_FORMAT_R8G8B8A8_UNORM || t.format == VK_FORMAT_R8G8B8A8_SRGB) &&
-            (f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB)) ci.format = f;
+        // Uncompressed color formats in the same texel-size class can share a
+        // mutable image. Initialization uses integer views of float textures.
+        int bw, bh;
+        int viewBytes = nvn_fmt_bpb(q.format, &bw, &bh);
+        bool uncompressed = bw == 1 && bh == 1;
+        if (t.aspect == VK_IMAGE_ASPECT_COLOR_BIT && uncompressed &&
+            viewBytes > 0 && unsigned(viewBytes) == t.texelBytes)
+            ci.format = f;
     }
     unsigned level = q.set_levels ? std::min(t.levels - 1, unsigned(std::max(0, q.base_level))) : 0;
     unsigned layer = q.set_layers ? std::min(t.layers - 1, unsigned(std::max(0, q.min_layer))) : 0;
@@ -2552,25 +2566,215 @@ void clearDS(const p_clear_ds &c) {
     if (a.aspectMask)
         vkCmdClearAttachments(cmd, 1, &a, 1, &r);
 }
-void copyB2T(const p_copy_b2t &c) {
+void clearTexture(const p_clear_tex &c) {
     endpass();
     Texture *t = texture(c.tex);
-    if (!t || !c.src)
+    if (!t || !(c.mask & 15)) return;
+    if ((c.mask & 15) != 15 || t->target == 2) {
+        note("unsupported texture clear mask=%x target=%d", c.mask, t->target);
         return;
-    int bw, bh, bpp = nvn_fmt_bpb(c.tex->d.format, &bw, &bh);
-    if (!bpp)
-        return;
-    size_t row = S.rowStride ? S.rowStride : (c.r.width + bw - 1) / bw * bpp;
-    size_t size = row * ((c.r.height + bh - 1) / bh) * std::max(1, c.r.depth);
-    Slice s = guest(c.src, size);
+    }
+    view_t view = c.has_view ? c.view : view_t{};
+    unsigned level = view.set_levels ? unsigned(std::max(0, view.base_level)) : 0;
+    unsigned layer = (view.set_layers ? unsigned(std::max(0, view.min_layer)) : 0) +
+                     unsigned(std::max(0, c.r.zoffset));
+    unsigned count = unsigned(std::max(1, c.r.depth));
+    if (level >= t->levels || layer >= t->layers || count > t->layers - layer ||
+        c.r.xoffset < 0 || c.r.yoffset < 0 || c.r.width <= 0 || c.r.height <= 0) return;
+    unsigned width = std::max(1u, t->w >> level), height = std::max(1u, t->h >> level);
+    if (unsigned(c.r.xoffset) >= width || unsigned(c.r.yoffset) >= height) return;
+    view.set_levels = view.set_layers = 1;
+    view.base_level = level; view.nlevels = view.nlayers = 1;
+    VkFormat clearFormat = view.set_format ? format(view.format) : t->format;
+    std::string key = "texture-clear:" + std::to_string(clearFormat) + ":" + std::to_string(t->aspect);
+    auto found = passes.find(key);
+    if (found == passes.end()) {
+        VkAttachmentDescription attachment{};
+        attachment.format = clearFormat;
+        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        attachment.loadOp = attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        attachment.storeOp = attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        attachment.initialLayout = attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_GENERAL};
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        if (t->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+            sub.colorAttachmentCount = 1; sub.pColorAttachments = &ref;
+        } else sub.pDepthStencilAttachment = &ref;
+        VkRenderPassCreateInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        info.attachmentCount = 1; info.pAttachments = &attachment;
+        info.subpassCount = 1; info.pSubpasses = &sub;
+        Pass pass{};
+        if (!check(vkCreateRenderPass(dev, &info, nullptr, &pass.pass), "texture clear render pass")) return;
+        found = passes.emplace(key, pass).first;
+    }
+    imageBarrier(*t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    VkClearAttachment clear{};
+    clear.aspectMask = t->aspect;
+    if (t->aspect == VK_IMAGE_ASPECT_COLOR_BIT) memcpy(&clear.clearValue.color, &c.c, sizeof c.c);
+    else clear.clearValue.depthStencil = {c.is_uint ? float(c.c.u[0]) : c.c.f[0],
+                                          c.c.u[t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? 1 : 0]};
+    VkClearRect rect{{{c.r.xoffset, c.r.yoffset},
+                      {std::min(unsigned(c.r.width), width - unsigned(c.r.xoffset)),
+                       std::min(unsigned(c.r.height), height - unsigned(c.r.yoffset))}}, 0, 1};
+    for (unsigned z = 0; z < count; z++) {
+        view.min_layer = layer + z;
+        VkImageView iv = textureView(*t, &view, true);
+        if (!iv) return;
+        VkFramebufferCreateInfo fb{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fb.renderPass = found->second.pass; fb.attachmentCount = 1; fb.pAttachments = &iv;
+        fb.width = width; fb.height = height; fb.layers = 1;
+        VkFramebuffer frame{};
+        if (!check(vkCreateFramebuffer(dev, &fb, nullptr, &frame), "texture clear framebuffer")) return;
+        cur->framebuffers.push_back(frame);
+        VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        begin.renderPass = found->second.pass; begin.framebuffer = frame;
+        begin.renderArea.extent = {width, height};
+        vkCmdBeginRenderPass(cmd, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdClearAttachments(cmd, 1, &clear, 1, &rect);
+        vkCmdEndRenderPass(cmd);
+    }
+    imageBarrier(*t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    note("texture clear serial=%llu format=%d view=%d level=%u layers=%u value=%x,%x,%x,%x",
+         (unsigned long long)t->serial, int(t->format), int(clearFormat), level, count,
+         c.c.u[0], c.c.u[1], c.c.u[2], c.c.u[3]);
+    // Keep a tiny GPU readback of initialization clears. This verifies the
+    // integer-view bit pattern independently of the subsequent scene draws.
+    static unsigned sampledClears{};
+    if (t->aspect == VK_IMAGE_ASPECT_COLOR_BIT && sampledClears++ < 8) {
+        Slice sample = bytes(nullptr, 16);
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = sample.off;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
+        copy.imageOffset = {c.r.xoffset, c.r.yoffset, 0};
+        copy.imageExtent = {1, 1, 1};
+        vkCmdCopyImageToBuffer(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, sample.b, 1, &copy);
+        cur->captures.push_back({"clear_" + std::to_string(t->serial) + ".bin", sample});
+    }
+}
+void copyB2T(const p_copy_b2t &c) {
+    endpass();
+    TextureCopyPlan plan;
+    if (!c.tex || !c.src || !textureCopyPlan(c.tex->d, c.has_view ? &c.view : nullptr, c.r,
+                                           S.rowStride, S.imageStride, plan)) return;
+    Texture *t = texture(c.tex);
+    if (!t || plan.extent > (256u << 20)) return;
+    Slice s;
+    bool compressed = plan.blockWidth != 1 || plan.blockHeight != 1;
+    if (compressed) {
+        uint32_t unused; int pixelBytes{};
+        if (!nvn_bc_unpacked(c.tex->d.format, &unused, &pixelBytes)) {
+            note("unsupported compressed texture upload format=%d", c.tex->d.format); return;
+        }
+        drainIfOverlap(c.src, plan.extent);
+        endpass();
+        t = texture(c.tex);
+        if (!t) return;
+        size_t pitch = size_t(plan.width) * pixelBytes, image = pitch * plan.height;
+        if (image > (256u << 20) / plan.count) return;
+        std::vector<uint8_t> pixels(image * plan.count);
+        for (unsigned z = 0; z < plan.count; z++)
+            if (nvn_bc_decode(c.tex->d.format, (const uint8_t *)(uintptr_t)c.src + z * plan.image,
+                              plan.row, plan.width, plan.height, pixels.data() + z * image, pitch)) return;
+        s = bytes(pixels.data(), pixels.size());
+    } else {
+        if (plan.row % plan.blockBytes || plan.image % plan.row) {
+            note("unsupported texture upload pitch row=%zu image=%zu", plan.row, plan.image); return;
+        }
+        s = guest(c.src, plan.extent, true);
+    }
     VkBufferImageCopy copy{};
     copy.bufferOffset = s.off;
-    copy.bufferRowLength = S.rowStride ? row / bpp * bw : 0;
-    copy.imageSubresource = {t->aspect, 0, 0, 1};
-    copy.imageOffset = {c.r.xoffset, c.r.yoffset, c.r.zoffset};
-    copy.imageExtent = {(uint32_t)c.r.width, (uint32_t)c.r.height, (uint32_t)std::max(1, c.r.depth)};
+    copy.bufferRowLength = compressed ? 0 : uint32_t(plan.row / plan.blockBytes);
+    copy.bufferImageHeight = compressed ? 0 : uint32_t(plan.image / plan.row);
+    copy.imageSubresource = {t->aspect, plan.level, plan.volume ? 0 : plan.layer, plan.volume ? 1 : plan.count};
+    copy.imageOffset = {c.r.xoffset, c.r.yoffset, plan.volume ? int32_t(plan.layer) : 0};
+    copy.imageExtent = {plan.width, plan.height, plan.volume ? plan.count : 1};
+    imageBarrier(*t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
     vkCmdCopyBufferToImage(cmd, s.b, t->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     imageBarrier(*t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+}
+bool copyT2B(const p_copy_b2t &c, int64_t rowStride, int64_t imageStride) {
+    TextureCopyPlan plan;
+    if (!c.tex || !c.src || !textureCopyPlan(c.tex->d, c.has_view ? &c.view : nullptr, c.r,
+                                           rowStride, imageStride, plan)) return false;
+    if (plan.blockWidth != 1 || plan.blockHeight != 1 || plan.row % plan.blockBytes ||
+        plan.image % plan.row || plan.extent > (256u << 20)) {
+        note("unsupported texture readback format=%d row=%zu image=%zu", c.tex->d.format, plan.row, plan.image);
+        return false;
+    }
+    endpass();
+    drainIfOverlap(c.src, plan.extent);
+    endpass();
+    Texture *t = texture(c.tex);
+    if (!t || (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT && t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) return false;
+    // Preserve bytes outside the copied rows, including image/row padding.
+    Slice target = bytes((const void *)(uintptr_t)c.src, plan.extent);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = target.off;
+    copy.bufferRowLength = uint32_t(plan.row / plan.blockBytes);
+    copy.bufferImageHeight = uint32_t(plan.image / plan.row);
+    copy.imageSubresource = {t->aspect, plan.level, plan.volume ? 0 : plan.layer, plan.volume ? 1 : plan.count};
+    copy.imageOffset = {c.r.xoffset, c.r.yoffset, plan.volume ? int32_t(plan.layer) : 0};
+    copy.imageExtent = {plan.width, plan.height, plan.volume ? plan.count : 1};
+    imageBarrier(*t, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    vkCmdCopyImageToBuffer(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, target.b, 1, &copy);
+    VkMemoryBarrier after{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         0, 1, &after, 0, nullptr, 0, nullptr);
+    recordGpuWrite(c.src, plan.extent);
+    invalidateCopies(c.src, plan.extent);
+    copies[{c.src, plan.extent}] = target;
+    cur->writebacks.push_back({c.src, target, plan.extent});
+    return true;
+}
+void copyT2T(const p_copy_t2t &c) {
+    TextureCopyPlan src, dst;
+    if (!c.src || !c.dst || !textureCopyPlan(c.src->d, c.has_sv ? &c.sv : nullptr, c.sr, 0, 0, src) ||
+        !textureCopyPlan(c.dst->d, c.has_dv ? &c.dv : nullptr, c.dr, 0, 0, dst)) return;
+    if (src.count != dst.count) {
+        note("unsupported texture copy slice scaling %u -> %u", src.count, dst.count); return;
+    }
+    endpass();
+    Texture *s = texture(c.src), *d = texture(c.dst);
+    if (!s || !d || s->aspect != d->aspect) return;
+    imageBarrier(*s, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    imageBarrier(*d, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
+    bool blit = src.width != dst.width || src.height != dst.height || (c.flags & 12) ||
+                (s->format != d->format && (!s->texelBytes || s->texelBytes != d->texelBytes));
+    std::vector<VkImageCopy> copies;
+    std::vector<VkImageBlit> blits;
+    for (unsigned z = 0; z < src.count; z++) {
+        unsigned sourceZ = c.flags & 16 ? src.count - 1 - z : z;
+        for (VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                                         VK_IMAGE_ASPECT_STENCIL_BIT}) {
+            if (!(s->aspect & aspect)) continue;
+            VkImageSubresourceLayers sl{aspect, src.level, src.volume ? 0 : src.layer + sourceZ, 1};
+            VkImageSubresourceLayers dl{aspect, dst.level, dst.volume ? 0 : dst.layer + z, 1};
+            VkOffset3D so{c.sr.xoffset, c.sr.yoffset, src.volume ? int32_t(src.layer + sourceZ) : 0};
+            VkOffset3D target{c.dr.xoffset, c.dr.yoffset, dst.volume ? int32_t(dst.layer + z) : 0};
+            if (blit) {
+                VkImageBlit b{};
+                b.srcSubresource = sl; b.dstSubresource = dl;
+                b.srcOffsets[0] = so;
+                b.srcOffsets[1] = {so.x + int32_t(src.width), so.y + int32_t(src.height), so.z + 1};
+                if (c.flags & 4) std::swap(b.srcOffsets[0].x, b.srcOffsets[1].x);
+                if (c.flags & 8) std::swap(b.srcOffsets[0].y, b.srcOffsets[1].y);
+                b.dstOffsets[0] = target;
+                b.dstOffsets[1] = {target.x + int32_t(dst.width), target.y + int32_t(dst.height), target.z + 1};
+                blits.push_back(b);
+            } else copies.push_back({sl, so, dl, target, {src.width, src.height, 1}});
+        }
+    }
+    if (blit)
+        vkCmdBlitImage(cmd, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL,
+                       uint32_t(blits.size()), blits.data(),
+                       (c.flags & 1) && s->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    else vkCmdCopyImage(cmd, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL,
+                        uint32_t(copies.size()), copies.data());
+    imageBarrier(*d, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
 }
 bool copyGpuResult(uint64_t src, uint64_t dst, size_t n) {
     if (!src || !dst || !n || n > (64u << 20)) return false;
@@ -2640,6 +2844,9 @@ void execute(const uint8_t *p, int depth = 0) {
             break;
         case OP_CLEAR_DS:
             clearDS(*(const p_clear_ds *)a);
+            break;
+        case OP_CLEAR_TEX:
+            clearTexture(*(const p_clear_tex *)a);
             break;
         case OP_BIND_PROGRAM:
             S.prog = ((const p_bind_program *)a)->prog;
@@ -2751,25 +2958,12 @@ void execute(const uint8_t *p, int depth = 0) {
         case OP_COPY_B2T:
             copyB2T(*(const p_copy_b2t *)a);
             break;
-        case OP_COPY_T2T: {
-            endpass();
-            const auto &c = *(const p_copy_t2t *)a;
-            Texture *s = texture(c.src), *d = texture(c.dst);
-            if (s && d) {
-                VkImageBlit b{};
-                b.srcSubresource = {s->aspect, 0, 0, 1};
-                b.dstSubresource = {d->aspect, 0, 0, 1};
-                b.srcOffsets[0] = {c.sr.xoffset, c.sr.yoffset, c.sr.zoffset};
-                b.srcOffsets[1] = {c.sr.xoffset + c.sr.width, c.sr.yoffset + c.sr.height,
-                                   c.sr.zoffset + std::max(1, c.sr.depth)};
-                b.dstOffsets[0] = {c.dr.xoffset, c.dr.yoffset, c.dr.zoffset};
-                b.dstOffsets[1] = {c.dr.xoffset + c.dr.width, c.dr.yoffset + c.dr.height,
-                                   c.dr.zoffset + std::max(1, c.dr.depth)};
-                vkCmdBlitImage(cmd, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1,
-                               &b, VK_FILTER_NEAREST);
-                    }
+        case OP_COPY_T2B:
+            copyT2B(*(const p_copy_b2t *)a, S.rowStride, S.imageStride);
             break;
-        }
+        case OP_COPY_T2T:
+            copyT2T(*(const p_copy_t2t *)a);
+            break;
         case OP_COPY_STRIDE:
             S.rowStride = ((const p_copy_stride *)a)->stride;
             break;
@@ -3066,6 +3260,48 @@ void finish(VkSemaphore wait, VkSemaphore signal) {
     if (debugFlags & 0x10000)   // synchronous fallback for A/B comparison
         reclaimAll();
 }
+bool recreateSwapchain() {
+    VkSurfaceCapabilitiesKHR caps{};
+    if (!check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps), "surface capabilities"))
+        return false;
+    VkExtent2D nextExtent = caps.currentExtent;
+    if (nextExtent.width == UINT32_MAX) nextExtent = extent;
+    if (!nextExtent.width || !nextExtent.height) return false;
+    reclaimAll();
+    if (!check(vkDeviceWaitIdle(dev), "swapchain idle")) return false;
+    auto info = swapchainConfig;
+    info.oldSwapchain = swapchain;
+    info.imageExtent = nextExtent;
+    info.minImageCount = std::max(2u, caps.minImageCount);
+    if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
+    info.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+                            ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
+    VkSwapchainKHR replacement{};
+    if (!check(vkCreateSwapchainKHR(dev, &info, nullptr, &replacement), "recreate swapchain")) return false;
+    vkDestroySwapchainKHR(dev, swapchain, nullptr);
+    swapchain = replacement;
+    extent = nextExtent;
+    swapchainConfig = info;
+    swapchainConfig.oldSwapchain = VK_NULL_HANDLE;
+    // A failed presentation may leave a binary semaphore signaled. The device
+    // is idle, so replace presentation synchronization together with the chain.
+    VkSemaphoreCreateInfo sem{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    for (auto &slot : ring) {
+        vkDestroySemaphore(dev, slot.acquireSem, nullptr);
+        vkDestroySemaphore(dev, slot.renderSem, nullptr);
+        slot.acquireSem = slot.renderSem = VK_NULL_HANDLE;
+        if (!check(vkCreateSemaphore(dev, &sem, nullptr, &slot.acquireSem), "recreate acquire semaphore") ||
+            !check(vkCreateSemaphore(dev, &sem, nullptr, &slot.renderSem), "recreate render semaphore")) {
+            deviceLost = true;
+            return false;
+        }
+    }
+    swapchainNeedsRebuild = false;
+    note("swapchain recovered %ux%u frame=%llu", extent.width, extent.height,
+         (unsigned long long)frames.load());
+    RLOG("swapchain recovered %{public}ux%{public}u", extent.width, extent.height);
+    return true;
+}
 void savePipelineCache() {
     static size_t savedPipelines = 0;
     static uint64_t savedAt = 0;
@@ -3161,8 +3397,12 @@ extern "C" void dmReplayArmCapture(int n) {
     geometrySlices.clear();
     captureTrace = fopen((std::string(base) + "flash/draws.tsv").c_str(), "w");
     if (captureTrace) {
+        fprintf(captureTrace, "CAPTURE_START frame=%llu draws=%llu serial=%llu\n",
+                (unsigned long long)frames.load(), (unsigned long long)draws,
+                (unsigned long long)serial.load());
         fprintf(captureTrace, "FALLBACK_DRAW_MASK %x\n", dmNvnFallbackDrawMask());
         dmNvnTraceFallbacks(captureTrace);
+        fflush(captureTrace);
     }
 }
 extern "C" void dmReplaySubmit(int n, const uint64_t *h) {
@@ -3181,14 +3421,26 @@ extern "C" void dmReplayPresent(const tex_t *t, const int *crop) {
     std::lock_guard<std::recursive_mutex> lock(mu);
     if (!ready || !t || deviceLost)
         return;
-    begin();
-    VkSemaphore acquireSem = cur->acquireSem, renderSem = cur->renderSem;
-    uint32_t index;
-    VkResult r = vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, acquireSem, VK_NULL_HANDLE, &index);
+    // Acquire before recording. On an out-of-date chain no semaphore is
+    // signaled and no command buffer may be left open for the next submit.
+    if (swapchainNeedsRebuild && !recreateSwapchain()) return;
+    auto &slot = ring[curSlot];
+    if (slot.live) reclaim(slot);
+    uint32_t index{};
+    VkResult r = vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, slot.acquireSem, VK_NULL_HANDLE, &index);
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) {
+        swapchainNeedsRebuild = true;
+        if (!recreateSwapchain()) return;
+        r = vkAcquireNextImageKHR(dev, swapchain, UINT64_MAX, slot.acquireSem, VK_NULL_HANDLE, &index);
+    }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        if (r == VK_ERROR_OUT_OF_DATE_KHR) swapchainNeedsRebuild = true;
         check(r, "acquire");
         return;
     }
+    if (r == VK_SUBOPTIMAL_KHR) swapchainNeedsRebuild = true;
+    VkSemaphore acquireSem = slot.acquireSem, renderSem = slot.renderSem;
+    begin();
     Texture *src = texture(t);
     struct Dump { int id; Texture *texture; Slice data; };
     std::vector<Dump> dumps;
@@ -3309,12 +3561,19 @@ extern "C" void dmReplayPresent(const tex_t *t, const int *crop) {
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain;
     pi.pImageIndices = &index;
-    check(vkQueuePresentKHR(queue, &pi), "present");
+    VkResult presented = vkQueuePresentKHR(queue, &pi);
+    if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR)
+        swapchainNeedsRebuild = true;
+    else check(presented, "present");
     if (debugFlags & 0x10000 || legacyPresent)   // synchronous fallback for A/B comparison
         vkQueueWaitIdle(queue);
     if (captureTrace) {
         fflush(captureTrace);
-        if (armedCapture.load() <= 0) { fclose(captureTrace); captureTrace = nullptr; }
+        if (armedCapture.load() <= 0) {
+            fprintf(captureTrace, "CAPTURE_DONE frame=%llu draws=%llu\n",
+                    (unsigned long long)frames.load(), (unsigned long long)draws);
+            fclose(captureTrace); captureTrace = nullptr;
+        }
     }
     frames++;
     if (frames % 10 == 0)
@@ -3422,23 +3681,27 @@ extern "C" void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer, 
     std::lock_guard<std::recursive_mutex> lock(mu);
     if (!t || !dst || !r)
         return;
-    // Reads guest memory directly; pending writebacks must be applied first.
+    if (row > INT64_MAX || img > INT64_MAX) return;
+    view_t view{};
+    view.set_levels = view.set_layers = 1;
+    view.base_level = int(level); view.min_layer = int(layer);
+    view.nlevels = 1;
+    TextureCopyPlan plan;
+    if (!textureCopyPlan(t->d, &view, *r, int64_t(row), int64_t(img), plan)) return;
+    // Packaged assets are read from Tegra storage; render targets must be read
+    // from the GPU after their producers complete, not from the stale shadow.
     if (ready && !deviceLost)
         reclaimAll();
-    int bw, bh, bpp = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    if (!bpp)
-        return;
-    size_t pitch = ((t->d.width + bw - 1) / bw) * bpp, rows = (t->d.height + bh - 1) / bh;
-    std::vector<uint8_t> linear(pitch * rows);
-    if (t->mem && !nvn_deswizzle(&t->d, level, layer, t->mem, linear.data(), pitch)) {
-        size_t n = ((r->width + bw - 1) / bw) * bpp;
-        if (!row)
-            row = n;
-        if (!img)
-            img = row * ((r->height + bh - 1) / bh);
-        for (int y = 0; y < (r->height + bh - 1) / bh; y++)
-            memcpy(dst + y * row, linear.data() + (y + r->yoffset / bh) * pitch + r->xoffset / bw * bpp, n);
-    }
+    if (readPackagedTexture(*t, plan, *r, dst)) return;
+    if (!ready || deviceLost) return;
+    p_copy_b2t request{};
+    request.tex = t; request.src = uint64_t(uintptr_t(dst));
+    request.view = view; request.has_view = 1; request.r = *r;
+    begin();
+    bool copied = copyT2B(request, int64_t(row), int64_t(img));
+    Slot *submitted = cur;
+    finish();
+    if (copied) reclaim(*submitted);
 }
 static void replayCleanup() {
     if (dev)
@@ -3571,6 +3834,8 @@ static void replayCleanup() {
     instance = {};
     surface = {};
     swapchain = {};
+    swapchainConfig = {};
+    swapchainNeedsRebuild = false;
     submittedSerial = completedSerial = 0;
 }
 extern "C" void dmReplayLoop(OHNativeWindow *window, volatile int *running) {
@@ -3685,6 +3950,7 @@ extern "C" void dmReplayLoop(OHNativeWindow *window, volatile int *running) {
             replayCleanup();
             return;
         }
+        swapchainConfig = sw;
         VkSemaphoreCreateInfo sm{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
         VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         for (auto &s : ring) {

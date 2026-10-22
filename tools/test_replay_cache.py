@@ -9,6 +9,74 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 class ReplayCacheTest(unittest.TestCase):
+    def test_present_recovers_outdated_swapchain_before_recording(self):
+        compiler = shutil.which('clang++') or shutil.which('c++')
+        if not compiler:
+            self.skipTest('requires a C++17 compiler')
+        source = (ROOT / 'entry/src/main/cpp/gfx/dm_vk_replay.cpp').read_text()
+        start = source.index('    // Acquire before recording.')
+        end = source.index('    Texture *src = texture(t);', start)
+        code = r'''
+#include <cassert>
+#include <cstdint>
+#include <deque>
+using VkResult = int;
+using VkSemaphore = int;
+constexpr int VK_SUCCESS=0, VK_SUBOPTIMAL_KHR=1, VK_ERROR_OUT_OF_DATE_KHR=-1;
+constexpr int VK_NULL_HANDLE=0;
+struct Slot { bool live{}; int acquireSem{10},renderSem{20}; } ring[2];
+int curSlot{}, dev{}, swapchain{}, begins{}, rebuilds{}, reclaims{}, checks{}, boundAcquire{}, boundRender{};
+bool swapchainNeedsRebuild{}, rebuildSucceeds=true;
+std::deque<int> results;
+void reclaim(Slot &s) { reclaims++; s.live=false; }
+bool recreateSwapchain() {
+    rebuilds++;
+    if (!rebuildSucceeds) return false;
+    for (auto &s:ring) { s.acquireSem+=100; s.renderSem+=100; }
+    swapchainNeedsRebuild=false;
+    return true;
+}
+VkResult vkAcquireNextImageKHR(int,int,uint64_t,int semaphore,int,uint32_t *index) {
+    assert(begins==0); // acquiring and recovery must precede command recording
+    assert(semaphore==ring[curSlot].acquireSem);
+    assert(!results.empty()); int r=results.front(); results.pop_front(); *index=3; return r;
+}
+void begin() { begins++; }
+void check(int,const char*) { checks++; }
+void present() {
+''' + source[start:end] + r'''
+    boundAcquire=acquireSem; boundRender=renderSem;
+}
+void reset() {
+    ring[0]={}; begins=rebuilds=reclaims=checks=boundAcquire=boundRender=0;
+    swapchainNeedsRebuild=false; rebuildSucceeds=true; results.clear();
+}
+int main() {
+    reset(); ring[0].live=true; results={VK_SUCCESS}; present();
+    assert(begins==1 && reclaims==1 && rebuilds==0 && boundAcquire==10);
+    reset(); results={VK_ERROR_OUT_OF_DATE_KHR,VK_SUCCESS}; present();
+    assert(begins==1 && rebuilds==1 && !swapchainNeedsRebuild);
+    assert(boundAcquire==110 && boundRender==120); // use replacement semaphores
+    reset(); results={VK_ERROR_OUT_OF_DATE_KHR,VK_ERROR_OUT_OF_DATE_KHR}; present();
+    assert(begins==0 && rebuilds==1 && swapchainNeedsRebuild && checks==1);
+    reset(); rebuildSucceeds=false; results={VK_ERROR_OUT_OF_DATE_KHR}; present();
+    assert(begins==0 && rebuilds==1 && swapchainNeedsRebuild);
+    reset(); swapchainNeedsRebuild=true; results={VK_SUCCESS}; present();
+    assert(begins==1 && rebuilds==1 && boundAcquire==110);
+    reset(); results={VK_SUBOPTIMAL_KHR}; present();
+    assert(begins==1 && swapchainNeedsRebuild && rebuilds==0);
+    reset(); results={-9}; present();
+    assert(begins==0 && checks==1 && rebuilds==0);
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='d2r-present-') as tmp:
+            folder = pathlib.Path(tmp)
+            path = folder / 'main.cpp'
+            path.write_text(code)
+            exe = folder / 'present-test'
+            subprocess.run([compiler, '-std=c++17', '-O2', str(path), '-o', str(exe)], check=True)
+            subprocess.run([str(exe)], check=True)
+
     def test_graphics_commands_change_and_command_buffer_reset(self):
         compiler = shutil.which('clang++') or shutil.which('c++')
         if not compiler:
